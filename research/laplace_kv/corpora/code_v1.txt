@@ -1,0 +1,843 @@
+// Laplace - an Apple Silicon LLM inference engine.
+//
+// A from-scratch C++20 inference engine that supports multiple
+// transformer architectures through a single ModelArch abstraction.
+// Currently ships:
+//   - Llama-style transformers (Qwen2.5, Llama 2/3, Mistral, etc.)
+//   - Qwen3-Next hybrid (full attention + Gated DeltaNet)
+//   - Phi3 (fused QKV + gain+1 RMSNorm)
+//
+// Usage:
+//   laplace <model.gguf> [-p "prompt"] [-n N] [-t T] [--top-k K] [--top-p P]
+//                       [--no-im-start] [--max-seq LEN]
+//
+// If no prompt is given, dumps model metadata (legacy behaviour).
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#include "gguf.h"
+#include "kvcache.h"
+#include "matmul.h"
+#include "model.h"
+#include "sampler.h"
+#include "tokenizer.h"
+#include "tensor.h"
+#include "power_monitor.h"
+
+using namespace Laplace;
+
+// Bandwidth-bound kernels lose throughput with thread oversubscription, so
+// default to physical cores. Override with OMP_NUM_THREADS or -j.
+static void set_default_threads(int n_threads) {
+#ifdef _OPENMP
+    if (n_threads > 0) {
+        omp_set_num_threads(n_threads);
+    } else if (!std::getenv("OMP_NUM_THREADS")) {
+        int logical = omp_get_num_procs();
+#if defined(__aarch64__) && defined(__APPLE__)
+        omp_set_num_threads(logical);  // no SMT on Apple Silicon
+#else
+        omp_set_num_threads(logical >= 8 ? logical / 2 : logical);
+#endif
+    }
+#else
+    (void)n_threads;
+#endif
+}
+
+static int run_dump(const std::string& path);
+static int run_eval(const std::string& path, const std::string& eval_path,
+                    int eval_limit, int max_seq, bool streaming_kv,
+                    bool preliminary);
+static int run_generate(const std::string& path,
+                        const std::string& prompt,
+                        int n_tokens,
+                        const SamplerParams& sp,
+                        int max_seq,
+                        bool use_chat,
+                        bool use_spec,
+                        int n_draft,
+                        const std::string& draft_mode,
+                        KVCacheMode kv_mode,
+                        bool bench,
+                        bool streaming_kv);
+
+// Prompt-lookup drafting: if the last `n` generated/context tokens appear
+// earlier in the context, propose the tokens that followed that occurrence.
+// Cheap (no model), surprisingly effective on input-grounded or repetitive
+// text; harmless when nothing matches (returns empty -> normal decode step).
+static std::vector<int> lookup_draft(const std::vector<int>& ctx, int max_draft) {
+    const int n_ctx = static_cast<int>(ctx.size());
+    for (int ngram = 3; ngram >= 2; ngram--) {
+        if (n_ctx < ngram + 1) continue;
+        const int* tail = ctx.data() + n_ctx - ngram;
+        // Search backwards (most recent match first), excluding the tail itself.
+        for (int i = n_ctx - ngram - 1; i >= 0; i--) {
+            if (std::memcmp(ctx.data() + i, tail, ngram * sizeof(int)) != 0) continue;
+            int start = i + ngram;
+            int take = std::min(max_draft, n_ctx - start);  // start <= n_ctx-1, so take >= 1
+            return std::vector<int>(ctx.begin() + start, ctx.begin() + start + take);
+        }
+    }
+    return {};
+}
+
+// Lookahead Decoding (Fu et al, arXiv 2402.02057).  Generates a draft by
+// Jacobi iteration: at each step, feed the previous token (or `cur` for
+// the first) into the model and take the argmax of the result.  Repeats
+// for `ngram` iterations, then the existing batched verification picks
+// the longest matching prefix.  Unlike prompt-lookup, this produces
+// model-coherent drafts on free-form text (where prompt-lookup fails
+// because there are no long n-gram matches).
+//
+// Cost: ngram extra model calls per draft (one per Jacobi iteration).
+// Benefit: a draft that is exactly the model's own greedy prediction,
+// which by definition matches at least the first token of the model's
+// own output.
+//
+// Side effect: the KV cache advances by ngram during the Jacobi
+// iterations.  The subsequent batched verification re-processes the
+// same positions, so the cache state at the end of the verification
+// is the same as if the verification had been run alone.
+static std::vector<int> lookahead_draft(
+    Model& model, KVCache& kv, int cur, int pos,
+    int ngram, int max_draft, float* logits_buf, int vocab_size) {
+    std::vector<int> draft;
+    draft.reserve(static_cast<size_t>(ngram));
+    int sim_pos = pos;
+    for (int i = 0; i < ngram; i++) {
+        int token = i == 0 ? cur : draft.back();
+        model.forward_batch(&token, 1, sim_pos, kv, logits_buf);
+        int next = 0;
+        float best = logits_buf[0];
+        for (int v = 1; v < vocab_size; v++) {
+            if (logits_buf[v] > best) { best = logits_buf[v]; next = v; }
+        }
+        draft.push_back(next);
+        sim_pos += 1;
+    }
+    if (static_cast<int>(draft.size()) > max_draft) draft.resize(max_draft);
+    return draft;
+}
+
+static int argmax_row(const float* v, int n) {
+    int best = 0;
+    for (int i = 1; i < n; i++) if (v[i] > v[best]) best = i;
+    return best;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 2) {
+        fprintf(stderr,
+            "laplace - CPU LLM inference engine\n"
+            "usage: %s <model.gguf> [-p prompt] [-n N] [-t T] [--top-k K] [--top-p P] [--max-seq L]\n"
+            "       [--laplace-kv] [--laplace-stream] [--laplace-resident]\n"
+            "       (baselines: [--kv-fp32] [--kv-fp16])\n"
+            "       [--eval-file PATH] [--eval-limit N] [--eval-preliminary]\n"
+            "       [--draft N] [--draft-mode {prompt,lookahead}] [--no-spec] [--prompt-file PATH]\n",
+            argv[0]);
+        return 1;
+    }
+
+    std::string model_path = argv[1];
+    std::string prompt;
+    std::string prompt_file;
+    std::string eval_file;
+    int eval_limit = 2048;
+    int n_tokens  = 200;
+    int max_seq   = 2048;
+    int n_threads = 0;
+    int n_draft   = 3;
+    std::string draft_mode = "prompt";  // "prompt" or "lookahead"
+    bool use_chat = true;
+    bool use_spec = true;
+    KVCacheMode kv_mode = KVCacheMode::LAPLACE;
+    int streaming_override = -1;
+    SamplerParams sp;
+    sp.temperature = 0.7f;
+    sp.top_k       = 40;
+    sp.top_p       = 0.9f;
+    bool bench = false;
+    bool eval_preliminary = false;
+
+    for (int i = 2; i < argc; i++) {
+        std::string a = argv[i];
+        if (a == "-p" && i + 1 < argc) { prompt = argv[++i]; }
+        else if (a == "--prompt-file" && i + 1 < argc) { prompt_file = argv[++i]; }
+        else if (a == "--eval-file" && i + 1 < argc) { eval_file = argv[++i]; }
+        else if (a == "--eval-limit" && i + 1 < argc) { eval_limit = std::atoi(argv[++i]); }
+        else if (a == "--eval-preliminary") { eval_preliminary = true; }
+        else if (a == "-n" && i + 1 < argc) { n_tokens = std::atoi(argv[++i]); }
+        else if (a == "-t" && i + 1 < argc) { sp.temperature = std::atof(argv[++i]); }
+        else if (a == "--top-k" && i + 1 < argc) { sp.top_k = std::atoi(argv[++i]); }
+        else if (a == "--top-p" && i + 1 < argc) { sp.top_p = std::atof(argv[++i]); }
+        else if (a == "--max-seq" && i + 1 < argc) { max_seq = std::atoi(argv[++i]); }
+        else if (a == "--no-im-start") { use_chat = false; }
+        else if (a == "--greedy") { sp.temperature = 0.0f; }
+        else if (a == "--seed" && i + 1 < argc) { sp.seed = (uint32_t)std::strtoul(argv[++i], nullptr, 10); }
+        else if (a == "-j" && i + 1 < argc) { n_threads = std::atoi(argv[++i]); }
+        else if (a == "--no-spec") { use_spec = false; }
+        else if (a == "--draft" && i + 1 < argc) { n_draft = std::atoi(argv[++i]); }
+        else if (a == "--draft-mode" && i + 1 < argc) { draft_mode = argv[++i]; }
+        else if (a == "--laplace-kv") { kv_mode = KVCacheMode::LAPLACE; streaming_override = -1; }
+        else if (a == "--laplace-stream") { kv_mode = KVCacheMode::LAPLACE; streaming_override = 1; }
+        else if (a == "--laplace-resident") { kv_mode = KVCacheMode::LAPLACE; streaming_override = 0; }
+        else if (a == "--kv-fp32") { kv_mode = KVCacheMode::FP32; }
+        else if (a == "--kv-fp16") { kv_mode = KVCacheMode::FP16; }
+        else if (a == "--bench") { bench = true; }
+    }
+    set_default_threads(n_threads);
+
+    bool streaming_kv = streaming_override >= 0
+                      ? streaming_override != 0 : max_seq > 4096;
+    if (!eval_file.empty()) {
+        return run_eval(model_path, eval_file, eval_limit, max_seq,
+                        streaming_kv, eval_preliminary);
+    }
+    if (prompt.empty() && prompt_file.empty()) return run_dump(model_path);
+    if (!prompt_file.empty()) {
+        FILE* f = std::fopen(prompt_file.c_str(), "rb");
+        if (!f) { fprintf(stderr, "cannot open prompt file %s\n", prompt_file.c_str()); return 1; }
+        std::fseek(f, 0, SEEK_END);
+        long sz = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
+        prompt.assign(static_cast<size_t>(sz), '\0');
+        std::fread(&prompt[0], 1, static_cast<size_t>(sz), f);
+        std::fclose(f);
+    }
+    return run_generate(model_path, prompt, n_tokens, sp, max_seq, use_chat,
+                        use_spec, n_draft, draft_mode, kv_mode, bench,
+                        streaming_kv);
+}
+
+static int run_eval(const std::string& path, const std::string& eval_path,
+                    int eval_limit, int max_seq, bool streaming_kv,
+                    bool preliminary) {
+    FILE* file = std::fopen(eval_path.c_str(), "rb");
+    if (!file) {
+        fprintf(stderr, "cannot open eval file %s\n", eval_path.c_str());
+        return 1;
+    }
+    std::fseek(file, 0, SEEK_END);
+    long file_size = std::ftell(file);
+    std::fseek(file, 0, SEEK_SET);
+    std::string text(static_cast<size_t>(std::max(0L, file_size)), '\0');
+    size_t read = text.empty() ? 0 : std::fread(text.data(), 1, text.size(), file);
+    std::fclose(file);
+    text.resize(read);
+
+    GGUFContext context;
+    if (!context.open(path.c_str())) return 1;
+    matmul_register_weights(context.file_data(), context.file_size());
+
+    Tokenizer tokenizer;
+    Model reference;
+    Model candidate;
+    if (!tokenizer.init(context) || !reference.init(context)
+        || !candidate.init(context)) {
+        fprintf(stderr, "eval: model initialization failed\n");
+        return 1;
+    }
+
+    std::vector<int> tokens;
+    if (tokenizer.bos_id() >= 0) tokens.push_back(tokenizer.bos_id());
+    std::vector<int> encoded = tokenizer.encode(text);
+    tokens.insert(tokens.end(), encoded.begin(), encoded.end());
+    int predictions = std::min({eval_limit, max_seq,
+                                static_cast<int>(tokens.size()) - 1});
+    if (predictions <= LaplaceKVTile::kTokens) {
+        fprintf(stderr, "eval: need more than %d predictions, got %d\n",
+                LaplaceKVTile::kTokens, predictions);
+        return 1;
+    }
+    if (!preliminary && predictions < 2048) {
+        fprintf(stderr,
+                "eval: publication run needs at least 2048 predictions, got %d; "
+                "use --eval-preliminary for a diagnostic run\n",
+                predictions);
+        return 1;
+    }
+    int capacity = predictions;
+    if (!reference.reserve(capacity, 1) || !candidate.reserve(capacity, 1)) {
+        return 1;
+    }
+
+    const ModelConfig& config = reference.config();
+    int attention_layers = 0;
+    for (int layer = 0; layer < config.n_layers; layer++) {
+        if (reference.is_attention_layer(layer)) attention_layers++;
+    }
+    KVCache fp16;
+    KVCache laplace;
+    laplace.set_streaming(streaming_kv);
+    KVCacheMode candidate_mode = KVCacheMode::LAPLACE;
+#if defined(LAPLACE_KV_CAPTURE)
+    int baseline_key_bits = 0;
+    int baseline_value_bits = 0;
+    int baseline_group = 128;
+    int baseline_sink = 128;
+    int baseline_metadata_bits = 0;
+    int baseline_tail_key_bits = 0;
+    int baseline_tail_value_bits = 0;
+    bool baseline_bfp3 = false;
+    bool baseline_mlx_q2 = false;
+    const char* baseline_label = "none";
+    const char* capture_path = std::getenv("LAPLACE_KV_CAPTURE");
+    bool capture_active = capture_path && capture_path[0];
+    const char* baseline = std::getenv("LAPLACE_KV_BASELINE");
+    if (baseline && std::strcmp(baseline, "k4v2") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_label = "k4v2";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k2v2") == 0) {
+        baseline_key_bits = 2;
+        baseline_value_bits = 2;
+        baseline_label = "k2v2";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k3v2g256") == 0) {
+        baseline_key_bits = 3;
+        baseline_value_bits = 2;
+        baseline_group = 256;
+        baseline_sink = 256;
+        baseline_label = "k3v2g256";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k3v2g128") == 0) {
+        baseline_key_bits = 3;
+        baseline_value_bits = 2;
+        baseline_group = 128;
+        baseline_sink = 128;
+        baseline_label = "k3v2g128";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "laplace3") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_group = 128;
+        baseline_sink = 128;
+        baseline_metadata_bits = 5;
+        baseline_label = "laplace3";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k4v2fp8") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_metadata_bits = 9;
+        baseline_label = "k4v2fp8";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k4v2q8") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_metadata_bits = 8;
+        baseline_label = "k4v2q8";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k4v2q6") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_metadata_bits = 6;
+        baseline_label = "k4v2q6";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k4v2g256") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_group = 256;
+        baseline_sink = 256;
+        baseline_label = "k4v2g256";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k4v2g256fp8") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_group = 256;
+        baseline_sink = 256;
+        baseline_metadata_bits = 9;
+        baseline_label = "k4v2g256fp8";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k4v2g256q8") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_group = 256;
+        baseline_sink = 256;
+        baseline_metadata_bits = 8;
+        baseline_label = "k4v2g256q8";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "laplace3tail") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_sink = 0;
+        baseline_metadata_bits = 8;
+        baseline_tail_key_bits = 3;
+        baseline_tail_value_bits = 2;
+        baseline_label = "laplace3tail";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "laplace3tail4") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_sink = 0;
+        baseline_metadata_bits = 8;
+        baseline_tail_key_bits = 4;
+        baseline_tail_value_bits = 2;
+        baseline_label = "laplace3tail4";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "laplace3tail33") == 0) {
+        baseline_key_bits = 4;
+        baseline_value_bits = 2;
+        baseline_sink = 0;
+        baseline_metadata_bits = 8;
+        baseline_tail_key_bits = 3;
+        baseline_tail_value_bits = 3;
+        baseline_label = "laplace3tail33";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "kstripev2q6") == 0) {
+        baseline_key_bits = 5;
+        baseline_value_bits = 2;
+        baseline_metadata_bits = 6;
+        baseline_label = "kstripev2q6";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "bfp3") == 0) {
+        baseline_bfp3 = true;
+        baseline_label = "bfp3";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "mlxq2") == 0) {
+        baseline_mlx_q2 = true;
+        baseline_label = "mlxq2";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && std::strcmp(baseline, "k3v2g256all") == 0) {
+        baseline_key_bits = 3;
+        baseline_value_bits = 2;
+        baseline_group = 256;
+        baseline_sink = 0;
+        baseline_label = "k3v2g256all";
+        candidate_mode = KVCacheMode::FP32;
+    } else if (baseline && baseline[0]) {
+        fprintf(stderr, "eval: unknown LAPLACE_KV_BASELINE=%s\n", baseline);
+        return 1;
+    }
+#endif
+    if (!fp16.init(attention_layers, config.n_kv_heads, config.head_dim,
+                   capacity, KVCacheMode::FP16)
+        || !laplace.init(attention_layers, config.n_kv_heads, config.head_dim,
+                         capacity, candidate_mode)) {
+        fprintf(stderr, "eval: KV initialization failed for head_dim=%d\n",
+                config.head_dim);
+        return 1;
+    }
+#if defined(LAPLACE_KV_CAPTURE)
+    if (baseline_bfp3 && !laplace.set_research_bfp3()) {
+        fprintf(stderr,
+                "eval: BFP3 research mode requires FP32 and head_dim %% 16 == 0\n");
+        return 1;
+    }
+    if (baseline_mlx_q2 && !laplace.set_research_mlx_q2()) {
+        fprintf(stderr,
+                "eval: MLX Q2 baseline requires FP32 and head_dim %% 64 == 0\n");
+        return 1;
+    }
+    if (baseline_key_bits
+        && !laplace.set_research_baseline(
+            baseline_key_bits, baseline_value_bits,
+            baseline_group, baseline_sink, baseline_metadata_bits,
+            baseline_tail_key_bits, baseline_tail_value_bits)) {
+        fprintf(stderr,
+                "eval: research baseline requires FP32 and an even head_dim\n");
+        return 1;
+    }
+#endif
+
+    std::vector<float> reference_logits(config.vocab);
+    std::vector<float> candidate_logits(config.vocab);
+    std::vector<double> token_kl;
+    token_kl.reserve(predictions);
+    double reference_nll = 0.0;
+    double candidate_nll = 0.0;
+    double reference_ms = 0.0;
+    double candidate_ms = 0.0;
+    int top1_matches = 0;
+
+    auto forward_timed = [](Model& model, int token, int position,
+                            KVCache& cache, float* logits) {
+        auto start = std::chrono::steady_clock::now();
+        model.forward(token, position, cache, logits);
+        return std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - start).count();
+    };
+
+    for (int position = 0; position < predictions; position++) {
+        if ((position & 1) == 0) {
+            reference_ms += forward_timed(reference, tokens[position], position,
+                                          fp16, reference_logits.data());
+            candidate_ms += forward_timed(candidate, tokens[position], position,
+                                          laplace, candidate_logits.data());
+        } else {
+            candidate_ms += forward_timed(candidate, tokens[position], position,
+                                          laplace, candidate_logits.data());
+            reference_ms += forward_timed(reference, tokens[position], position,
+                                          fp16, reference_logits.data());
+        }
+
+        for (int token = 0; token < config.vocab; token++) {
+            if (!std::isfinite(reference_logits[token])
+                || !std::isfinite(candidate_logits[token])) {
+                fprintf(stderr,
+                        "eval: non-finite logit at position %d token %d\n",
+                        position, token);
+                return 1;
+            }
+        }
+
+        float reference_max = *std::max_element(reference_logits.begin(),
+                                                reference_logits.end());
+        float candidate_max = *std::max_element(candidate_logits.begin(),
+                                                candidate_logits.end());
+        double reference_sum = 0.0;
+        double candidate_sum = 0.0;
+        int reference_top = 0;
+        int candidate_top = 0;
+        for (int token = 0; token < config.vocab; token++) {
+            reference_sum += std::exp(
+                static_cast<double>(reference_logits[token] - reference_max));
+            candidate_sum += std::exp(
+                static_cast<double>(candidate_logits[token] - candidate_max));
+            if (reference_logits[token] > reference_logits[reference_top]) {
+                reference_top = token;
+            }
+            if (candidate_logits[token] > candidate_logits[candidate_top]) {
+                candidate_top = token;
+            }
+        }
+        if (reference_top == candidate_top) top1_matches++;
+        double reference_logz = reference_max + std::log(reference_sum);
+        double candidate_logz = candidate_max + std::log(candidate_sum);
+        if (!std::isfinite(reference_logz) || !std::isfinite(candidate_logz)) {
+            fprintf(stderr, "eval: non-finite normalization at position %d\n",
+                    position);
+            return 1;
+        }
+        int target = tokens[position + 1];
+        reference_nll += reference_logz - reference_logits[target];
+        candidate_nll += candidate_logz - candidate_logits[target];
+
+        double kl = 0.0;
+        for (int token = 0; token < config.vocab; token++) {
+            double logp = reference_logits[token] - reference_logz;
+            double logq = candidate_logits[token] - candidate_logz;
+            kl += std::exp(logp) * (logp - logq);
+        }
+        if (!std::isfinite(kl)) {
+            fprintf(stderr, "eval: non-finite KL at position %d\n", position);
+            return 1;
+        }
+        token_kl.push_back(std::max(0.0, kl));
+    }
+
+    std::sort(token_kl.begin(), token_kl.end());
+    double kl_sum = 0.0;
+    for (double value : token_kl) kl_sum += value;
+    size_t p95_index = static_cast<size_t>(0.95 * (token_kl.size() - 1));
+    double reference_ppl = std::exp(reference_nll / predictions);
+    double candidate_ppl = std::exp(candidate_nll / predictions);
+    double ppl_delta = (candidate_ppl / reference_ppl - 1.0) * 100.0;
+    if (!std::isfinite(reference_ppl) || !std::isfinite(candidate_ppl)
+        || !std::isfinite(ppl_delta)) {
+        fprintf(stderr, "eval: non-finite final quality metric\n");
+        return 1;
+    }
+    size_t fp16_encoded = fp16.encoded_bytes(predictions);
+    size_t laplace_encoded = laplace.encoded_bytes(predictions);
+    size_t scalar_count = static_cast<size_t>(2) * predictions
+                        * attention_layers * config.n_kv_heads
+                        * config.head_dim;
+    double effective_bits = scalar_count == 0 ? 0.0
+                          : 8.0 * laplace_encoded / scalar_count;
+
+    std::printf(
+        "{\"model\":\"%s\",\"eval_file\":\"%s\",\"eval_bytes\":%zu,"
+        "\"input_tokens\":%zu,\"predictions\":%d,\"preliminary\":%s,"
+        "\"attention_layers\":%d,"
+        "\"kv_heads\":%d,\"head_dim\":%d,"
+#if defined(LAPLACE_KV_CAPTURE)
+        "\"research_baseline\":\"%s\","
+        "\"timing_valid\":%s,\"storage_valid\":%s,"
+#endif
+        "\"streaming\":%s,"
+        "\"timing_scope\":\"growing_context_teacher_forced\","
+        "\"fp16_nll\":%.9g,\"laplace_nll\":%.9g,"
+        "\"fp16_ppl\":%.9g,\"laplace_ppl\":%.9g,"
+        "\"ppl_delta_pct\":%.6f,\"top1_agreement_pct\":%.6f,"
+        "\"kl_mean\":%.9g,\"kl_p95\":%.9g,\"kl_max\":%.9g,"
+        "\"fp16_diagnostic_total_ms\":%.3f,"
+        "\"laplace_diagnostic_total_ms\":%.3f,"
+        "\"fp16_encoded_bytes\":%zu,\"laplace_encoded_bytes\":%zu,"
+        "\"laplace_effective_bits_per_scalar\":%.9g,"
+        "\"fp16_allocated_payload_ram_bytes\":%zu,"
+        "\"laplace_allocated_payload_ram_bytes\":%zu,"
+        "\"archive_logical_capacity_bytes\":%zu,"
+        "\"archive_read_bytes\":%llu,\"archive_write_bytes\":%llu}\n",
+        path.c_str(), eval_path.c_str(), text.size(), tokens.size(),
+        predictions, preliminary ? "true" : "false",
+        attention_layers, config.n_kv_heads, config.head_dim,
+#if defined(LAPLACE_KV_CAPTURE)
+        baseline_label,
+        baseline_key_bits || baseline_bfp3 || baseline_mlx_q2 || capture_active
+            ? "false" : "true",
+        baseline_key_bits || baseline_bfp3 || baseline_mlx_q2
+            ? "false" : "true",
+#endif
+        streaming_kv ? "true" : "false",
+        reference_nll / predictions, candidate_nll / predictions,
+        reference_ppl, candidate_ppl,
+        ppl_delta, 100.0 * top1_matches / predictions,
+        kl_sum / predictions, token_kl[p95_index], token_kl.back(),
+        reference_ms, candidate_ms, fp16_encoded, laplace_encoded,
+        effective_bits, fp16.storage_bytes(), laplace.storage_bytes(),
+        laplace.archive_bytes(),
+        static_cast<unsigned long long>(laplace.archive_read_bytes()),
+        static_cast<unsigned long long>(laplace.archive_write_bytes()));
+    return 0;
+}
+
+static int run_dump(const std::string& path) {
+    GGUFContext ctx;
+    if (!ctx.open(path.c_str())) { fprintf(stderr, "failed to open %s\n", path.c_str()); return 1; }
+    const auto& m = ctx.metadata();
+
+    auto arch = meta_str(m, "general.architecture");
+    printf("file:    %s\n", path.c_str());
+    printf("size:    %.2f MB\n", ctx.file_size() / 1e6);
+    if (arch) printf("arch:    %s\n", arch->c_str());
+    if (auto p = meta_str(m, "general.name")) printf("name:    %s\n", p->c_str());
+    if (auto p = meta_uint32(m, "general.file_type")) printf("file_type: %u\n", *p);
+    if (auto p = meta_uint32(m, "general.quantization_version")) printf("quant_version: %u\n", *p);
+    printf("\n");
+    return 0;
+}
+
+static int run_generate(const std::string& path,
+                        const std::string& prompt,
+                        int n_tokens,
+                        const SamplerParams& sp,
+                        int max_seq,
+                        bool use_chat,
+                        bool use_spec,
+                        int n_draft,
+                        const std::string& draft_mode,
+                        KVCacheMode kv_mode,
+                        bool bench,
+                        bool streaming_kv) {
+    // Start the power monitor: background thread that adjusts thread count
+    // and core mode at runtime based on power state, thermal, and throughput.
+    PowerMonitor::get().start();
+
+    GGUFContext ctx;
+    if (!ctx.open(path.c_str())) { fprintf(stderr, "failed to open %s\n", path.c_str()); return 1; }
+
+    matmul_register_weights(ctx.file_data(), ctx.file_size());
+
+    Model model;
+    if (!model.init(ctx)) { fprintf(stderr, "model init failed\n"); return 1; }
+
+    Tokenizer tok;
+    if (!tok.init(ctx)) { fprintf(stderr, "tokenizer init failed\n"); return 1; }
+
+    const int max_batch = 8;
+    if (!model.reserve(max_seq, max_batch)) { fprintf(stderr, "reserve failed\n"); return 1; }
+
+    const auto& cfg = model.config();
+    int n_attn = 0, n_ssm = 0;
+    for (int i = 0; i < cfg.n_layers; i++) {
+        if (model.is_attention_layer(i)) n_attn++; else n_ssm++;
+    }
+    fprintf(stderr, "model: %d layers (%d attn, %d ssm), hidden=%d, vocab=%d, experts=%d/%d inter=%d\n",
+        cfg.n_layers, n_attn, n_ssm, cfg.hidden, cfg.vocab, cfg.n_experts_used, cfg.n_experts, cfg.expert_inter);
+    fflush(stderr);
+
+    // KV cache for full-attention layers. LaplaceKV stays resident for short
+    // contexts and streams sealed tiles when the configured context is large.
+    KVCache kv;
+    if (n_attn > 0) {
+        kv.set_streaming(streaming_kv && kv_mode == KVCacheMode::LAPLACE);
+        if (!kv.init(n_attn, cfg.n_kv_heads, cfg.head_dim, max_seq, kv_mode)) {
+            fprintf(stderr,
+                    "kv-cache: LaplaceKV init failed for head_dim=%d, using FP16\n",
+                    cfg.head_dim);
+            kv_mode = KVCacheMode::FP16;
+            if (!kv.init(n_attn, cfg.n_kv_heads, cfg.head_dim,
+                         max_seq, kv_mode)) {
+                return 1;
+            }
+        }
+        const char* name = kv_mode == KVCacheMode::FP32 ? "FP32"
+                         : kv_mode == KVCacheMode::FP16 ? "FP16"
+                         : streaming_kv ? "LaplaceKV K8/V6 streaming"
+                                        : "LaplaceKV K8/V6 resident";
+        fprintf(stderr, "kv-cache: %s\n", name);
+    }
+
+    std::vector<float> logits(static_cast<size_t>(max_batch) * cfg.vocab);
+    Sampler sampler(sp);
+
+    // Build the prompt token sequence.
+    std::vector<int> prompt_tokens;
+    if (use_chat && ((tok.im_start_id() >= 0 && tok.im_end_id() >= 0) ||
+                     (tok.turn_start_id() >= 0 && tok.turn_end_id() >= 0))) {
+        prompt_tokens = tok.encode_chat(prompt);
+    } else {
+        if (tok.bos_id() >= 0) prompt_tokens.push_back(tok.bos_id());
+        auto enc = tok.encode(prompt);
+        prompt_tokens.insert(prompt_tokens.end(), enc.begin(), enc.end());
+    }
+
+    if (prompt_tokens.empty() || (int)prompt_tokens.size() >= max_seq) {
+        fprintf(stderr, "prompt empty or too long (%d tokens, max %d)\n",
+                (int)prompt_tokens.size(), max_seq);
+        return 1;
+    }
+    fprintf(stderr, "prompt: %d tokens\n", (int)prompt_tokens.size());
+
+    // Prefill in batched chunks; the last chunk's final row seeds generation.
+    const int n_prompt = static_cast<int>(prompt_tokens.size());
+    int pos = 0;
+    int last_row = 0;
+    auto t_prefill0 = std::chrono::steady_clock::now();
+    while (pos < n_prompt) {
+        int chunk = std::min(max_batch, n_prompt - pos);
+        model.forward_batch(prompt_tokens.data() + pos, chunk, pos, kv, logits.data());
+        last_row = chunk - 1;
+        pos += chunk;
+    }
+    auto t_prefill1 = std::chrono::steady_clock::now();
+
+    // Greedy speculative decoding (prompt-lookup or Lookahead drafts,
+    // batched verify).  Sampling (temperature > 0) uses the plain
+    // one-token-at-a-time loop.
+    const bool spec = use_spec && sp.temperature <= 0.0f;
+    const int max_draft = std::max(1, std::min(n_draft, max_batch - 1));
+    const int ngram     = max_draft;     // Lookahead chain length per draft.
+    std::vector<float> ckpts;
+    if (spec) ckpts.resize(static_cast<size_t>(max_batch) * model.ssm_state_floats());
+
+    std::vector<int> context = prompt_tokens;   // full history for draft lookup
+    long n_drafted = 0, n_accepted = 0;
+
+    auto emit = [&](int id) {
+        std::string piece = tok.decode(id);
+        printf("%s", piece.c_str());
+    };
+    auto is_stop = [&](int id) { return id == tok.eos_id() || id == tok.im_end_id(); };
+
+    int cur = spec ? argmax_row(logits.data() + static_cast<size_t>(last_row) * cfg.vocab, cfg.vocab)
+                   : sampler.sample(logits.data() + static_cast<size_t>(last_row) * cfg.vocab, cfg.vocab);
+    int generated = 0;
+    auto t_decode0 = std::chrono::steady_clock::now();
+    bool stopped = is_stop(cur);
+    if (!stopped) {
+        emit(cur);
+        fflush(stdout);
+        context.push_back(cur);
+        generated = 1;
+        ThreadPool::get().record_token();
+    }
+
+    while (!stopped && generated < n_tokens && pos < max_seq) {
+        std::vector<int> draft;
+        if (spec) {
+            int draft_budget = std::min(max_draft, max_seq - pos - 1);
+            if (draft_mode == "lookahead") {
+                draft = lookahead_draft(model, kv, cur, pos, ngram, draft_budget,
+                                        logits.data(), cfg.vocab);
+            } else {
+                draft = lookup_draft(context, draft_budget);
+            }
+        }
+
+        if (draft.empty()) {
+            // Plain step.
+            model.forward(cur, pos, kv, logits.data());
+            pos++;
+            cur = spec ? argmax_row(logits.data(), cfg.vocab)
+                       : sampler.sample(logits.data(), cfg.vocab);
+            if (is_stop(cur)) { stopped = true; break; }
+            emit(cur);
+            fflush(stdout);
+            context.push_back(cur);
+            generated++;
+            ThreadPool::get().record_token();
+            continue;
+        }
+
+        // Verify [cur, draft...] in one batched pass. logits row i predicts
+        // the token after batch[0..i].
+        const int Mb = 1 + static_cast<int>(draft.size());
+        std::vector<int> batch(Mb);
+        batch[0] = cur;
+        std::copy(draft.begin(), draft.end(), batch.begin() + 1);
+        model.forward_batch(batch.data(), Mb, pos, kv, logits.data(), ckpts.data());
+
+        int a = 0;   // accepted draft tokens
+        while (a < (int)draft.size() &&
+               argmax_row(logits.data() + static_cast<size_t>(a) * cfg.vocab, cfg.vocab) == draft[a]) {
+            a++;
+        }
+        n_drafted  += static_cast<long>(draft.size());
+        n_accepted += a;
+
+        // Roll the SSM state back to "after the last accepted batch token".
+        if (a + 1 < Mb) {
+            model.restore_ssm_state(ckpts.data() + static_cast<size_t>(a) * model.ssm_state_floats());
+        }
+        pos += a + 1;
+
+        // Emit accepted drafts plus the model's own token at the first
+        // mismatch (or the bonus token when everything matched).
+        for (int i = 0; i < a && !stopped; i++) {
+            if (is_stop(draft[i])) { stopped = true; break; }
+            emit(draft[i]);
+            context.push_back(draft[i]);
+            generated++;
+            ThreadPool::get().record_token();
+        }
+        if (!stopped) {
+            int nxt = argmax_row(logits.data() + static_cast<size_t>(a) * cfg.vocab, cfg.vocab);
+            if (is_stop(nxt)) {
+                stopped = true;
+            } else {
+                emit(nxt);
+                context.push_back(nxt);
+                generated++;
+                ThreadPool::get().record_token();
+                cur = nxt;
+            }
+        }
+        fflush(stdout);
+    }
+
+    printf("\n");
+    auto t_decode1 = std::chrono::steady_clock::now();
+    if (spec && n_drafted > 0) {
+        fprintf(stderr, "[spec: accepted %ld/%ld drafted tokens, %d generated]\n",
+                n_accepted, n_drafted, generated);
+    }
+    if (stopped) fprintf(stderr, "[eos]\n");
+    if (bench) {
+        double pf_ms = std::chrono::duration<double, std::milli>(t_prefill1 - t_prefill0).count();
+        double dc_ms = std::chrono::duration<double, std::milli>(t_decode1 - t_decode0).count();
+        fprintf(stderr, "[bench] prefill: %d tokens in %.1f ms (%.1f tok/s)\n",
+                n_prompt, pf_ms, 1000.0 * n_prompt / std::max(1.0, pf_ms));
+        fprintf(stderr, "[bench] decode:  %d tokens in %.1f ms (%.1f tok/s)\n",
+                generated, dc_ms, 1000.0 * generated / std::max(1.0, dc_ms));
+        if (streaming_kv && kv_mode == KVCacheMode::LAPLACE) {
+            fprintf(stderr, "[bench] LaplaceKV: %llu streamed queries\n",
+                    static_cast<unsigned long long>(
+                        kv.stream_calls()));
+        }
+    }
+    return 0;
+}
