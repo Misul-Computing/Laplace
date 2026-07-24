@@ -10,6 +10,7 @@
 #include "gguf.h"
 #include "kvcache.h"
 #include "tensor.h"
+#include "topology.h"
 
 namespace Laplace {
 
@@ -121,6 +122,8 @@ public:
 
     bool is_attention_layer(int i) const { return is_attention_[i]; }
     int max_seq() const { return max_seq_; }
+    std::vector<KVLayerConfig> kv_layer_configs(
+        int max_seq_len, KVCacheMode mode) const;
 
 private:
     ModelConfig cfg_;
@@ -137,6 +140,7 @@ private:
     bool streaming_experts_ = false;  // dense pinned, experts stream from SSD
 
     ModelBuffers buffers_;
+    TopologyPlan topology_;
 
     // Decide which weights stay resident and which stream, based on model
     // size vs physical RAM. Faults dense weights into RAM so the OS keeps

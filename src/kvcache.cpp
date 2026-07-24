@@ -533,7 +533,37 @@ bool KVCache::init(int n_layers, int n_kv_heads, int head_dim, int capacity,
         n_layers, n_kv_heads, head_dim, capacity, streaming_);
 }
 
+bool KVCache::init(const std::vector<KVLayerConfig>& layers) {
+    free();
+    if (layers.empty()) return false;
+    layer_configs_ = layers;
+    layer_caches_.reserve(layers.size());
+    n_layers_ = static_cast<int>(layers.size());
+    mode_ = layers.front().mode;
+    for (const KVLayerConfig& config : layers) {
+        if (config.n_kv_heads <= 0 || config.head_dim <= 0 ||
+            config.capacity <= 0 || config.sliding_window < 0) {
+            free();
+            return false;
+        }
+        auto cache = std::make_unique<KVCache>();
+        cache->set_streaming(streaming_);
+        if (!cache->init(1, config.n_kv_heads, config.head_dim,
+                         config.capacity, config.mode)) {
+            free();
+            return false;
+        }
+        n_kv_heads_ = std::max(n_kv_heads_, config.n_kv_heads);
+        head_dim_ = std::max(head_dim_, config.head_dim);
+        capacity_ = std::max(capacity_, config.capacity);
+        layer_caches_.push_back(std::move(cache));
+    }
+    return true;
+}
+
 void KVCache::free() {
+    layer_caches_.clear();
+    layer_configs_.clear();
     std::vector<float>().swap(k32_);
     std::vector<float>().swap(v32_);
     std::vector<uint16_t>().swap(k16_);
@@ -556,6 +586,135 @@ void KVCache::free() {
     research_mlx_q2_ = false;
     research_turboquant_2_5_ = false;
 #endif
+}
+
+KVCache* KVCache::layer_cache(int layer) {
+    return layer_caches_.empty() ? nullptr : layer_caches_[layer].get();
+}
+
+const KVCache* KVCache::layer_cache(int layer) const {
+    return layer_caches_.empty() ? nullptr : layer_caches_[layer].get();
+}
+
+int KVCache::physical_pos(int layer, int pos) const {
+    if (layer_caches_.empty() || layer_configs_[layer].sliding_window == 0) {
+        return pos;
+    }
+    return pos % layer_configs_[layer].capacity;
+}
+
+KVCacheMode KVCache::mode(int layer) const {
+    const KVCache* cache = layer_cache(layer);
+    return cache ? cache->mode() : mode_;
+}
+
+int KVCache::capacity(int layer) const {
+    const KVCache* cache = layer_cache(layer);
+    return cache ? cache->capacity() : capacity_;
+}
+
+int KVCache::n_kv_heads(int layer) const {
+    const KVCache* cache = layer_cache(layer);
+    return cache ? cache->n_kv_heads() : n_kv_heads_;
+}
+
+int KVCache::head_dim(int layer) const {
+    const KVCache* cache = layer_cache(layer);
+    return cache ? cache->head_dim() : head_dim_;
+}
+
+bool KVCache::ring(int layer) const {
+    return !layer_caches_.empty() &&
+           layer_configs_[layer].sliding_window > 0;
+}
+
+bool KVCache::laplace_rotated(int layer) const {
+    const KVCache* cache = layer_cache(layer);
+    return cache ? cache->laplace_rotated() : laplace_rotated();
+}
+
+bool KVCache::streaming() const {
+    if (layer_caches_.empty()) return laplace_ && laplace_->streaming();
+    for (const auto& cache : layer_caches_) {
+        if (cache->streaming()) return true;
+    }
+    return false;
+}
+
+uint64_t KVCache::stream_calls() const {
+    if (layer_caches_.empty()) return laplace_ ? laplace_->stream_calls() : 0;
+    uint64_t total = 0;
+    for (const auto& cache : layer_caches_) total += cache->stream_calls();
+    return total;
+}
+
+uint64_t KVCache::archive_read_bytes() const {
+    if (layer_caches_.empty()) {
+        return laplace_ ? laplace_->archive_read_bytes() : 0;
+    }
+    uint64_t total = 0;
+    for (const auto& cache : layer_caches_) {
+        total += cache->archive_read_bytes();
+    }
+    return total;
+}
+
+uint64_t KVCache::archive_write_bytes() const {
+    if (layer_caches_.empty()) {
+        return laplace_ ? laplace_->archive_write_bytes() : 0;
+    }
+    uint64_t total = 0;
+    for (const auto& cache : layer_caches_) {
+        total += cache->archive_write_bytes();
+    }
+    return total;
+}
+
+size_t KVCache::encoded_bytes(int n_tokens) const {
+    if (!layer_caches_.empty()) {
+        size_t total = 0;
+        for (const auto& cache : layer_caches_) {
+            total += cache->encoded_bytes(n_tokens);
+        }
+        return total;
+    }
+    if (laplace_) return laplace_->encoded_bytes(n_tokens);
+    int tokens = std::clamp(n_tokens, 0, capacity_);
+    size_t element_bytes = mode_ == KVCacheMode::FP16
+                         ? sizeof(uint16_t) : sizeof(float);
+    return static_cast<size_t>(n_layers_) * n_kv_heads_ * tokens
+         * head_dim_ * 2 * element_bytes;
+}
+
+size_t KVCache::storage_bytes() const {
+    if (!layer_caches_.empty()) {
+        size_t total = 0;
+        for (const auto& cache : layer_caches_) total += cache->storage_bytes();
+        return total;
+    }
+    size_t bytes = (k32_.capacity() + v32_.capacity()) * sizeof(float)
+                 + (k16_.capacity() + v16_.capacity()) * sizeof(uint16_t);
+    return bytes + (laplace_ ? laplace_->storage_bytes() : 0);
+}
+
+size_t KVCache::archive_read_buffer_bytes() const {
+    if (!layer_caches_.empty()) {
+        size_t total = 0;
+        for (const auto& cache : layer_caches_) {
+            total += cache->archive_read_buffer_bytes();
+        }
+        return total;
+    }
+    return laplace_ ? laplace_->archive_read_buffer_bytes() : 0;
+}
+
+size_t KVCache::archive_bytes() const {
+    if (!layer_caches_.empty()) {
+        size_t total = 0;
+        for (const auto& cache : layer_caches_) total += cache->archive_bytes();
+        return total;
+    }
+    return laplace_ ? laplace_->archive_bytes() : 0;
 }
 
 #if defined(LAPLACE_KV_CAPTURE)
@@ -618,6 +777,10 @@ bool KVCache::set_research_baseline(int key_bits, int value_bits,
 #endif
 
 void KVCache::load_k(int layer, int head, int pos, float* output) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->load_k(0, head, physical_pos(layer, pos), output);
+        return;
+    }
     if (laplace_) {
         laplace_->load_k_wh(layer, head, pos, output);
         if (laplace_->uses_rotation()) inverse_walsh_hadamard(output, head_dim_);
@@ -629,6 +792,10 @@ void KVCache::load_k(int layer, int head, int pos, float* output) const {
 }
 
 void KVCache::load_v(int layer, int head, int pos, float* output) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->load_v(0, head, physical_pos(layer, pos), output);
+        return;
+    }
     if (laplace_) {
         laplace_->load_v_wh(layer, head, pos, output);
         if (laplace_->uses_rotation()) inverse_walsh_hadamard(output, head_dim_);
@@ -640,6 +807,10 @@ void KVCache::load_v(int layer, int head, int pos, float* output) const {
 }
 
 void KVCache::store_k(int layer, int head, int pos, const float* input) {
+    if (KVCache* cache = layer_cache(layer)) {
+        cache->store_k(0, head, physical_pos(layer, pos), input);
+        return;
+    }
     if (laplace_) {
         float transformed[512];
         std::memcpy(transformed, input, sizeof(float) * head_dim_);
@@ -653,6 +824,10 @@ void KVCache::store_k(int layer, int head, int pos, const float* input) {
 }
 
 void KVCache::store_v(int layer, int head, int pos, const float* input) {
+    if (KVCache* cache = layer_cache(layer)) {
+        cache->store_v(0, head, physical_pos(layer, pos), input);
+        return;
+    }
     if (laplace_) {
         float transformed[512];
         std::memcpy(transformed, input, sizeof(float) * head_dim_);
@@ -720,6 +895,10 @@ void KVCache::store_v(int layer, int head, int pos, const float* input) {
 }
 
 void KVCache::load_k_wh(int layer, int head, int pos, float* output) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->load_k_wh(0, head, physical_pos(layer, pos), output);
+        return;
+    }
     if (laplace_) {
         laplace_->load_k_wh(layer, head, pos, output);
         return;
@@ -729,6 +908,10 @@ void KVCache::load_k_wh(int layer, int head, int pos, float* output) const {
 }
 
 void KVCache::load_v_wh(int layer, int head, int pos, float* output) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->load_v_wh(0, head, physical_pos(layer, pos), output);
+        return;
+    }
     if (laplace_) {
         laplace_->load_v_wh(layer, head, pos, output);
         return;
@@ -738,6 +921,10 @@ void KVCache::load_v_wh(int layer, int head, int pos, float* output) const {
 }
 
 void KVCache::store_k_wh(int layer, int head, int pos, const float* input) {
+    if (KVCache* cache = layer_cache(layer)) {
+        cache->store_k_wh(0, head, physical_pos(layer, pos), input);
+        return;
+    }
     if (laplace_) {
         laplace_->store_k_wh(layer, head, pos, input);
         return;
@@ -749,6 +936,10 @@ void KVCache::store_k_wh(int layer, int head, int pos, const float* input) {
 }
 
 void KVCache::store_v_wh(int layer, int head, int pos, const float* input) {
+    if (KVCache* cache = layer_cache(layer)) {
+        cache->store_v_wh(0, head, physical_pos(layer, pos), input);
+        return;
+    }
     if (laplace_) {
         laplace_->store_v_wh(layer, head, pos, input);
         return;
@@ -761,6 +952,10 @@ void KVCache::store_v_wh(int layer, int head, int pos, const float* input) {
 
 float KVCache::dot_k_wh(int layer, int head, int pos,
                         const float* query_wh) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->dot_k_wh(
+            0, head, physical_pos(layer, pos), query_wh);
+    }
     float key[512];
     load_k_wh(layer, head, pos, key);
     return ops::dot(query_wh, key, head_dim_);
@@ -768,6 +963,11 @@ float KVCache::dot_k_wh(int layer, int head, int pos,
 
 void KVCache::weighted_add_v_wh(int layer, int head, int pos, float weight,
                                 float* output_wh) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->weighted_add_v_wh(
+            0, head, physical_pos(layer, pos), weight, output_wh);
+        return;
+    }
     float value[512];
     load_v_wh(layer, head, pos, value);
     ops::axpy(output_wh, weight, value, head_dim_);
@@ -776,6 +976,11 @@ void KVCache::weighted_add_v_wh(int layer, int head, int pos, float weight,
 void KVCache::dot_k_all_wh(int layer, int head, int n_tokens,
                            const float* query_wh, float logit_scale,
                            float* scores, int first_token) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->dot_k_all_wh(
+            0, head, n_tokens, query_wh, logit_scale, scores, first_token);
+        return;
+    }
     if (!laplace_) return;
     laplace_->dot_keys_wh(
         layer, head, n_tokens, query_wh, scores, first_token);
@@ -787,6 +992,11 @@ void KVCache::dot_k_all_wh(int layer, int head, int n_tokens,
 void KVCache::weighted_add_v_all_wh(int layer, int head, int n_tokens,
                                     const float* weights, float* output_wh,
                                     int first_token) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->weighted_add_v_all_wh(
+            0, head, n_tokens, weights, output_wh, first_token);
+        return;
+    }
     if (laplace_) {
         laplace_->add_values_wh(
             layer, head, n_tokens, weights, output_wh, first_token);
@@ -796,6 +1006,11 @@ void KVCache::weighted_add_v_all_wh(int layer, int head, int n_tokens,
 void KVCache::attention_all_wh(int layer, int head, int n_tokens,
                                const float* query_wh, float logit_scale,
                                float* output_wh, int first_token) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->attention_all_wh(
+            0, head, n_tokens, query_wh, logit_scale, output_wh, first_token);
+        return;
+    }
     if (laplace_) {
         laplace_->attention_wh(
             layer, head, n_tokens, query_wh, logit_scale,
@@ -807,6 +1022,12 @@ void KVCache::attention_batch_all_wh(
         int layer, int head, int count, const int* n_tokens,
         const float* const* queries_wh, float logit_scale,
         float* const* outputs_wh, int first_token) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        cache->attention_batch_all_wh(
+            0, head, count, n_tokens, queries_wh,
+            logit_scale, outputs_wh, first_token);
+        return;
+    }
     if (laplace_) {
         laplace_->attention_batch_wh(
             layer, head, count, n_tokens, queries_wh,
@@ -815,29 +1036,59 @@ void KVCache::attention_batch_all_wh(
 }
 
 float* KVCache::slot_k(int layer, int head, int pos) {
+    if (KVCache* cache = layer_cache(layer)) {
+        return cache->slot_k(0, head, physical_pos(layer, pos));
+    }
     return k32_.data() + slot_index(layer, head, pos);
 }
 float* KVCache::slot_v(int layer, int head, int pos) {
+    if (KVCache* cache = layer_cache(layer)) {
+        return cache->slot_v(0, head, physical_pos(layer, pos));
+    }
     return v32_.data() + slot_index(layer, head, pos);
 }
 const float* KVCache::slot_k(int layer, int head, int pos) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->slot_k(0, head, physical_pos(layer, pos));
+    }
     return k32_.data() + slot_index(layer, head, pos);
 }
 const float* KVCache::slot_v(int layer, int head, int pos) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->slot_v(0, head, physical_pos(layer, pos));
+    }
     return v32_.data() + slot_index(layer, head, pos);
 }
-float* KVCache::head_k(int layer, int head) { return slot_k(layer, head, 0); }
-float* KVCache::head_v(int layer, int head) { return slot_v(layer, head, 0); }
+float* KVCache::head_k(int layer, int head) {
+    if (KVCache* cache = layer_cache(layer)) return cache->head_k(0, head);
+    return slot_k(layer, head, 0);
+}
+float* KVCache::head_v(int layer, int head) {
+    if (KVCache* cache = layer_cache(layer)) return cache->head_v(0, head);
+    return slot_v(layer, head, 0);
+}
 const float* KVCache::head_k(int layer, int head) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->head_k(0, head);
+    }
     return slot_k(layer, head, 0);
 }
 const float* KVCache::head_v(int layer, int head) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->head_v(0, head);
+    }
     return slot_v(layer, head, 0);
 }
 const uint16_t* KVCache::head_k16(int layer, int head) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->head_k16(0, head);
+    }
     return k16_.data() + slot_index(layer, head, 0);
 }
 const uint16_t* KVCache::head_v16(int layer, int head) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->head_v16(0, head);
+    }
     return v16_.data() + slot_index(layer, head, 0);
 }
 

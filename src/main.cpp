@@ -727,13 +727,23 @@ static int run_generate(const std::string& path,
     KVCache kv;
     if (n_attn > 0) {
         kv.set_streaming(streaming_kv && kv_mode == KVCacheMode::LAPLACE);
-        if (!kv.init(n_attn, cfg.n_kv_heads, cfg.head_dim, max_seq, kv_mode)) {
+        const std::vector<KVLayerConfig> kv_layers =
+            model.kv_layer_configs(max_seq, kv_mode);
+        const bool initialized = kv_layers.empty()
+            ? kv.init(n_attn, cfg.n_kv_heads, cfg.head_dim, max_seq, kv_mode)
+            : kv.init(kv_layers);
+        if (!initialized) {
             fprintf(stderr,
                     "kv-cache: LaplaceKV init failed for head_dim=%d, using FP16\n",
                     cfg.head_dim);
             kv_mode = KVCacheMode::FP16;
-            if (!kv.init(n_attn, cfg.n_kv_heads, cfg.head_dim,
-                         max_seq, kv_mode)) {
+            const std::vector<KVLayerConfig> fp16_layers =
+                model.kv_layer_configs(max_seq, kv_mode);
+            const bool fp16_initialized = fp16_layers.empty()
+                ? kv.init(n_attn, cfg.n_kv_heads, cfg.head_dim,
+                          max_seq, kv_mode)
+                : kv.init(fp16_layers);
+            if (!fp16_initialized) {
                 return 1;
             }
         }
@@ -742,6 +752,9 @@ static int run_generate(const std::string& path,
                          : streaming_kv ? "LaplaceKV K8/V6 streaming"
                                         : "LaplaceKV K8/V6 resident";
         fprintf(stderr, "kv-cache: %s\n", name);
+        fprintf(stderr, "kv-cache: %.2f MiB active, %.2f MiB archive\n",
+                kv.storage_bytes() / 1048576.0,
+                kv.archive_bytes() / 1048576.0);
     }
 
     std::vector<float> logits(static_cast<size_t>(max_batch) * cfg.vocab);
@@ -790,11 +803,23 @@ static int run_generate(const std::string& path,
     std::vector<int> context = prompt_tokens;   // full history for draft lookup
     long n_drafted = 0, n_accepted = 0;
 
+    bool channel_header = false;
     auto emit = [&](int id) {
+        if (id == tok.channel_start_id()) {
+            channel_header = true;
+            return;
+        }
+        if (channel_header) {
+            if (id == tok.channel_end_id()) channel_header = false;
+            return;
+        }
         std::string piece = tok.decode(id);
         printf("%s", piece.c_str());
     };
-    auto is_stop = [&](int id) { return id == tok.eos_id() || id == tok.im_end_id(); };
+    auto is_stop = [&](int id) {
+        return id == tok.eos_id() || id == tok.im_end_id() ||
+               id == tok.turn_end_id();
+    };
 
     int cur = spec ? argmax_row(logits.data() + static_cast<size_t>(last_row) * cfg.vocab, cfg.vocab)
                    : sampler.sample(logits.data() + static_cast<size_t>(last_row) * cfg.vocab, cfg.vocab);

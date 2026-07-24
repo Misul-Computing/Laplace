@@ -14,7 +14,6 @@ static id<MTLBuffer> g_ybuf;
 static std::mutex g_xy_mtx;
 static std::once_flag g_init;
 static std::mutex g_wb_mtx;
-static std::unordered_map<const void*, id<MTLBuffer>> g_wb_cache;
 static std::mutex g_pipe_mtx;
 static std::unordered_map<int, id<MTLComputePipelineState>> g_pipes;
 static std::unordered_map<int, id<MTLComputePipelineState>> g_gemm_pipes;
@@ -49,43 +48,46 @@ static inline float dequant_f16(device const uchar* row, int k) { return float((
 static inline float dequant_bf16(device const uchar* row, int k) { ushort v = ((device const ushort*)row)[k]; return as_type<float>((uint32_t)v << 16); }
 
 static inline float deq_q4_0(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d); uint8_t q = blk[b].qs[l%16];
     return d * float((l < 16 ? (q & 0xF) : (q >> 4)) - 8);
 }
 static inline float deq_q4_1(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d), m = float(blk[b].m); uint8_t q = blk[b].qs[l%16];
     return d * float(l < 16 ? (q & 0xF) : (q >> 4)) + m;
 }
 static inline float deq_q5_0(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; uchar qh[4]; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; uchar qh[4]; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d); uint qh = (uint)blk[b].qh[0]|((uint)blk[b].qh[1]<<8)|((uint)blk[b].qh[2]<<16)|((uint)blk[b].qh[3]<<24);
     uint8_t q = blk[b].qs[l%16]; int val = (l < 16 ? (q & 0xF) : (q >> 4)) | (((qh >> l) & 1) << 4);
     return d * float(val - 16);
 }
 static inline float deq_q5_1(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qh[4]; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qh[4]; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d), m = float(blk[b].m); uint qh = (uint)blk[b].qh[0]|((uint)blk[b].qh[1]<<8)|((uint)blk[b].qh[2]<<16)|((uint)blk[b].qh[3]<<24);
     uint8_t q = blk[b].qs[l%16]; int val = (l < 16 ? (q & 0xF) : (q >> 4)) | (((qh >> l) & 1) << 4);
     return d * float(val) + m;
 }
 static inline float deq_q8_0(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; int8_t qs[32]; }* blk = (device const decltype(blk))row;
-    return float(blk[b].d) * float(blk[b].qs[l]);
+    int b = k/QK, l = k%QK;
+    device const uchar* block = row + b * 34;
+    int q = int(block[2 + l]);
+    return float(*(device const half*)block) *
+           float(q < 128 ? q : q - 256);
 }
 static inline uchar2 get_scm(int j, device const uchar* q) {
     return j < 4 ? uchar2(q[j]&63, q[j+4]&63) : uchar2((q[j+4]&0xF)|((q[j-4]>>6)<<4), (q[j+4]>>4)|((q[j]>>6)<<4));
 }
 static inline float deq_q4_K(device const uchar* row, int k) {
-    int b = k/QK_K, off = k%QK_K; device const struct { half d; half dmin; uchar scales[12]; uchar qs[128]; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, off = k%QK_K; device const struct { half d; half dmin; uchar scales[12]; uchar qs[128]; }* blk = (decltype(blk))row;
     int jb = off/64, l = off%64; int is = jb*2; int lo = l%32, hi = l>=32; uint8_t q = blk[b].qs[jb*32 + lo];
     uchar2 s = hi ? get_scm(is+1, blk[b].scales) : get_scm(is, blk[b].scales);
     float val = hi ? float(q >> 4) : float(q & 0xF);
     return float(blk[b].d) * s.x * val - float(blk[b].dmin) * s.y;
 }
 static inline float deq_q6_K(device const uchar* row, int k) {
-    int b = k/QK_K, off = k%QK_K; device const struct { uchar ql[128]; uchar qh[64]; int8_t scales[16]; half d; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, off = k%QK_K; device const struct { uchar ql[128]; uchar qh[64]; int8_t scales[16]; half d; }* blk = (decltype(blk))row;
     int n = off/128, lh = off%128, sg = lh/32, l = lh%32, is = l/16;
     int qlb = n*64 + l + (sg%2)*32, qls = sg < 2 ? 0 : 4;
     int q = (int)((blk[b].ql[qlb] >> qls) & 0xF) | (((blk[b].qh[n*32 + l] >> (sg*2)) & 3) << 4);
@@ -93,7 +95,7 @@ static inline float deq_q6_K(device const uchar* row, int k) {
 }
 
 static inline float deq_q2_K(device const uchar* row, int k) {
-    int b = k/QK_K, off = k%QK_K; device const struct { uchar scales[16]; uchar qs[64]; half d; half dmin; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, off = k%QK_K; device const struct { uchar scales[16]; uchar qs[64]; half d; half dmin; }* blk = (decltype(blk))row;
     int j = off/16, l = off%16;
     int hf = j/8, jj = j%8, group = jj/2, lo = jj%2;
     uint8_t q = (blk[b].qs[hf*32 + lo*16 + l] >> (group*2)) & 3;
@@ -102,7 +104,7 @@ static inline float deq_q2_K(device const uchar* row, int k) {
 }
 
 static inline float deq_q3_K(device const uchar* row, int k) {
-    int b = k/QK_K, off = k%QK_K; device const struct { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, off = k%QK_K; device const struct { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; }* blk = (decltype(blk))row;
     device const uchar* sc = blk[b].scales;
     const uint kmask1 = 0x03030303u, kmask2 = 0x0f0f0f0fu;
     uint a0 = (uint)sc[0]|((uint)sc[1]<<8)|((uint)sc[2]<<16)|((uint)sc[3]<<24);
@@ -124,7 +126,7 @@ static inline float deq_q3_K(device const uchar* row, int k) {
 }
 
 static inline float deq_q5_K(device const uchar* row, int k) {
-    int b = k/QK_K, off = k%QK_K; device const struct { half d; half dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, off = k%QK_K; device const struct { half d; half dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]; }* blk = (decltype(blk))row;
     int jb = off/64, l = off%64; int is = jb*2; int hi = l>=32;
     uchar2 s = hi ? get_scm(is+1, blk[b].scales) : get_scm(is, blk[b].scales);
     uint8_t q = blk[b].qs[jb*32 + (l%32)];
@@ -209,17 +211,16 @@ kernel void gemv(
         }
     } else if (QUANT_TYPE == T_Q8_0) {
         int nb = K / 32;
-        device const q8_0_blk* wr = (device const q8_0_blk*)row;
         for (int b = tiisg; b < nb; b += 32) {
-            float d0 = float(wr[b].d);
-            float4 v0 = float4(0);
-            for (int i = 0; i < 8; i++) {
-                float4 a0 = *(device const float4*)(xm + b*32 + i*4);
-                char4 cq = *(device const char4*)(wr[b].qs + i*4);
-                float4 q0 = float4(float(cq.x), float(cq.y), float(cq.z), float(cq.w));
-                v0 += a0 * q0;
+            device const uchar* block = row + b * 34;
+            float d0 = float(*(device const half*)block);
+            float sum = 0.0f;
+            for (int i = 0; i < 32; ++i) {
+                int q = int(block[2 + i]);
+                if (q >= 128) q -= 256;
+                sum += xm[b * 32 + i] * float(q);
             }
-            acc += d0 * (v0.x+v0.y+v0.z+v0.w);
+            acc += d0 * sum;
         }
     } else if (QUANT_TYPE == T_Q6_K) {
         int nb = K / 256;
@@ -245,7 +246,7 @@ kernel void gemv(
         }
     } else if (QUANT_TYPE == T_Q4_0) {
         int nb = K / 32;
-        device const struct { half d; uchar qs[16]; }* wr = (device const decltype(wr))row;
+        device const struct { half d; uchar qs[16]; }* wr = (decltype(wr))row;
         for (int b = tiisg; b < nb; b += 32) {
             float d = float(wr[b].d);
             device const uint16_t* q4 = (device const uint16_t*)wr[b].qs;
@@ -313,39 +314,42 @@ static inline float dequant_f16(device const uchar* row, int k) { return float((
 static inline float dequant_bf16(device const uchar* row, int k) { ushort v = ((device const ushort*)row)[k]; return as_type<float>((uint32_t)v << 16); }
 
 static inline float deq_q4_0(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d); uint8_t q = blk[b].qs[l%16];
     return d * float((l < 16 ? (q & 0xF) : (q >> 4)) - 8);
 }
 static inline float deq_q4_1(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d), m = float(blk[b].m); uint8_t q = blk[b].qs[l%16];
     return d * float(l < 16 ? (q & 0xF) : (q >> 4)) + m;
 }
 static inline float deq_q5_0(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; uchar qh[4]; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; uchar qh[4]; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d); uint qh = (uint)blk[b].qh[0]|((uint)blk[b].qh[1]<<8)|((uint)blk[b].qh[2]<<16)|((uint)blk[b].qh[3]<<24);
     uint8_t q = blk[b].qs[l%16]; int val = (l < 16 ? (q & 0xF) : (q >> 4)) | (((qh >> l) & 1) << 4);
     return d * float(val - 16);
 }
 static inline float deq_q5_1(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qh[4]; uchar qs[16]; }* blk = (device const decltype(blk))row;
+    int b = k/QK, l = k%QK; device const struct { half d; half m; uchar qh[4]; uchar qs[16]; }* blk = (decltype(blk))row;
     float d = float(blk[b].d), m = float(blk[b].m); uint qh = (uint)blk[b].qh[0]|((uint)blk[b].qh[1]<<8)|((uint)blk[b].qh[2]<<16)|((uint)blk[b].qh[3]<<24);
     uint8_t q = blk[b].qs[l%16]; int val = (l < 16 ? (q & 0xF) : (q >> 4)) | (((qh >> l) & 1) << 4);
     return d * float(val) + m;
 }
 static inline float deq_q8_0(device const uchar* row, int k) {
-    int b = k/QK, l = k%QK; device const q8_0_blk* blk = (device const q8_0_blk*)row;
-    return float(blk[b].d) * float(blk[b].qs[l]);
+    int b = k/QK, l = k%QK;
+    device const uchar* block = row + b * 34;
+    int q = int(block[2 + l]);
+    return float(*(device const half*)block) *
+           float(q < 128 ? q : q - 256);
 }
 static inline float deq_q2_K(device const uchar* row, int k) {
-    int b = k/QK_K, l = k%QK_K; device const struct { uchar scales[16]; uchar qs[64]; half d; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, l = k%QK_K; device const struct { uchar scales[16]; uchar qs[64]; half d; }* blk = (decltype(blk))row;
     uchar sc = blk[b].scales[l/16]; uchar q = blk[b].qs[l/4];
     int shift = (l % 4) * 2; int qv = (q >> shift) & 3;
     return float(blk[b].d) * float(qv - 2) * float(sc);
 }
 static inline float deq_q3_K(device const uchar* row, int k) {
-    int b = k/QK_K, l = k%QK_K; device const struct { half d; uchar scales[12]; uchar qs[64]; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, l = k%QK_K; device const struct { half d; uchar scales[12]; uchar qs[64]; }* blk = (decltype(blk))row;
     int is = l/16; uchar sc = blk[b].scales[is] & 0x3F; int sign = (blk[b].scales[is] >> 6) & 1;
     uchar q = blk[b].qs[l/4]; int shift = (l % 4) * 2; int qv = (q >> shift) & 3;
     return float(blk[b].d) * float(qv - (sign ? 4 : 0)) * float(sc);
@@ -357,7 +361,7 @@ static inline float deq_q4_K(device const uchar* row, int k) {
     return float(blk[b].d) * float(qv - 8) * float(sc);
 }
 static inline float deq_q5_K(device const uchar* row, int k) {
-    int b = k/QK_K, l = k%QK_K; device const struct { half d; half dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]; }* blk = (device const decltype(blk))row;
+    int b = k/QK_K, l = k%QK_K; device const struct { half d; half dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]; }* blk = (decltype(blk))row;
     uchar sc = blk[b].scales[l/16]; uchar qh_v = blk[b].qh[l/8]; uchar q = blk[b].qs[l/2 + (l>=128?64:0)];
     int shift = (l % 32 < 16) ? 0 : 4; int qv = (q >> shift) & 0xF; int qh_bit = (qh_v >> (l%8)) & 1;
     return float(blk[b].d) * float(qv + qh_bit*16 - 8) * float(sc);
@@ -544,6 +548,7 @@ static id<MTLComputePipelineState> get_gemm_pipe(int type) {
 }
 
 bool metal_available() { init(); return g_dev != nil; }
+bool metal_device_present() { return MTLCreateSystemDefaultDevice() != nil; }
 
 // Create zero-copy Metal buffers covering the mmap'd GGUF file. The pointer
 // is page-aligned (mmap guarantees this). The length is rounded up to page
@@ -605,18 +610,13 @@ static id<MTLBuffer> get_weight_buf(const void* ptr, size_t len, size_t& offset)
         // Try zero-copy mmap path first
         id<MTLBuffer> mb = find_mmap_buf_locked(ptr, len, offset);
         if (mb) return mb;
-        // Try copy cache
-        auto it = g_wb_cache.find(ptr);
-        if (it != g_wb_cache.end()) return it->second;
     }
-    // Fall back to copy for tensors not in the registered mmap
+    // Heap-backed tensors may reuse an address after their allocation is
+    // released, so caching a copied buffer by pointer can return stale
+    // weights. Model weights use the zero-copy mmap path above.
     madvise((void*)ptr, len, MADV_WILLNEED);
     id<MTLBuffer> buf = [g_dev newBufferWithBytes:ptr length:len options:MTLResourceStorageModeShared];
-    if (buf) {
-        std::lock_guard<std::mutex> lk(g_wb_mtx);
-        g_wb_cache[ptr] = buf;
-        madvise((void*)ptr, len, MADV_DONTNEED);
-    }
+    if (buf) madvise((void*)ptr, len, MADV_DONTNEED);
     return buf;
 }
 

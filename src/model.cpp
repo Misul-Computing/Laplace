@@ -14,6 +14,7 @@
 #include "ops.h"
 #include "trace.h"
 #include "laplace_moe.h"
+#include "topology.h"
 
 #if defined(__APPLE__)
 #include <sys/mman.h>
@@ -61,6 +62,7 @@ void Model::restore_ssm_state(const float* checkpoint) {
 
 bool Model::init(const GGUFContext& gguf) {
     const auto& m = gguf.metadata();
+    topology_ = {};
 
     LaplaceMoE::set_file_fd(gguf.fd());
     LaplaceMoE::set_mmap_base(gguf.file_data());
@@ -70,7 +72,17 @@ bool Model::init(const GGUFContext& gguf) {
         fprintf(stderr, "model: missing general.architecture\n");
         return false;
     }
-    arch_ = create_arch(*arch_name);
+    TopologyPlan topology;
+    std::string topology_error;
+    if (synthesize_topology(gguf, &topology, &topology_error)) {
+        topology_ = topology;
+        arch_ = create_adaptive_arch(std::move(topology));
+    } else {
+        arch_ = create_arch(*arch_name);
+        if (!arch_) {
+            fprintf(stderr, "%s\n", topology_error.c_str());
+        }
+    }
     if (!arch_) {
         fprintf(stderr, "model: unsupported architecture '%s'\n", arch_name->c_str());
         return false;
@@ -108,6 +120,11 @@ bool Model::init(const GGUFContext& gguf) {
 
     plan_residency();
     return true;
+}
+
+std::vector<KVLayerConfig> Model::kv_layer_configs(
+        int max_seq_len, KVCacheMode mode) const {
+    return make_kv_layer_configs(topology_, max_seq_len, mode);
 }
 
 // Decide which weights stay resident and which stream from SSD.
@@ -334,19 +351,30 @@ bool Model::reserve(int max_seq_len, int max_batch) {
 
     // RoPE cos/sin tables: [max_seq, rope_pairs].
     //   angle(pos, p) = pos * base^(-2p / rope_dim_count)
-    buffers_.rope_pairs = cfg_.rope_dim_count / 2;
-    buffers_.rope_cos.resize(static_cast<size_t>(max_seq_) * buffers_.rope_pairs);
-    buffers_.rope_sin.resize(static_cast<size_t>(max_seq_) * buffers_.rope_pairs);
-    for (int p = 0; p < buffers_.rope_pairs; p++) {
-        double inv_freq = std::pow(static_cast<double>(cfg_.rope_freq_base),
-                                   -2.0 * p / cfg_.rope_dim_count);
-        for (int pos = 0; pos < max_seq_; pos++) {
-            double angle = pos * inv_freq;
-            buffers_.rope_cos[static_cast<size_t>(pos) * buffers_.rope_pairs + p] =
-                static_cast<float>(std::cos(angle));
-            buffers_.rope_sin[static_cast<size_t>(pos) * buffers_.rope_pairs + p] =
-                static_cast<float>(std::sin(angle));
+    if (arch_->needs_shared_rope_table()) {
+        buffers_.rope_pairs = cfg_.rope_dim_count / 2;
+        buffers_.rope_cos.resize(
+            static_cast<size_t>(max_seq_) * buffers_.rope_pairs);
+        buffers_.rope_sin.resize(
+            static_cast<size_t>(max_seq_) * buffers_.rope_pairs);
+        for (int p = 0; p < buffers_.rope_pairs; p++) {
+            double inv_freq = std::pow(
+                static_cast<double>(cfg_.rope_freq_base),
+                -2.0 * p / cfg_.rope_dim_count);
+            for (int pos = 0; pos < max_seq_; pos++) {
+                double angle = pos * inv_freq;
+                buffers_.rope_cos[
+                    static_cast<size_t>(pos) * buffers_.rope_pairs + p] =
+                    static_cast<float>(std::cos(angle));
+                buffers_.rope_sin[
+                    static_cast<size_t>(pos) * buffers_.rope_pairs + p] =
+                    static_cast<float>(std::sin(angle));
+            }
         }
+    } else {
+        buffers_.rope_pairs = 0;
+        buffers_.rope_cos.clear();
+        buffers_.rope_sin.clear();
     }
 
     return true;

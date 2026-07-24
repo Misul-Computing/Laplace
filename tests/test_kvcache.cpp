@@ -86,6 +86,35 @@ int main() {
         CHECK(accounting.storage_bytes() == 1 * 1 * 64 * 64 * 2 * 2);
     }
 
+    {
+        KVCache layered;
+        std::vector<KVLayerConfig> layers = {
+            {2, 8, 4, 4, KVCacheMode::FP32},
+            {1, 16, 16, 0, KVCacheMode::FP32},
+        };
+        CHECK(layered.init(layers));
+        float key[8];
+        float value[8];
+        for (int pos = 0; pos < 10; ++pos) {
+            for (int dim = 0; dim < 8; ++dim) {
+                key[dim] = 100.0f * pos + dim;
+                value[dim] = -100.0f * pos - dim;
+            }
+            layered.store_k(0, 1, pos, key);
+            layered.store_v(0, 1, pos, value);
+        }
+        for (int pos = 6; pos < 10; ++pos) {
+            layered.load_k(0, 1, pos, key);
+            layered.load_v(0, 1, pos, value);
+            for (int dim = 0; dim < 8; ++dim) {
+                CHECK(key[dim] == 100.0f * pos + dim);
+                CHECK(value[dim] == -100.0f * pos - dim);
+            }
+        }
+        CHECK(layered.storage_bytes() ==
+              (2 * 8 * 4 * 2 + 1 * 16 * 16 * 2) * sizeof(float));
+    }
+
     // LaplaceKV keeps full tiles compressed and the newest partial tile
     // in FP32. Both per-token compatibility loads and whole-head dots must
     // cover the boundary without changing positions.

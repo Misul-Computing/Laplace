@@ -76,6 +76,8 @@ TestVocab build_vocab() {
     v.tokens.push_back("bc");
     v.tokens.push_back("<|im_start|>");
     v.tokens.push_back("<|im_end|>");
+    v.tokens.push_back("<|channel>");
+    v.tokens.push_back("<channel|>");
 
     v.merges = {
         "h e", "l l", "ll o", "he llo",
@@ -149,6 +151,8 @@ void test_special_ids(const Tokenizer& tok, const TestVocab& v) {
     CHECK(tok.im_start_id() == v.id("<|im_start|>"));
     CHECK(tok.im_end_id()   == v.id("<|im_end|>"));
     CHECK(tok.eos_id()      == v.id("<|im_end|>"));
+    CHECK(tok.channel_start_id() == v.id("<|channel>"));
+    CHECK(tok.channel_end_id() == v.id("<channel|>"));
 }
 
 void test_chat_template(const Tokenizer& tok) {

@@ -1,5 +1,6 @@
 #include "topology.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace Laplace {
@@ -11,10 +12,17 @@ bool fail(std::string* error, const std::string& message) {
     return false;
 }
 
-const MetaArrayU32* u32_array(
-    const std::map<std::string, MetaValue>& metadata,
-    const std::string& key) {
-    return meta_as<MetaArrayU32>(metadata, key.c_str());
+bool integer_array(const std::map<std::string, MetaValue>& metadata,
+                   const std::string& key, std::vector<int>* output) {
+    auto copy = [&](const auto* values) {
+        if (!values) return false;
+        output->assign(values->begin(), values->end());
+        return true;
+    };
+    return copy(meta_as<MetaArrayU32>(metadata, key.c_str())) ||
+           copy(meta_as<MetaArrayI32>(metadata, key.c_str())) ||
+           copy(meta_as<MetaArrayU64>(metadata, key.c_str())) ||
+           copy(meta_as<MetaArrayI64>(metadata, key.c_str()));
 }
 
 } // namespace
@@ -57,15 +65,16 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
         return fail(error, "topology: incomplete model or attention dimensions");
     }
 
-    const MetaArrayU32* kv_heads =
-        u32_array(metadata, prefix + "attention.head_count_kv");
-    const MetaArrayU32* sliding_pattern =
-        u32_array(metadata, prefix + "attention.sliding_window_pattern");
-    if (!kv_heads || static_cast<int>(kv_heads->size()) != layer_count) {
+    std::vector<int> kv_heads;
+    std::vector<int> sliding_pattern;
+    if (!integer_array(metadata, prefix + "attention.head_count_kv",
+                       &kv_heads) ||
+        static_cast<int>(kv_heads.size()) != layer_count) {
         return fail(error, "topology: attention.head_count_kv must have one entry per layer");
     }
-    if (!sliding_pattern ||
-        static_cast<int>(sliding_pattern->size()) != layer_count) {
+    if (!integer_array(metadata, prefix + "attention.sliding_window_pattern",
+                       &sliding_pattern) ||
+        static_cast<int>(sliding_pattern.size()) != layer_count) {
         return fail(error,
                     "topology: attention.sliding_window_pattern must have one entry per layer");
     }
@@ -78,6 +87,10 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
         (candidate.n_experts_used > 0 &&
          candidate.expert_intermediate > 0)) {
         return fail(error, "topology: incomplete routed-expert dimensions");
+    }
+    if (candidate.n_experts_used > candidate.n_experts ||
+        candidate.n_experts_used > 16) {
+        return fail(error, "topology: routed expert count exceeds execution limit");
     }
     candidate.rms_eps =
         real("attention.layer_norm_rms_epsilon", 1e-6);
@@ -94,9 +107,9 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
     candidate.layers.resize(layer_count);
     for (int layer = 0; layer < layer_count; ++layer) {
         LayerTopology& output = candidate.layers[layer];
-        const bool sliding = (*sliding_pattern)[layer] != 0;
+        const bool sliding = sliding_pattern[layer] != 0;
         output.n_q_heads = query_heads;
-        output.n_kv_heads = static_cast<int>((*kv_heads)[layer]);
+        output.n_kv_heads = kv_heads[layer];
         output.head_dim = sliding ? sliding_dim : global_dim;
         output.sliding_window = sliding ? window : 0;
         output.rope_dim = sliding ? sliding_rope_dim : global_rope_dim;
@@ -105,8 +118,10 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
 
         if (output.n_kv_heads <= 0 ||
             output.n_q_heads % output.n_kv_heads != 0 ||
+            output.head_dim > 512 ||
             output.rope_dim <= 0 || output.rope_dim > output.head_dim ||
             (output.rope_dim & 1) != 0 ||
+            output.rope_base <= 0.0f ||
             (sliding && output.sliding_window <= 0)) {
             return fail(error, "topology: invalid attention geometry at layer " +
                                std::to_string(layer));
@@ -116,6 +131,27 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
     *plan = std::move(candidate);
     if (error) error->clear();
     return true;
+}
+
+std::vector<KVLayerConfig> make_kv_layer_configs(
+        const TopologyPlan& plan, int max_seq_len, KVCacheMode mode) {
+    std::vector<KVLayerConfig> output;
+    if (max_seq_len <= 0) return output;
+    output.reserve(plan.layers.size());
+    for (const LayerTopology& layer : plan.layers) {
+        KVLayerConfig config;
+        config.n_kv_heads = layer.n_kv_heads;
+        config.head_dim = layer.head_dim;
+        config.sliding_window = layer.sliding_window;
+        config.capacity = layer.sliding_window > 0
+                        ? std::min(max_seq_len, layer.sliding_window)
+                        : max_seq_len;
+        config.mode = layer.sliding_window > 0 &&
+                      mode == KVCacheMode::LAPLACE
+                    ? KVCacheMode::FP16 : mode;
+        output.push_back(config);
+    }
+    return output;
 }
 
 } // namespace Laplace

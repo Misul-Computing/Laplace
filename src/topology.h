@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "gguf.h"
+#include "kvcache.h"
 
 namespace Laplace {
 
@@ -33,5 +34,7 @@ struct TopologyPlan {
 };
 
 bool synthesize_topology(const GGUFContext&, TopologyPlan*, std::string* error);
+std::vector<KVLayerConfig> make_kv_layer_configs(
+    const TopologyPlan&, int max_seq_len, KVCacheMode mode);
 
 } // namespace Laplace

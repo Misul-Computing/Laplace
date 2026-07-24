@@ -63,7 +63,7 @@ set(LAPLACE_SOURCES
     src/arch_qwen3next.cpp
     src/arch_llama.cpp
     src/arch_phi3.cpp
-    src/arch_gemma4.cpp
+    src/arch_adaptive.cpp
     src/ssm.cpp
     src/tokenizer.cpp
     src/sampler.cpp
@@ -148,7 +148,7 @@ add_executable(test_arch tests/test_arch.cpp
     src/arch_qwen3next.cpp
     src/arch_llama.cpp
     src/arch_phi3.cpp
-    src/arch_gemma4.cpp
+    src/arch_adaptive.cpp
     src/laplace_moe.cpp
     src/matmul.cpp
     src/matmul_simd.cpp

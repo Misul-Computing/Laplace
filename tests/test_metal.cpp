@@ -9,11 +9,15 @@
 
 using namespace Laplace;
 using namespace Laplace::kernels;
-namespace Laplace { extern bool metal_available(); extern bool metal_gemv(const float* x, const Tensor& w, float* y, int K, int N); }
+namespace Laplace { extern bool metal_available(); extern bool metal_device_present(); extern bool metal_gemv(const float* x, const Tensor& w, float* y, int K, int N); }
 
 static void rng_fill(float* v, int n, unsigned seed) {
     unsigned s = seed;
-    for (int i = 0; i < n; i++) { s = s*1103515245 + 12345; v[i] = (float)((s >> 16) % 200 - 100) / 10.0f; }
+    for (int i = 0; i < n; i++) {
+        s = s * 1103515245 + 12345;
+        v[i] = static_cast<float>(
+            static_cast<int>((s >> 16) % 200) - 100) / 10.0f;
+    }
 }
 
 static uint16_t f2h(float f) { return fp32_to_fp16(f); }
@@ -159,7 +163,14 @@ static void pack_q5_K(const float* w, int K, int N, uint8_t* out) {
 }
 
 int main() {
-    if (!metal_available()) { fprintf(stderr, "SKIP: no Metal\n"); return 0; }
+    if (!metal_device_present()) {
+        fprintf(stderr, "SKIP: no Metal device\n");
+        return 0;
+    }
+    if (!metal_available()) {
+        fprintf(stderr, "FAIL: Metal device present but kernels did not compile\n");
+        return 1;
+    }
     fprintf(stderr, "[metal] device available\n");
 
     const int K = 2816, N = 512;
@@ -200,7 +211,11 @@ int main() {
         float max_err = 0, max_val = 0;
         for (int j = 0; j < N; j++) { max_err = fmaxf(max_err, fabsf(y_ref[j]-y_gpu[j])); max_val = fmaxf(max_val, fabsf(y_ref[j])); }
         float rel = max_val > 0 ? max_err/max_val : 0;
-        if (rel > 0.01f) { fprintf(stderr, "FAIL %s: rel err %.6f (err=%.2f val=%.1f)\n", tc.name, rel, max_err, max_val); fail++; }
+        if (!std::isfinite(rel) || rel > 0.01f) {
+            fprintf(stderr, "FAIL %s: rel err %.6f (err=%.2f val=%.1f) first=(%.2f,%.2f)\n",
+                    tc.name, rel, max_err, max_val, y_ref[0], y_gpu[0]);
+            fail++;
+        }
         else { fprintf(stderr, "PASS %s: rel err %.6f\n", tc.name, rel); pass++; }
     }
     fprintf(stderr, "%d passed, %d failed\n", pass, fail);

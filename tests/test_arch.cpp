@@ -136,6 +136,9 @@ void test_topology_uses_features_not_architecture_name() {
     CHECK_MSG(synthesize_topology(gguf, &plan, &error), "%s", error.c_str());
     CHECK(plan.metadata_namespace == "mystery.");
     CHECK(plan.layers.size() == 2);
+    auto adaptive = create_adaptive_arch(plan);
+    CHECK(adaptive != nullptr);
+    if (adaptive) CHECK(std::string(adaptive->name()) == "adaptive");
     if (plan.layers.size() == 2) {
         CHECK(plan.layers[0].sliding_window == 64);
         CHECK(plan.layers[0].n_kv_heads == 4);
@@ -145,6 +148,20 @@ void test_topology_uses_features_not_architecture_name() {
         CHECK(plan.layers[1].head_dim == 16);
         CHECK(plan.layers[1].moe);
     }
+    const auto kv_layers =
+        make_kv_layer_configs(plan, 262144, KVCacheMode::LAPLACE);
+    CHECK(kv_layers.size() == 2);
+    if (kv_layers.size() == 2) {
+        CHECK(kv_layers[0].capacity == 64);
+        CHECK(kv_layers[0].mode == KVCacheMode::FP16);
+        CHECK(kv_layers[1].capacity == 262144);
+        CHECK(kv_layers[1].mode == KVCacheMode::LAPLACE);
+    }
+    const auto short_kv_layers =
+        make_kv_layer_configs(plan, 32, KVCacheMode::FP16);
+    KVCache short_cache;
+    CHECK(short_kv_layers.size() == 2);
+    CHECK(short_cache.init(short_kv_layers));
     std::remove("test_topology.gguf");
 }
 

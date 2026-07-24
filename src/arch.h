@@ -13,6 +13,7 @@ namespace Laplace {
 
 struct ModelConfig;
 struct LayerWeights;
+struct TopologyPlan;
 
 // Activation and persistent state scratch buffers sized for max_batch rows.
 struct ModelBuffers {
@@ -77,9 +78,11 @@ public:
                                const ModelConfig& cfg, int M, int pos0,
                                KVCache& kv, ModelBuffers* buf,
                                float* checkpoints) = 0;
+    virtual bool needs_shared_rope_table() const { return true; }
 };
 
 // Static factory: maps general.architecture strings to implementations.
 std::unique_ptr<ModelArch> create_arch(const std::string& name);
+std::unique_ptr<ModelArch> create_adaptive_arch(TopologyPlan plan);
 
 } // namespace Laplace

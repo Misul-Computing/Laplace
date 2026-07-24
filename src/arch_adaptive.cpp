@@ -1,5 +1,5 @@
-// arch_gemma4.cpp - Gemma 4 26B-A4B MoE architecture
-#include "arch_gemma4.h"
+// arch_adaptive.cpp - feature-driven GGUF execution
+#include "arch_adaptive.h"
 
 #include <algorithm>
 #include <array>
@@ -28,7 +28,7 @@ void rmsnorm_no_scale(const float* x, float* y, int n, float eps) {
     for (int i = 0; i < n; i++) y[i] = x[i] * inv;
 }
 
-// LAPLACE_PROF=1: per-kernel timing for the Gemma4 path. Prints averages
+// LAPLACE_PROF=1: per-kernel timing for the Adaptive path. Prints averages
 // every 100 decode tokens (a new token is detected when forward_layer is
 // called with layer==0).
 struct KernelProf {
@@ -48,7 +48,7 @@ struct KernelProf {
     void maybe_print() {
         if (!on) return;
         if (++tokens % 30 != 0) return;
-        fprintf(stderr, "\n=== PROF gemma4 per-kernel (last 100 decode tokens) ===\n");
+        fprintf(stderr, "\n=== PROF adaptive per-kernel (last 100 decode tokens) ===\n");
         double total = 0.0;
         for (int i = 0; i < NK; i++) {
             if (cnt[i] == 0) continue;
@@ -89,60 +89,45 @@ struct KTimer {
 };
 } // namespace
 
-bool Gemma4Arch::load_config(const GGUFContext& gguf, ModelConfig* cfg) {
-    const auto& m = gguf.metadata();
-    auto arch = meta_str(m, "general.architecture");
-    if (!arch || *arch != "gemma4") return false;
-    const std::string A = "gemma4.";
+bool AdaptiveArch::load_config(const GGUFContext& gguf, ModelConfig* cfg) {
+    (void)gguf;
+    cfg->n_layers = static_cast<int>(plan_.layers.size());
+    cfg->hidden = plan_.hidden;
+    cfg->intermediate = plan_.intermediate;
+    cfg->max_seq_len = plan_.max_seq_len;
+    cfg->rms_eps = plan_.rms_eps;
+    cfg->n_experts = plan_.n_experts;
+    cfg->n_experts_used = plan_.n_experts_used;
+    cfg->expert_inter = plan_.expert_intermediate;
+    cfg->logit_softcap = plan_.logit_softcap;
+    cfg->embed_scale = plan_.embed_scale;
 
-    cfg->n_layers     = static_cast<int>(meta_int(m, (A + "block_count").c_str()));
-    cfg->hidden       = static_cast<int>(meta_int(m, (A + "embedding_length").c_str()));
-    cfg->intermediate = static_cast<int>(meta_int(m, (A + "feed_forward_length").c_str()));
-    cfg->n_q_heads    = static_cast<int>(meta_int(m, (A + "attention.head_count").c_str()));
-    cfg->head_dim     = static_cast<int>(meta_int(m, (A + "attention.key_length").c_str()));
-    cfg->max_seq_len  = static_cast<int>(meta_int(m, (A + "context_length").c_str()));
-    cfg->rms_eps      = static_cast<float>(meta_float(m, (A + "attention.layer_norm_rms_epsilon").c_str(), 1e-6));
-    cfg->rope_freq_base = static_cast<float>(meta_float(m, (A + "rope.freq_base").c_str(), 1e6));
-    rope_freq_base_swa_ = static_cast<float>(meta_float(m, (A + "rope.freq_base_swa").c_str(), 10000.0f));
-
-    // MoE config
-    cfg->n_experts      = static_cast<int>(meta_int(m, (A + "expert_count").c_str(), 0));
-    cfg->n_experts_used = static_cast<int>(meta_int(m, (A + "expert_used_count").c_str(), 0));
-    cfg->expert_inter   = static_cast<int>(meta_int(m, (A + "expert_feed_forward_length").c_str(), 0));
-
-    // Logit softcapping and embedding scale
-    cfg->logit_softcap = static_cast<float>(meta_float(m, (A + "final_logit_softcapping").c_str(), 0.0f));
-    cfg->embed_scale = std::sqrt(static_cast<float>(cfg->hidden));
-
-    // Per-layer KV head counts and sliding window pattern.
-    auto* kv_heads_arr = meta_as<MetaArrayU32>(m, (A + "attention.head_count_kv").c_str());
-    auto* swa_pattern  = meta_as<MetaArrayU32>(m, (A + "attention.sliding_window_pattern").c_str());
-    int swa = static_cast<int>(meta_int(m, (A + "attention.sliding_window").c_str(), 1024));
-    int head_dim_swa = static_cast<int>(meta_int(m, (A + "attention.key_length_swa").c_str(), 256));
-
+    cfg->n_q_heads = 0;
+    cfg->n_kv_heads = 0;
+    cfg->head_dim = 0;
     layer_types_.assign(cfg->n_layers, {});
-    for (int i = 0; i < cfg->n_layers; i++) {
-        LayerTypeInfo& lti = layer_types_[i];
-        bool is_global = swa_pattern && (*swa_pattern)[i] == 0;
-        lti.is_global = is_global;
-        lti.n_q_heads = cfg->n_q_heads;
-        if (is_global) {
-            lti.head_dim = cfg->head_dim;       // 512
-            lti.n_kv_heads = kv_heads_arr ? static_cast<int>((*kv_heads_arr)[i]) : 2;
-        } else {
-            lti.head_dim = head_dim_swa;        // 256
-            lti.n_kv_heads = kv_heads_arr ? static_cast<int>((*kv_heads_arr)[i]) : 8;
+    for (int i = 0; i < cfg->n_layers; ++i) {
+        const LayerTopology& source = plan_.layers[i];
+        LayerTypeInfo& output = layer_types_[i];
+        output.is_global = source.sliding_window == 0;
+        output.n_q_heads = source.n_q_heads;
+        output.n_kv_heads = source.n_kv_heads;
+        output.head_dim = source.head_dim;
+        output.sliding_window = source.sliding_window;
+        output.rope_dim = source.rope_dim;
+        output.rope_base = source.rope_base;
+        cfg->n_q_heads = std::max(cfg->n_q_heads, source.n_q_heads);
+        cfg->n_kv_heads = std::max(cfg->n_kv_heads, source.n_kv_heads);
+        cfg->head_dim = std::max(cfg->head_dim, source.head_dim);
+        if (source.sliding_window == 0) {
+            cfg->rope_freq_base = source.rope_base;
+            cfg->rope_dim_count = source.rope_dim;
         }
     }
-
-    // KV cache uses the max dims across all layers.
-    cfg->n_kv_heads = 8;   // max(8 sliding, 2 global)
-    // head_dim stays 512 (the global max); sliding layers pad to this.
-    (void)swa;
     return true;
 }
 
-bool Gemma4Arch::load_weights(const GGUFContext& gguf, const ModelConfig& cfg,
+bool AdaptiveArch::load_weights(const GGUFContext& gguf, const ModelConfig& cfg,
                               std::vector<LayerWeights>* layers,
                               std::vector<bool>* is_attention,
                               std::vector<int>* kv_layer_idx) {
@@ -193,18 +178,18 @@ bool Gemma4Arch::load_weights(const GGUFContext& gguf, const ModelConfig& cfg,
         if (!L.attn_norm || !L.attn_q || !L.attn_k || !L.attn_output ||
             !L.attn_q_norm || !L.attn_k_norm || !L.ffn_norm ||
             !L.ffn_gate || !L.ffn_up || !L.ffn_down) {
-            fprintf(stderr, "gemma4: layer %d missing core tensors\n", i);
+            fprintf(stderr, "adaptive: layer %d missing core tensors\n", i);
             return false;
         }
         if (L.moe_gate_inp && !L.moe_gate_up_exps) {
-            fprintf(stderr, "gemma4: layer %d has router but no expert weights\n", i);
+            fprintf(stderr, "adaptive: layer %d has router but no expert weights\n", i);
             return false;
         }
     }
     return true;
 }
 
-void Gemma4Arch::reserve(const ModelConfig& cfg, int max_seq, int max_batch,
+void AdaptiveArch::reserve(const ModelConfig& cfg, int max_seq, int max_batch,
                          ModelBuffers* buf) {
     const size_t M = static_cast<size_t>(max_batch);
     const int H = cfg.hidden;
@@ -236,7 +221,7 @@ void Gemma4Arch::reserve(const ModelConfig& cfg, int max_seq, int max_batch,
         buf->moe_expert_out.assign(M * H, 0.0f);
     }
 
-    // Clear SSM/DeltaNet buffers (not used by Gemma4)
+    // Clear SSM/DeltaNet buffers (not used by Adaptive)
     buf->dnet_qkv.clear();
     buf->dnet_gate.clear();
     buf->dnet_b_proj.clear();
@@ -246,57 +231,21 @@ void Gemma4Arch::reserve(const ModelConfig& cfg, int max_seq, int max_batch,
     buf->ssm_conv_state.clear();
     buf->ssm_recurrent.clear();
 
-    // Dual RoPE tables.
-    rope_pairs_swa_ = 256 / 2;   // sliding head_dim=256, 128 pairs
-    rope_pairs_full_ = Dh_max / 2; // global head_dim=512, 256 pairs
-
-    rope_cos_swa_.assign(static_cast<size_t>(max_seq) * rope_pairs_swa_, 0.0f);
-    rope_sin_swa_.assign(static_cast<size_t>(max_seq) * rope_pairs_swa_, 0.0f);
-    rope_cos_full_.assign(static_cast<size_t>(max_seq) * rope_pairs_full_, 0.0f);
-    rope_sin_full_.assign(static_cast<size_t>(max_seq) * rope_pairs_full_, 0.0f);
-
-    // Sliding RoPE: base from metadata (default 10000), dim=256
-    float base_swa = rope_freq_base_swa_;
-    for (int p = 0; p < rope_pairs_swa_; p++) {
-        double inv_freq = std::pow(base_swa, -2.0 * p / 256);
-        for (int pos = 0; pos < max_seq; pos++) {
-            double angle = pos * inv_freq;
-            rope_cos_swa_[static_cast<size_t>(pos) * rope_pairs_swa_ + p] = std::cos(angle);
-            rope_sin_swa_[static_cast<size_t>(pos) * rope_pairs_swa_ + p] = std::sin(angle);
-        }
-    }
-
-    // Global RoPE: base=1000000, dim=512, with p-RoPE freq factors
-    float base_full = cfg.rope_freq_base;  // 1000000
-    for (int p = 0; p < rope_pairs_full_; p++) {
-        double inv_freq = std::pow(base_full, -2.0 * p / Dh_max);
-        if (p < static_cast<int>(rope_freqs_full_.size()))
-            inv_freq *= rope_freqs_full_[p];
-        for (int pos = 0; pos < max_seq; pos++) {
-            double angle = pos * inv_freq;
-            rope_cos_full_[static_cast<size_t>(pos) * rope_pairs_full_ + p] = std::cos(angle);
-            rope_sin_full_[static_cast<size_t>(pos) * rope_pairs_full_ + p] = std::sin(angle);
-        }
-    }
-
-    // Padded buffer: K and V each use Hk slots of Dh_max floats, reused
-    // per token within the attention loop (no cross-token persistence).
-    pad_buf_.assign(static_cast<size_t>(2) * Hk_max * Dh_max, 0.0f);
 }
 
-void Gemma4Arch::attention_batch(int layer, int M, int pos0, KVCache& kv,
+void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
                                  const LayerWeights& W, const LayerTypeInfo& lti,
                                  const ModelConfig& cfg, ModelBuffers* buf) {
     const int Hq = lti.n_q_heads;
     const int Hk = lti.n_kv_heads;
     const int Dh = lti.head_dim;
-    const int Dh_store = cfg.head_dim;  // 512 (KV cache slot size)
+    const int Dh_store = kv.head_dim(layer);
     const int gqa = Hq / Hk;
-    // Gemma4 uses attention scale = 1.0 (no 1/sqrt(d_k) scaling).
+    // Adaptive uses attention scale = 1.0 (no 1/sqrt(d_k) scaling).
     // Q and K are already RMSNormed, so their dot product is bounded.
     const float scale = 1.0f;
     const int max_seq = static_cast<int>(buf->attn_logits.size()) / cfg.n_q_heads;
-    const int swa_window = lti.is_global ? 0 : 1024;
+    const int swa_window = lti.sliding_window;
     const bool use_v_proj = (W.attn_v != nullptr);
     const int qn = Hq * Dh;
     const int kn = Hk * Dh;
@@ -344,32 +293,31 @@ void Gemma4Arch::attention_batch(int layer, int M, int pos0, KVCache& kv,
         // RoPE on Q and K only (not V)
         {
             KTimer _t(KernelProf::k_rope);
-            const float* cos_t = lti.is_global ? rope_cos_full_.data() : rope_cos_swa_.data();
-            const float* sin_t = lti.is_global ? rope_sin_full_.data() : rope_sin_swa_.data();
-            int rp = lti.is_global ? rope_pairs_full_ : rope_pairs_swa_;
-            const float* cs = cos_t + static_cast<size_t>(pos) * rp;
-            const float* sn = sin_t + static_cast<size_t>(pos) * rp;
-            ops::rope_apply(qp, Hq, Dh, rp, cs, sn);
-            ops::rope_apply(kp, Hk, Dh, rp, cs, sn);
+            const int pairs = lti.rope_dim / 2;
+            float cosines[256];
+            float sines[256];
+            for (int pair = 0; pair < pairs; ++pair) {
+                double inverse = std::pow(
+                    static_cast<double>(lti.rope_base),
+                    -2.0 * pair / lti.rope_dim);
+                if (lti.is_global &&
+                    pair < static_cast<int>(rope_freqs_full_.size())) {
+                    inverse *= rope_freqs_full_[pair];
+                }
+                const double angle = pos * inverse;
+                cosines[pair] = static_cast<float>(std::cos(angle));
+                sines[pair] = static_cast<float>(std::sin(angle));
+            }
+            ops::rope_apply(qp, Hq, Dh, pairs, cosines, sines);
+            ops::rope_apply(kp, Hk, Dh, pairs, cosines, sines);
         }
 
         // Store K/V in KV cache (pad to Dh_store if sliding layer)
         {
             KTimer _t(KernelProf::k_kv_store);
             for (int h = 0; h < Hk; h++) {
-                if (Dh < Dh_store) {
-                    float* pad_k = pad_buf_.data() + static_cast<size_t>(h) * Dh_store;
-                    std::memcpy(pad_k, kp + h * Dh, static_cast<size_t>(Dh) * sizeof(float));
-                    std::memset(pad_k + Dh, 0, static_cast<size_t>(Dh_store - Dh) * sizeof(float));
-                    kv.store_k(layer, h, pos, pad_k);
-                    float* pad_v = pad_buf_.data() + static_cast<size_t>(Hk + h) * Dh_store;
-                    std::memcpy(pad_v, vp + h * Dh, static_cast<size_t>(Dh) * sizeof(float));
-                    std::memset(pad_v + Dh, 0, static_cast<size_t>(Dh_store - Dh) * sizeof(float));
-                    kv.store_v(layer, h, pos, pad_v);
-                } else {
-                    kv.store_k(layer, h, pos, kp + h * Dh);
-                    kv.store_v(layer, h, pos, vp + h * Dh);
-                }
+                kv.store_k(layer, h, pos, kp + h * Dh);
+                kv.store_v(layer, h, pos, vp + h * Dh);
             }
         }
 
@@ -383,11 +331,15 @@ void Gemma4Arch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             int end = pos + 1;
             float* ao = buf->attn_out.data() + static_cast<size_t>(m) * Hq * Dh;
 
-            const bool fp32_fast = (kv.mode() == KVCacheMode::FP32);
-            const bool laplace_fast = (kv.mode() == KVCacheMode::LAPLACE);
+            const KVCacheMode layer_mode = kv.mode(layer);
+            const bool ring = kv.ring(layer);
+            const bool fp32_fast =
+                layer_mode == KVCacheMode::FP32 && !ring;
+            const bool laplace_fast =
+                layer_mode == KVCacheMode::LAPLACE && !ring;
 
             if (laplace_fast) {
-                const bool rotated = kv.laplace_rotated();
+                const bool rotated = kv.laplace_rotated(layer);
                 static thread_local std::vector<float> query_wh, output_wh;
                 size_t scratch_size = static_cast<size_t>(Hq) * Dh_store;
                 query_wh.assign(scratch_size, 0.0f);
@@ -426,6 +378,51 @@ void Gemma4Arch::attention_batch(int layer, int M, int pos0, KVCache& kv,
                         }
                         std::memcpy(ao + h * Dh, transformed_output,
                                     static_cast<size_t>(Dh) * sizeof(float));
+                    }
+                });
+            } else if (ring) {
+                for (int d = 0; d < Hq * Dh; d++) ao[d] = 0.0f;
+                ThreadPool::get().parallel_for(Hk, [&](int kvh) {
+                    const int h0 = kvh * gqa;
+                    float key[512];
+                    float value[512];
+                    for (int t = start; t < end; ++t) {
+                        kv.load_k(layer, kvh, t, key);
+                        for (int hi = 0; hi < gqa; ++hi) {
+                            const int h = h0 + hi;
+                            const float* qh = qp + h * Dh;
+                            float* logits = buf->attn_logits.data() +
+                                static_cast<size_t>(h) * max_seq;
+                            logits[t] = ops::dot(qh, key, Dh) * scale;
+                        }
+                    }
+                    for (int hi = 0; hi < gqa; ++hi) {
+                        const int h = h0 + hi;
+                        float* logits = buf->attn_logits.data() +
+                            static_cast<size_t>(h) * max_seq;
+                        float maximum = -1e30f;
+                        for (int t = start; t < end; ++t) {
+                            maximum = std::max(maximum, logits[t]);
+                        }
+                        float sum = 0.0f;
+                        for (int t = start; t < end; ++t) {
+                            logits[t] = std::exp(logits[t] - maximum);
+                            sum += logits[t];
+                        }
+                        const float inverse = 1.0f / sum;
+                        for (int t = start; t < end; ++t) {
+                            logits[t] *= inverse;
+                        }
+                    }
+                    for (int t = start; t < end; ++t) {
+                        kv.load_v(layer, kvh, t, value);
+                        for (int hi = 0; hi < gqa; ++hi) {
+                            const int h = h0 + hi;
+                            const float weight =
+                                buf->attn_logits[static_cast<size_t>(h) *
+                                                max_seq + t];
+                            ops::axpy(ao + h * Dh, weight, value, Dh);
+                        }
                     }
                 });
             } else {
@@ -504,7 +501,7 @@ void Gemma4Arch::attention_batch(int layer, int M, int pos0, KVCache& kv,
     }
 }
 
-void Gemma4Arch::moe_ffn(const LayerWeights& W, const ModelConfig& cfg,
+void AdaptiveArch::moe_ffn(const LayerWeights& W, const ModelConfig& cfg,
                          int M, const float* residual, ModelBuffers* buf) {
     const int H = cfg.hidden;
     const int n_exp = cfg.n_experts;
@@ -640,7 +637,7 @@ void Gemma4Arch::moe_ffn(const LayerWeights& W, const ModelConfig& cfg,
     }
 }
 
-void Gemma4Arch::forward_layer(int layer, const LayerWeights& W, const ModelConfig& cfg,
+void AdaptiveArch::forward_layer(int layer, const LayerWeights& W, const ModelConfig& cfg,
                                int M, int pos0, KVCache& kv, ModelBuffers* buf,
                                float* checkpoints) {
     (void)checkpoints;

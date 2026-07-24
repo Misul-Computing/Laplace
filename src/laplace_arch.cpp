@@ -4,7 +4,7 @@
 #include <memory>
 #include <string>
 
-#include "arch_gemma4.h"
+#include "arch_adaptive.h"
 #include "arch_llama.h"
 #include "arch_phi3.h"
 #include "arch_qwen3next.h"
@@ -12,7 +12,6 @@
 namespace Laplace {
 
 std::unique_ptr<ModelArch> create_arch(const std::string& name) {
-    if (name == "gemma4") return std::make_unique<Gemma4Arch>();
     if (name == "qwen3next" || name == "qwen35") {
         return std::make_unique<Qwen3NextArch>();
     }
@@ -21,6 +20,10 @@ std::unique_ptr<ModelArch> create_arch(const std::string& name) {
     }
     if (name == "phi3") return std::make_unique<Phi3Arch>();
     return nullptr;
+}
+
+std::unique_ptr<ModelArch> create_adaptive_arch(TopologyPlan plan) {
+    return std::make_unique<AdaptiveArch>(std::move(plan));
 }
 
 } // namespace Laplace
