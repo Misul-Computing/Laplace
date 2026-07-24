@@ -147,7 +147,8 @@ std::vector<KVLayerConfig> make_kv_layer_configs(
                         ? std::min(max_seq_len, layer.sliding_window)
                         : max_seq_len;
         config.mode = layer.sliding_window > 0 &&
-                      mode == KVCacheMode::LAPLACE
+                      (mode == KVCacheMode::LAPLACE ||
+                       mode == KVCacheMode::LAPLACE_Q4)
                     ? KVCacheMode::FP16 : mode;
         output.push_back(config);
     }

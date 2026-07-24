@@ -335,7 +335,8 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             const bool fp32_fast =
                 layer_mode == KVCacheMode::FP32 && !ring;
             const bool laplace_fast =
-                layer_mode == KVCacheMode::LAPLACE && !ring;
+                (layer_mode == KVCacheMode::LAPLACE ||
+                 layer_mode == KVCacheMode::LAPLACE_Q4) && !ring;
 
             if (laplace_fast) {
                 const bool rotated = kv.laplace_rotated(layer);

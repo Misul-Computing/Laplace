@@ -172,6 +172,7 @@ int main(int argc, char** argv) {
             "laplace - CPU LLM inference engine\n"
             "usage: %s <model.gguf> [-p prompt] [-n N] [-t T] [--top-k K] [--top-p P] [--max-seq L]\n"
             "       [--laplace-kv] [--laplace-stream] [--laplace-resident]\n"
+            "       [--laplace-kv-q4] (research K4/V2 global cache)\n"
             "       (baselines: [--kv-fp32] [--kv-fp16])\n"
             "       [--eval-file PATH] [--eval-limit N] [--eval-preliminary]\n"
             "       [--draft N] [--draft-mode {prompt,lookahead}] [--no-spec] [--prompt-file PATH]\n",
@@ -222,6 +223,7 @@ int main(int argc, char** argv) {
         else if (a == "--laplace-kv") { kv_mode = KVCacheMode::LAPLACE; streaming_override = -1; }
         else if (a == "--laplace-stream") { kv_mode = KVCacheMode::LAPLACE; streaming_override = 1; }
         else if (a == "--laplace-resident") { kv_mode = KVCacheMode::LAPLACE; streaming_override = 0; }
+        else if (a == "--laplace-kv-q4") { kv_mode = KVCacheMode::LAPLACE_Q4; streaming_override = -1; }
         else if (a == "--kv-fp32") { kv_mode = KVCacheMode::FP32; }
         else if (a == "--kv-fp16") { kv_mode = KVCacheMode::FP16; }
         else if (a == "--bench") { bench = true; }
@@ -726,7 +728,10 @@ static int run_generate(const std::string& path,
     // contexts and streams sealed tiles when the configured context is large.
     KVCache kv;
     if (n_attn > 0) {
-        kv.set_streaming(streaming_kv && kv_mode == KVCacheMode::LAPLACE);
+        kv.set_streaming(
+            streaming_kv &&
+            (kv_mode == KVCacheMode::LAPLACE ||
+             kv_mode == KVCacheMode::LAPLACE_Q4));
         const std::vector<KVLayerConfig> kv_layers =
             model.kv_layer_configs(max_seq, kv_mode);
         const bool initialized = kv_layers.empty()
@@ -749,6 +754,10 @@ static int run_generate(const std::string& path,
         }
         const char* name = kv_mode == KVCacheMode::FP32 ? "FP32"
                          : kv_mode == KVCacheMode::FP16 ? "FP16"
+                         : kv_mode == KVCacheMode::LAPLACE_Q4
+                             ? (streaming_kv
+                                ? "LaplaceKV K4/V2 research streaming"
+                                : "LaplaceKV K4/V2 research resident")
                          : streaming_kv ? "LaplaceKV K8/V6 streaming"
                                         : "LaplaceKV K8/V6 resident";
         fprintf(stderr, "kv-cache: %s\n", name);
@@ -921,7 +930,9 @@ static int run_generate(const std::string& path,
                 n_prompt, pf_ms, 1000.0 * n_prompt / std::max(1.0, pf_ms));
         fprintf(stderr, "[bench] decode:  %d tokens in %.1f ms (%.1f tok/s)\n",
                 generated, dc_ms, 1000.0 * generated / std::max(1.0, dc_ms));
-        if (streaming_kv && kv_mode == KVCacheMode::LAPLACE) {
+        if (streaming_kv &&
+            (kv_mode == KVCacheMode::LAPLACE ||
+             kv_mode == KVCacheMode::LAPLACE_Q4)) {
             fprintf(stderr, "[bench] LaplaceKV: %llu streamed queries\n",
                     static_cast<unsigned long long>(
                         kv.stream_calls()));

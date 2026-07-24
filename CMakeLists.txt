@@ -68,6 +68,7 @@ set(LAPLACE_SOURCES
     src/tokenizer.cpp
     src/sampler.cpp
     src/laplace_kv.cpp
+    src/laplace_kv_q4.cpp
     src/laplace_moe.cpp
 )
 
@@ -126,7 +127,7 @@ if(APPLE)
 endif()
 
 add_executable(test_kvcache tests/test_kvcache.cpp
-    src/kvcache.cpp src/laplace_kv.cpp src/ops.cpp)
+    src/kvcache.cpp src/laplace_kv.cpp src/laplace_kv_q4.cpp src/ops.cpp)
 target_include_directories(test_kvcache PRIVATE src)
 if(APPLE)
     target_link_libraries(test_kvcache PRIVATE ${LAPLACE_ACCELERATE_FW})
@@ -155,6 +156,7 @@ add_executable(test_arch tests/test_arch.cpp
     src/ssm.cpp
     src/kvcache.cpp
     src/laplace_kv.cpp
+    src/laplace_kv_q4.cpp
     src/gguf.cpp
     src/mmap.cpp)
 target_include_directories(test_arch PRIVATE src tests)
@@ -176,13 +178,23 @@ if(APPLE)
 endif()
 add_test(NAME test_laplace_kv COMMAND test_laplace_kv)
 
+add_executable(test_laplace_kv_q4
+    tests/test_laplace_kv_q4.cpp
+    src/laplace_kv_q4.cpp
+    src/ops.cpp)
+target_include_directories(test_laplace_kv_q4 PRIVATE src)
+if(APPLE)
+    target_link_libraries(test_laplace_kv_q4 PRIVATE ${LAPLACE_APPLE_FW})
+endif()
+add_test(NAME test_laplace_kv_q4 COMMAND test_laplace_kv_q4)
+
 add_executable(test_laplace_moe tests/test_laplace_moe.cpp
     src/laplace_moe.cpp)
 target_include_directories(test_laplace_moe PRIVATE src tests)
 add_test(NAME test_laplace_moe COMMAND test_laplace_moe)
 
 add_executable(bench_kvcache tests/bench_kvcache.cpp
-    src/laplace_kv.cpp src/kvcache.cpp src/ops.cpp)
+    src/laplace_kv.cpp src/laplace_kv_q4.cpp src/kvcache.cpp src/ops.cpp)
 target_include_directories(bench_kvcache PRIVATE src)
 if(APPLE)
     target_link_libraries(bench_kvcache PRIVATE ${LAPLACE_ACCELERATE_FW})

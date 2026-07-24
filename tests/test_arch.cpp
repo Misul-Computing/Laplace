@@ -157,6 +157,13 @@ void test_topology_uses_features_not_architecture_name() {
         CHECK(kv_layers[1].capacity == 262144);
         CHECK(kv_layers[1].mode == KVCacheMode::LAPLACE);
     }
+    const auto q4_kv_layers =
+        make_kv_layer_configs(plan, 262144, KVCacheMode::LAPLACE_Q4);
+    CHECK(q4_kv_layers.size() == 2);
+    if (q4_kv_layers.size() == 2) {
+        CHECK(q4_kv_layers[0].mode == KVCacheMode::FP16);
+        CHECK(q4_kv_layers[1].mode == KVCacheMode::LAPLACE_Q4);
+    }
     const auto short_kv_layers =
         make_kv_layer_configs(plan, 32, KVCacheMode::FP16);
     KVCache short_cache;

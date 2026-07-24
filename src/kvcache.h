@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "laplace_kv.h"
+#include "laplace_kv_q4.h"
 
 namespace Laplace {
 
@@ -14,6 +15,7 @@ enum class KVCacheMode {
     FP32,
     FP16,
     LAPLACE,
+    LAPLACE_Q4,
 };
 
 struct KVLayerConfig {
@@ -82,7 +84,8 @@ public:
     const uint16_t* head_v16(int layer, int head) const;
 
     bool laplace_rotated() const {
-        return laplace_ && laplace_->uses_rotation();
+        return (laplace_ && laplace_->uses_rotation()) ||
+               (laplace_q4_ && laplace_q4_->uses_rotation());
     }
     bool laplace_rotated(int layer) const;
     bool streaming() const;
@@ -117,6 +120,7 @@ private:
     std::vector<uint16_t> k16_;
     std::vector<uint16_t> v16_;
     std::unique_ptr<LaplaceKV> laplace_;
+    std::unique_ptr<LaplaceKVQ4> laplace_q4_;
     std::vector<std::unique_ptr<KVCache>> layer_caches_;
     std::vector<KVLayerConfig> layer_configs_;
     bool streaming_ = false;
