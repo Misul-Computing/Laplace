@@ -41,8 +41,6 @@ public:
     static bool streaming_enabled() { return streaming_enabled_; }
     static void set_streaming(bool v) { streaming_enabled_ = v; }
 
-    static void pagein_expert_mt(const Tensor* tensor, int expert_idx);
-    static void pagein_all_mt(const Tensor* tensor, const int* expert_idx, int n);
     static ExpertAcquireTicket prefetch(
         const Tensor* tensor, const int* expert_idx, int n);
     static ExpertAcquireStats wait(const ExpertAcquireTicket& ticket);

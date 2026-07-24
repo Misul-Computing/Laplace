@@ -80,6 +80,7 @@ Key flags:
 | `--laplace-kv` | LaplaceKV with automatic resident or streaming storage (default) |
 | `--laplace-stream` | Keep sealed KV tiles in an SSD-backed archive |
 | `--laplace-resident` | Keep sealed KV tiles in unified memory |
+| `--laplace-kv-q4` | Fully counted K4/V2 global cache (research mode) |
 | `--kv-fp16` | Uncompressed FP16 comparison path |
 | `--kv-fp32` | Uncompressed FP32 comparison path |
 | `--eval-file PATH` | Compare LaplaceKV against FP16 on cached next-token prediction |
@@ -294,11 +295,21 @@ FP rounding. No published work compresses a linear-attention state this way.
 
 | Model | Quant | Hardware | Decode | Prefill |
 |-------|-------|----------|--------|---------|
-| Gemma 4 26B MoE | Q4 | Apple M5 Pro | 18 tok/s | 19 tok/s |
+| Gemma 4 26B MoE | Q4 | Apple M5 Pro, 15 workers | 23.7 tok/s | 23.2 tok/s |
 | Gemma 4 26B MoE | Q4 | 24GB Mac (streaming) | 8.24 tok/s | - |
 
-Both are memory-bandwidth bound. The M5 Pro runs 8 threads (5P + 3E) to
-avoid thermal throttling that kicks in within 3s at 15 threads.
+The 23.7 tok/s result is a 128-token greedy decode measured on 2026-07-24.
+It is the current best measured result, not the 42 tok/s target. The engine
+now acquires only missing expert pages, reuses a bounded I/O worker pool, and
+fuses routed gate/up, GeGLU, down projection, and route accumulation without
+model-name or layer-number conditions. Five workers measured 17.0 tok/s and
+ten measured 21.9 tok/s on the same run.
+
+`--laplace-kv-q4` restores the fixed K4/V2 formula as an explicit research
+mode for global attention layers. Its 128-token tiles count all six FP16
+affine fields, keep the mutable tile FP32, and use FP16 rings for sliding
+layers. It is not the default because the registered 2,048-prediction screen
+changed perplexity by +4.774%, above the 2% acceptance gate.
 
 ## Roadmap
 

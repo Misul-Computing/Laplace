@@ -184,14 +184,6 @@ const uint8_t* LaplaceMoE::expert_data(const Tensor* tensor, int expert_idx) {
     return tensor->data + static_cast<size_t>(expert_idx) * per_expert_bytes(tensor);
 }
 
-void LaplaceMoE::pagein_expert_mt(const Tensor* tensor, int expert_idx) {
-    (void)acquire(tensor, &expert_idx, 1);
-}
-
-void LaplaceMoE::pagein_all_mt(const Tensor* tensor, const int* expert_idx, int n) {
-    (void)acquire(tensor, expert_idx, n);
-}
-
 ExpertAcquireTicket LaplaceMoE::prefetch(
         const Tensor* tensor, const int* expert_idx, int n) {
     auto state = std::make_shared<ExpertAcquireState>();

@@ -699,3 +699,26 @@ fails the 2% screen, and none supplies valid native timing and complete storage
 evidence. Zero-byte row-order and code-alias channels have not produced a
 validated survivor. The required cross-model, retrieval, native Apple Silicon
 speed, memory, I/O, portability, and novelty gates remain open.
+
+## 2026-07-24: production K4/V2 research mode
+
+The fixed-width K4/V2 reference is now available through
+`--laplace-kv-q4`. The implementation uses the same eight-iteration
+variance-normalized affine equations as the registered simulator:
+
+```text
+K[t,d] = (K4[t,d] * ka[d] + kb[d]) * kc[t]
+V[t,d] = (V2[t,d] * va[t] + vb[t]) * vc[d]
+```
+
+All six fields are stored as FP16. The 128-token record is 3.5625 effective
+bits per K/V scalar at D64 and 3.375 bits at D128, before one state byte per
+live tile. The mutable tile remains FP32. Resident and unlinked-file streaming
+paths share the format, while sliding-window layers remain FP16.
+
+On the local 26B-A4B model, a 256K configuration allocated 205.02 MiB of
+active memory and a 1,035.00 MiB archive. A 163-token prompt crossed the tile
+boundary and generated coherent text, but it did not preserve exact token
+parity with K8/V6. The prior 2,048-prediction result remains +4.774%
+perplexity and 84.131% top-1 agreement. No new model-quality pass was
+established, so K4/V2 remains opt-in and the default stays K8/V6.
