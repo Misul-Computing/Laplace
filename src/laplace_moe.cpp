@@ -2,9 +2,13 @@
 #include "laplace_moe.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <climits>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -20,11 +24,128 @@ namespace Laplace {
 
 bool LaplaceMoE::streaming_enabled_ = false;
 
+struct ExpertAcquireState {
+    std::mutex mutex;
+    std::condition_variable complete;
+    ExpertAcquireStats stats;
+    int pending = 0;
+};
+
 namespace {
 int g_file_fd = -1;
 const uint8_t* g_mmap_base = nullptr;
 int g_io_threads = 4;
 const size_t IO_CHUNK = 1 << 20;
+
+struct ExpertIoJob {
+    const Tensor* tensor = nullptr;
+    int expert = 0;
+    size_t bytes = 0;
+    std::shared_ptr<ExpertAcquireState> state;
+};
+
+void read_expert(const ExpertIoJob& job, std::vector<uint8_t>* scratch) {
+    const uint8_t* source = LaplaceMoE::expert_data(
+        job.tensor, job.expert);
+    if (g_file_fd >= 0 && g_mmap_base &&
+        source >= g_mmap_base) {
+        const off_t file_offset =
+            static_cast<off_t>(source - g_mmap_base);
+        scratch->resize(std::min(IO_CHUNK, job.bytes));
+        size_t offset = 0;
+        while (offset < job.bytes) {
+            const size_t count =
+                std::min(scratch->size(), job.bytes - offset);
+            const ssize_t result = pread(
+                g_file_fd, scratch->data(), count,
+                file_offset + static_cast<off_t>(offset));
+            if (result > 0) {
+                offset += static_cast<size_t>(result);
+            } else if (result < 0 && errno == EINTR) {
+                continue;
+            } else {
+                break;
+            }
+        }
+        return;
+    }
+
+    const long page_result = sysconf(_SC_PAGESIZE);
+    const size_t page =
+        page_result > 0 ? static_cast<size_t>(page_result) : 4096;
+    const volatile uint8_t* bytes = source;
+    for (size_t offset = 0; offset < job.bytes; offset += page) {
+        (void)bytes[offset];
+    }
+    if (job.bytes) (void)bytes[job.bytes - 1];
+}
+
+class ExpertIoPool {
+public:
+    ExpertIoPool() {
+        const int count = std::clamp(g_io_threads, 1, 32);
+        workers_.reserve(count);
+        for (int i = 0; i < count; ++i) {
+            workers_.emplace_back([this] { worker(); });
+        }
+    }
+
+    ~ExpertIoPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_all();
+        for (std::thread& worker : workers_) worker.join();
+    }
+
+    void submit(ExpertIoJob job) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            jobs_.push_back(std::move(job));
+        }
+        ready_.notify_one();
+    }
+
+    int worker_count() const {
+        return static_cast<int>(workers_.size());
+    }
+
+private:
+    void worker() {
+        std::vector<uint8_t> scratch;
+        while (true) {
+            ExpertIoJob job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                ready_.wait(lock, [&] {
+                    return stopping_ || !jobs_.empty();
+                });
+                if (stopping_ && jobs_.empty()) return;
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+            }
+            read_expert(job, &scratch);
+            {
+                std::lock_guard<std::mutex> lock(job.state->mutex);
+                job.state->stats.bytes_read += job.bytes;
+                job.state->pending--;
+            }
+            job.state->complete.notify_all();
+        }
+    }
+
+    mutable std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<ExpertIoJob> jobs_;
+    std::vector<std::thread> workers_;
+    bool stopping_ = false;
+};
+
+ExpertIoPool& io_pool() {
+    static ExpertIoPool pool;
+    return pool;
+}
 } // namespace
 
 void LaplaceMoE::set_file_fd(int fd) {
@@ -64,99 +185,31 @@ const uint8_t* LaplaceMoE::expert_data(const Tensor* tensor, int expert_idx) {
 }
 
 void LaplaceMoE::pagein_expert_mt(const Tensor* tensor, int expert_idx) {
-    if (!tensor || !tensor->data) return;
-    size_t per = per_expert_bytes(tensor);
-    if (per == 0) return;
-    const uint8_t* src = expert_data(tensor, expert_idx);
-    int nthreads = g_io_threads;
-
-    if (g_file_fd >= 0 && g_mmap_base) {
-        off_t file_offset = static_cast<off_t>(src - g_mmap_base);
-        size_t per_thread = (per + nthreads - 1) / nthreads;
-
-        std::thread threads[32];
-        for (int t = 0; t < nthreads; t++) {
-            size_t start = static_cast<size_t>(t) * per_thread;
-            size_t end = std::min(start + per_thread, per);
-            if (start >= end) continue;
-
-            threads[t] = std::thread([start, end, file_offset]() {
-                std::vector<uint8_t> buf(IO_CHUNK);
-                size_t off = start;
-                while (off < end) {
-                    size_t to_read = std::min(IO_CHUNK, end - off);
-                    ssize_t n = pread(g_file_fd, buf.data(), to_read,
-                                      file_offset + static_cast<off_t>(off));
-                    if (n <= 0) break;
-                    off += static_cast<size_t>(n);
-                }
-            });
-        }
-        for (int t = 0; t < nthreads; t++) {
-            if (threads[t].joinable()) threads[t].join();
-        }
-    } else {
-        long ps = sysconf(_SC_PAGESIZE);
-        size_t page = ps > 0 ? static_cast<size_t>(ps) : 4096;
-        size_t per_thread = (per + nthreads - 1) / nthreads;
-
-        std::thread threads[32];
-        for (int t = 0; t < nthreads; t++) {
-            size_t start = (static_cast<size_t>(t) * per_thread) & ~(page - 1);
-            size_t end = std::min(start + per_thread, per);
-            if (start >= end) continue;
-
-            threads[t] = std::thread([src, start, end, page]() {
-                const volatile uint8_t* p = src + start;
-                for (size_t off = 0; off + page <= end - start; off += page)
-                    (void)p[off];
-                if (start < end) (void)src[end - 1];
-            });
-        }
-        for (int t = 0; t < nthreads; t++) {
-            if (threads[t].joinable()) threads[t].join();
-        }
-    }
+    (void)acquire(tensor, &expert_idx, 1);
 }
 
 void LaplaceMoE::pagein_all_mt(const Tensor* tensor, const int* expert_idx, int n) {
-    if (!tensor || !tensor->data || n <= 0) return;
-    int nthreads = g_io_threads;
-    if (n < nthreads) nthreads = n;
-
-    std::thread threads[32];
-    int per_thread = (n + nthreads - 1) / nthreads;
-    for (int t = 0; t < nthreads; t++) {
-        int start = t * per_thread;
-        int end = std::min(start + per_thread, n);
-        if (start >= end) continue;
-        threads[t] = std::thread([tensor, expert_idx, start, end]() {
-            for (int i = start; i < end; i++)
-                pagein_expert_mt(tensor, expert_idx[i]);
-        });
-    }
-    for (int t = 0; t < nthreads; t++) {
-        if (threads[t].joinable()) threads[t].join();
-    }
+    (void)acquire(tensor, expert_idx, n);
 }
 
-ExpertAcquireStats LaplaceMoE::acquire(
+ExpertAcquireTicket LaplaceMoE::prefetch(
         const Tensor* tensor, const int* expert_idx, int n) {
-    ExpertAcquireStats stats;
+    auto state = std::make_shared<ExpertAcquireState>();
     if (!tensor || !tensor->data || !expert_idx || n <= 0 ||
         tensor->n_dims < 3 || tensor->dims[2] == 0) {
-        stats.invalid = std::max(n, 0);
-        return stats;
+        state->stats.invalid = std::max(n, 0);
+        return ExpertAcquireTicket(std::move(state));
     }
 
     const size_t bytes = per_expert_bytes(tensor);
+    std::vector<ExpertIoJob> jobs;
     for (int i = 0; i < n; ++i) {
         const int id = expert_idx[i];
         if (id < 0 || static_cast<uint64_t>(id) >= tensor->dims[2]) {
-            stats.invalid++;
+            state->stats.invalid++;
             continue;
         }
-        stats.requested++;
+        state->stats.requested++;
 
         bool resident = false;
         {
@@ -172,7 +225,7 @@ ExpertAcquireStats LaplaceMoE::acquire(
             }
         }
         if (resident) {
-            stats.hits++;
+            state->stats.hits++;
             continue;
         }
 
@@ -186,13 +239,33 @@ ExpertAcquireStats LaplaceMoE::acquire(
                            expert_it->second.locked;
             }
         }
-        stats.misses++;
+        state->stats.misses++;
         if (!resident) {
-            pagein_expert_mt(tensor, id);
-            stats.bytes_read += bytes;
+            jobs.push_back({tensor, id, bytes, state});
         }
     }
-    return stats;
+    state->pending = static_cast<int>(jobs.size());
+    for (ExpertIoJob& job : jobs) io_pool().submit(std::move(job));
+    return ExpertAcquireTicket(std::move(state));
+}
+
+ExpertAcquireStats LaplaceMoE::wait(
+        const ExpertAcquireTicket& ticket) {
+    if (!ticket.state_) return {};
+    std::unique_lock<std::mutex> lock(ticket.state_->mutex);
+    ticket.state_->complete.wait(lock, [&] {
+        return ticket.state_->pending == 0;
+    });
+    return ticket.state_->stats;
+}
+
+ExpertAcquireStats LaplaceMoE::acquire(
+        const Tensor* tensor, const int* expert_idx, int n) {
+    return wait(prefetch(tensor, expert_idx, n));
+}
+
+int LaplaceMoE::io_worker_count() {
+    return io_pool().worker_count();
 }
 
 void LaplaceMoE::set_cache_budget(size_t bytes) {

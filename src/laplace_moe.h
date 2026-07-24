@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 
 #include "tensor.h"
 
@@ -19,6 +20,19 @@ struct ExpertAcquireStats {
     size_t bytes_read = 0;
 };
 
+struct ExpertAcquireState;
+
+class ExpertAcquireTicket {
+public:
+    ExpertAcquireTicket() = default;
+
+private:
+    explicit ExpertAcquireTicket(std::shared_ptr<ExpertAcquireState> state)
+        : state_(std::move(state)) {}
+    std::shared_ptr<ExpertAcquireState> state_;
+    friend class LaplaceMoE;
+};
+
 class LaplaceMoE {
 public:
     // Global mode: when true, dense weights are pinned and expert tensors
@@ -29,8 +43,12 @@ public:
 
     static void pagein_expert_mt(const Tensor* tensor, int expert_idx);
     static void pagein_all_mt(const Tensor* tensor, const int* expert_idx, int n);
+    static ExpertAcquireTicket prefetch(
+        const Tensor* tensor, const int* expert_idx, int n);
+    static ExpertAcquireStats wait(const ExpertAcquireTicket& ticket);
     static ExpertAcquireStats acquire(
         const Tensor* tensor, const int* expert_idx, int n);
+    static int io_worker_count();
 
     static void set_file_fd(int fd);
     static void set_mmap_base(const uint8_t* base);

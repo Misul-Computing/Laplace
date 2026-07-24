@@ -41,5 +41,19 @@ int main() {
     CHECK(rejected.requested == 0);
     CHECK(rejected.invalid == 1);
 
+    std::vector<uint8_t> uncached_storage(experts * bytes_per_expert, 9);
+    tensor.data = uncached_storage.data();
+    LaplaceMoE::set_cache_budget(0);
+    ExpertAcquireStats uncached_first =
+        LaplaceMoE::acquire(&tensor, selected, 2);
+    const int workers_after_first = LaplaceMoE::io_worker_count();
+    ExpertAcquireStats uncached_second =
+        LaplaceMoE::acquire(&tensor, selected, 2);
+    CHECK(uncached_first.misses == 2);
+    CHECK(uncached_second.misses == 2);
+    CHECK(workers_after_first > 0);
+    CHECK(LaplaceMoE::io_worker_count() == workers_after_first);
+    CHECK(workers_after_first <= 4);
+
     return test_summary("test_laplace_moe");
 }
