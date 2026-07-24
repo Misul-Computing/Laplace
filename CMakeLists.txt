@@ -176,6 +176,11 @@ if(APPLE)
 endif()
 add_test(NAME test_laplace_kv COMMAND test_laplace_kv)
 
+add_executable(test_laplace_moe tests/test_laplace_moe.cpp
+    src/laplace_moe.cpp)
+target_include_directories(test_laplace_moe PRIVATE src tests)
+add_test(NAME test_laplace_moe COMMAND test_laplace_moe)
+
 add_executable(bench_kvcache tests/bench_kvcache.cpp
     src/laplace_kv.cpp src/kvcache.cpp src/ops.cpp)
 target_include_directories(bench_kvcache PRIVATE src)

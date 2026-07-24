@@ -140,6 +140,61 @@ void LaplaceMoE::pagein_all_mt(const Tensor* tensor, const int* expert_idx, int 
     }
 }
 
+ExpertAcquireStats LaplaceMoE::acquire(
+        const Tensor* tensor, const int* expert_idx, int n) {
+    ExpertAcquireStats stats;
+    if (!tensor || !tensor->data || !expert_idx || n <= 0 ||
+        tensor->n_dims < 3 || tensor->dims[2] == 0) {
+        stats.invalid = std::max(n, 0);
+        return stats;
+    }
+
+    const size_t bytes = per_expert_bytes(tensor);
+    for (int i = 0; i < n; ++i) {
+        const int id = expert_idx[i];
+        if (id < 0 || static_cast<uint64_t>(id) >= tensor->dims[2]) {
+            stats.invalid++;
+            continue;
+        }
+        stats.requested++;
+
+        bool resident = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cache_mutex);
+            auto tensor_it = g_cache.find(tensor->data);
+            if (tensor_it != g_cache.end()) {
+                auto expert_it = tensor_it->second.find(id);
+                resident = expert_it != tensor_it->second.end() &&
+                           expert_it->second.locked;
+                if (resident) {
+                    expert_it->second.last_accessed = g_current_token;
+                }
+            }
+        }
+        if (resident) {
+            stats.hits++;
+            continue;
+        }
+
+        touch_expert(tensor, id);
+        {
+            std::lock_guard<std::mutex> lock(g_cache_mutex);
+            auto tensor_it = g_cache.find(tensor->data);
+            if (tensor_it != g_cache.end()) {
+                auto expert_it = tensor_it->second.find(id);
+                resident = expert_it != tensor_it->second.end() &&
+                           expert_it->second.locked;
+            }
+        }
+        stats.misses++;
+        if (!resident) {
+            pagein_expert_mt(tensor, id);
+            stats.bytes_read += bytes;
+        }
+    }
+    return stats;
+}
+
 void LaplaceMoE::set_cache_budget(size_t bytes) {
     std::lock_guard<std::mutex> lock(g_cache_mutex);
     g_budget = bytes;

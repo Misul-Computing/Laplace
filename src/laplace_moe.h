@@ -11,6 +11,14 @@
 
 namespace Laplace {
 
+struct ExpertAcquireStats {
+    int requested = 0;
+    int hits = 0;
+    int misses = 0;
+    int invalid = 0;
+    size_t bytes_read = 0;
+};
+
 class LaplaceMoE {
 public:
     // Global mode: when true, dense weights are pinned and expert tensors
@@ -21,6 +29,8 @@ public:
 
     static void pagein_expert_mt(const Tensor* tensor, int expert_idx);
     static void pagein_all_mt(const Tensor* tensor, const int* expert_idx, int n);
+    static ExpertAcquireStats acquire(
+        const Tensor* tensor, const int* expert_idx, int n);
 
     static void set_file_fd(int fd);
     static void set_mmap_base(const uint8_t* base);
