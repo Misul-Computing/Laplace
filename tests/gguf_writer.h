@@ -60,6 +60,12 @@ public:
         put<uint64_t>(v.size());
         for (int32_t b : v) put(b);
     }
+    void kv_arr_u32(const std::string& key, const std::vector<uint32_t>& v) {
+        begin_kv(key, VT_ARRAY);
+        put<uint32_t>(VT_UINT32);
+        put<uint64_t>(v.size());
+        for (uint32_t b : v) put(b);
+    }
 
     void add_tensor(TensorDecl t) { tensors_.push_back(std::move(t)); }
 

@@ -4,11 +4,15 @@
 #include <cstring>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "arch.h"
+#include "gguf.h"
 #include "ops.h"
 #include "ssm.h"
+#include "topology.h"
+#include "gguf_writer.h"
 #include "test_util.h"
 
 using namespace Laplace;
@@ -105,6 +109,43 @@ void test_factory() {
 
     auto a7 = create_arch("unknown");
     CHECK(a7 == nullptr);
+}
+
+void test_topology_uses_features_not_architecture_name() {
+    gguf_writer::Writer w;
+    w.kv_str("general.architecture", "mystery");
+    w.kv_u32("mystery.block_count", 2);
+    w.kv_u32("mystery.embedding_length", 32);
+    w.kv_u32("mystery.feed_forward_length", 48);
+    w.kv_u32("mystery.context_length", 262144);
+    w.kv_u32("mystery.attention.head_count", 4);
+    w.kv_u32("mystery.attention.key_length", 16);
+    w.kv_u32("mystery.attention.key_length_swa", 8);
+    w.kv_u32("mystery.attention.sliding_window", 64);
+    w.kv_arr_u32("mystery.attention.head_count_kv", {4, 2});
+    w.kv_arr_u32("mystery.attention.sliding_window_pattern", {1, 0});
+    w.kv_u32("mystery.expert_count", 8);
+    w.kv_u32("mystery.expert_used_count", 2);
+    w.kv_u32("mystery.expert_feed_forward_length", 12);
+    CHECK(w.write_file("test_topology.gguf"));
+
+    GGUFContext gguf;
+    CHECK(gguf.open("test_topology.gguf"));
+    TopologyPlan plan;
+    std::string error;
+    CHECK_MSG(synthesize_topology(gguf, &plan, &error), "%s", error.c_str());
+    CHECK(plan.metadata_namespace == "mystery.");
+    CHECK(plan.layers.size() == 2);
+    if (plan.layers.size() == 2) {
+        CHECK(plan.layers[0].sliding_window == 64);
+        CHECK(plan.layers[0].n_kv_heads == 4);
+        CHECK(plan.layers[0].head_dim == 8);
+        CHECK(plan.layers[1].sliding_window == 0);
+        CHECK(plan.layers[1].n_kv_heads == 2);
+        CHECK(plan.layers[1].head_dim == 16);
+        CHECK(plan.layers[1].moe);
+    }
+    std::remove("test_topology.gguf");
 }
 
 // Phi3's RMSNorm uses the gain+1 trick: y = x / sqrt(mean(x^2) + eps)
@@ -278,6 +319,7 @@ int main() {
     test_rmsnorm_phi3();
     test_rope_roundtrip();
     test_factory();
+    test_topology_uses_features_not_architecture_name();
     test_deltanet_wh_parity();
     return test_summary("test_arch");
 }

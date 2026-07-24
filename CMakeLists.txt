@@ -57,6 +57,7 @@ set(LAPLACE_SOURCES
     src/matmul.cpp
     src/matmul_simd.cpp
     src/model.cpp
+    src/topology.cpp
     src/ops.cpp
     src/laplace_arch.cpp
     src/arch_qwen3next.cpp
@@ -141,6 +142,7 @@ target_include_directories(test_tokenizer PRIVATE src)
 add_test(NAME test_tokenizer COMMAND test_tokenizer)
 
 add_executable(test_arch tests/test_arch.cpp
+    src/topology.cpp
     src/ops.cpp
     src/laplace_arch.cpp
     src/arch_qwen3next.cpp
@@ -155,7 +157,7 @@ add_executable(test_arch tests/test_arch.cpp
     src/laplace_kv.cpp
     src/gguf.cpp
     src/mmap.cpp)
-target_include_directories(test_arch PRIVATE src)
+target_include_directories(test_arch PRIVATE src tests)
 if(LAPLACE_OMP_TARGET)
     target_link_libraries(test_arch PRIVATE ${LAPLACE_OMP_TARGET})
 endif()
