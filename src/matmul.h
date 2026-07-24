@@ -39,6 +39,18 @@ void fused_moe_gemm_multi(const float* x, const Tensor& w, float* y,
                           const int* expert_idx, int n_experts,
                           int K, int N);
 
+// Computes the selected experts' gate and up projections and applies GeGLU
+// without materializing the 2 * hidden_dim projection.
+bool fused_moe_gate_up_geglu(const float* x, const Tensor& w, float* hidden,
+                             const int* expert_idx, int n_experts,
+                             int K, int hidden_dim);
+
+// Adds the route-weighted selected expert projections directly to output,
+// without materializing one output vector per expert.
+bool fused_moe_down_accumulate(const float* x, const Tensor& w,
+                               const int* expert_idx, const float* route_weight,
+                               int n_experts, int K, int N, float* output);
+
 // Standalone dequantize (for testing and verification).
 // dst must hold exactly `n` floats.
 void dequantize(const Tensor& w, float* dst, int n);

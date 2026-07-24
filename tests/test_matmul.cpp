@@ -13,6 +13,7 @@
 
 #include "fp16.h"
 #include "matmul.h"
+#include "ops.h"
 #include "tensor.h"
 
 #include "quant_ref.h"
@@ -30,6 +31,14 @@ Tensor make_tensor(GGMLType type, int K, int N, const uint8_t* data) {
     t.dims[0] = static_cast<uint64_t>(K);
     t.dims[1] = static_cast<uint64_t>(N);
     t.data = data;
+    return t;
+}
+
+Tensor make_expert_tensor(GGMLType type, int K, int N, int experts,
+                          const uint8_t* data) {
+    Tensor t = make_tensor(type, K, N, data);
+    t.n_dims = 3;
+    t.dims[2] = static_cast<uint64_t>(experts);
     return t;
 }
 
@@ -249,6 +258,155 @@ void test_batched_rows() {
     }
 }
 
+void test_routed_moe_fusion() {
+    constexpr int experts = 5;
+    constexpr int selected = 3;
+    constexpr int input_dim = 64;
+    constexpr int hidden_dim = 32;
+    constexpr int output_dim = 48;
+    const int expert_idx[selected] = {4, 1, 3};
+    const float route_weight[selected] = {0.2f, -0.1f, 0.7f};
+
+    XorShift32 rng(47);
+    std::vector<float> x(input_dim);
+    for (float& v : x) v = rng.next_float();
+
+    std::vector<float> gate_up_w(static_cast<size_t>(experts) * 2 * hidden_dim * input_dim);
+    for (float& v : gate_up_w) v = rng.next_float();
+    Tensor gate_up = make_expert_tensor(
+        GGMLType::F32, input_dim, 2 * hidden_dim, experts,
+        reinterpret_cast<const uint8_t*>(gate_up_w.data()));
+
+    std::vector<float> gate_up_ref(static_cast<size_t>(selected) * 2 * hidden_dim);
+    std::vector<float> hidden_ref(static_cast<size_t>(selected) * hidden_dim);
+    std::vector<float> hidden_fused(hidden_ref.size());
+    fused_moe_gemm_idx(x.data(), gate_up, gate_up_ref.data(), expert_idx,
+                       selected, input_dim, 2 * hidden_dim);
+    for (int k = 0; k < selected; k++) {
+        const float* gu = gate_up_ref.data() + static_cast<size_t>(k) * 2 * hidden_dim;
+        ops::geglu(gu, gu + hidden_dim,
+                   hidden_ref.data() + static_cast<size_t>(k) * hidden_dim,
+                   hidden_dim);
+    }
+    CHECK(fused_moe_gate_up_geglu(x.data(), gate_up, hidden_fused.data(),
+                                  expert_idx, selected, input_dim, hidden_dim));
+    for (size_t i = 0; i < hidden_ref.size(); i++)
+        CHECK(almost_equal(hidden_fused[i], hidden_ref[i], 1e-5f, 1e-5f));
+
+    std::vector<float> down_w(static_cast<size_t>(experts) * output_dim * hidden_dim);
+    for (float& v : down_w) v = rng.next_float();
+    Tensor down = make_expert_tensor(
+        GGMLType::F32, hidden_dim, output_dim, experts,
+        reinterpret_cast<const uint8_t*>(down_w.data()));
+
+    std::vector<float> expert_out(static_cast<size_t>(selected) * output_dim);
+    std::vector<float> output_ref(output_dim, 0.0f);
+    std::vector<float> output_fused(output_dim, 0.0f);
+    fused_moe_gemm_multi(hidden_ref.data(), down, expert_out.data(),
+                         expert_idx, selected, hidden_dim, output_dim);
+    for (int k = 0; k < selected; k++)
+        for (int j = 0; j < output_dim; j++)
+            output_ref[j] += route_weight[k] *
+                expert_out[static_cast<size_t>(k) * output_dim + j];
+
+    CHECK(fused_moe_down_accumulate(hidden_ref.data(), down, expert_idx,
+                                    route_weight, selected, hidden_dim,
+                                    output_dim, output_fused.data()));
+    for (int j = 0; j < output_dim; j++)
+        CHECK(almost_equal(output_fused[j], output_ref[j], 1e-5f, 1e-5f));
+}
+
+std::vector<uint8_t> make_quant_expert_weights(GGMLType type, int K, int N,
+                                                int experts, XorShift32& rng) {
+    size_t blocks = static_cast<size_t>(experts) * N *
+                    (K / elements_per_block(type));
+    std::vector<uint8_t> data(blocks * bytes_per_block(type));
+    if (type == GGMLType::Q4_0) {
+        auto* w = reinterpret_cast<quant_ref::block_q4_0*>(data.data());
+        for (size_t i = 0; i < blocks; i++) {
+            w[i].d = small_fp16(rng);
+            for (auto& q : w[i].qs) q = rng.next_byte();
+        }
+    } else if (type == GGMLType::Q8_0) {
+        auto* w = reinterpret_cast<quant_ref::block_q8_0*>(data.data());
+        for (size_t i = 0; i < blocks; i++) {
+            w[i].d = small_fp16(rng);
+            for (auto& q : w[i].qs) q = static_cast<int8_t>(rng.next_byte());
+        }
+    } else if (type == GGMLType::Q4_K) {
+        auto* w = reinterpret_cast<quant_ref::block_q4_K*>(data.data());
+        for (size_t i = 0; i < blocks; i++) {
+            w[i].d = small_fp16(rng);
+            w[i].dmin = small_fp16(rng);
+            for (auto& s : w[i].scales) s = rng.next_byte();
+            for (auto& q : w[i].qs) q = rng.next_byte();
+        }
+    } else if (type == GGMLType::Q6_K) {
+        auto* w = reinterpret_cast<quant_ref::block_q6_K*>(data.data());
+        for (size_t i = 0; i < blocks; i++) {
+            for (auto& q : w[i].ql) q = rng.next_byte();
+            for (auto& q : w[i].qh) q = rng.next_byte();
+            for (auto& s : w[i].scales)
+                s = static_cast<int8_t>(rng.next() % 17) - 8;
+            w[i].d = small_fp16(rng);
+        }
+    }
+    return data;
+}
+
+void test_routed_moe_quant_fusion(GGMLType type) {
+    constexpr int experts = 4;
+    constexpr int selected = 3;
+    constexpr int input_dim = 512;
+    constexpr int hidden_dim = 256;
+    constexpr int output_dim = 256;
+    const int expert_idx[selected] = {3, 0, 2};
+    const float route_weight[selected] = {0.5f, 0.3f, 0.2f};
+
+    XorShift32 rng(53u + static_cast<uint32_t>(type));
+    std::vector<float> x(input_dim);
+    for (float& v : x) v = rng.next_float();
+    std::vector<uint8_t> gate_up_data =
+        make_quant_expert_weights(type, input_dim, 2 * hidden_dim, experts, rng);
+    Tensor gate_up = make_expert_tensor(type, input_dim, 2 * hidden_dim,
+                                        experts, gate_up_data.data());
+
+    std::vector<float> gate_up_ref(static_cast<size_t>(selected) * 2 * hidden_dim);
+    std::vector<float> hidden_ref(static_cast<size_t>(selected) * hidden_dim);
+    std::vector<float> hidden_fused(hidden_ref.size());
+    fused_moe_gemm_idx(x.data(), gate_up, gate_up_ref.data(), expert_idx,
+                       selected, input_dim, 2 * hidden_dim);
+    for (int k = 0; k < selected; k++) {
+        const float* gu = gate_up_ref.data() + static_cast<size_t>(k) * 2 * hidden_dim;
+        ops::geglu(gu, gu + hidden_dim,
+                   hidden_ref.data() + static_cast<size_t>(k) * hidden_dim,
+                   hidden_dim);
+    }
+    CHECK(fused_moe_gate_up_geglu(x.data(), gate_up, hidden_fused.data(),
+                                  expert_idx, selected, input_dim, hidden_dim));
+    for (size_t i = 0; i < hidden_ref.size(); i++)
+        CHECK(almost_equal(hidden_fused[i], hidden_ref[i], 1e-5f, 1e-5f));
+
+    std::vector<uint8_t> down_data =
+        make_quant_expert_weights(type, hidden_dim, output_dim, experts, rng);
+    Tensor down = make_expert_tensor(type, hidden_dim, output_dim,
+                                     experts, down_data.data());
+    std::vector<float> expert_out(static_cast<size_t>(selected) * output_dim);
+    std::vector<float> output_ref(output_dim, 0.0f);
+    std::vector<float> output_fused(output_dim, 0.0f);
+    fused_moe_gemm_multi(hidden_ref.data(), down, expert_out.data(), expert_idx,
+                         selected, hidden_dim, output_dim);
+    for (int k = 0; k < selected; k++)
+        for (int j = 0; j < output_dim; j++)
+            output_ref[j] += route_weight[k] *
+                expert_out[static_cast<size_t>(k) * output_dim + j];
+    CHECK(fused_moe_down_accumulate(hidden_ref.data(), down, expert_idx,
+                                    route_weight, selected, hidden_dim,
+                                    output_dim, output_fused.data()));
+    for (int j = 0; j < output_dim; j++)
+        CHECK(almost_equal(output_fused[j], output_ref[j], 1e-5f, 1e-5f));
+}
+
 void test_fp16_conversions() {
     CHECK(fp16_to_fp32(0x3C00) == 1.0f);
     CHECK(fp16_to_fp32(0xC000) == -2.0f);
@@ -272,6 +430,10 @@ void test_fp16_conversions() {
 int main() {
     test_fp16_conversions();
     test_batched_rows();
+    test_routed_moe_fusion();
+    for (GGMLType type : {GGMLType::Q4_0, GGMLType::Q8_0,
+                          GGMLType::Q4_K, GGMLType::Q6_K})
+        test_routed_moe_quant_fusion(type);
 
     // K must be a multiple of 256 for K-quants; exercise N=1, narrow N, and
     // N >= 128 (the threshold for the OpenMP-parallel row loop).

@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "fp16.h"
 #include "kernels.h"
@@ -39,6 +40,13 @@ using kernels::block_q5_K;
 using kernels::get_scale_min_k4;
 
 namespace {
+
+inline float geglu_product(float gate, float up) {
+    constexpr float c = 0.7978845608028654f;
+    constexpr float c2 = 0.044715f;
+    float gate3 = gate * gate * gate;
+    return 0.5f * gate * (1.0f + std::tanh(c * (gate + c2 * gate3))) * up;
+}
 
 // ---------------- runtime kernel dispatch -----------------------------------
 // The SIMD back-end (matmul_simd.cpp, compiled with ARMv8.x ISA flags)
@@ -497,6 +505,51 @@ void fused_moe_gemm_multi(const float* x, const Tensor& w, float* y,
         view.data = w.data + static_cast<size_t>(e) * per_expert;
         matmul_row(x + static_cast<size_t>(k) * K, view, y + static_cast<size_t>(k) * N, K, N);
     }
+}
+
+bool fused_moe_gate_up_geglu(const float* x, const Tensor& w, float* hidden,
+                             const int* expert_idx, int n_experts,
+                             int K, int hidden_dim) {
+    if (kernels::moe_gate_up_fn fn = [] {
+        const char* off = std::getenv("LAPLACE_NOSIMD");
+        if (off && off[0] == '1') return static_cast<kernels::moe_gate_up_fn>(nullptr);
+        return kernels::get_simd_moe_gate_up();
+    }()) {
+        if (fn(x, w.data, w.type, expert_idx, n_experts, hidden,
+               K, hidden_dim)) return true;
+    }
+
+    std::vector<float> gate_up(static_cast<size_t>(n_experts) * 2 * hidden_dim);
+    fused_moe_gemm_idx(x, w, gate_up.data(), expert_idx, n_experts,
+                       K, 2 * hidden_dim);
+    for (int k = 0; k < n_experts; k++) {
+        const float* gu = gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim;
+        float* dst = hidden + static_cast<size_t>(k) * hidden_dim;
+        for (int j = 0; j < hidden_dim; j++)
+            dst[j] = geglu_product(gu[j], gu[hidden_dim + j]);
+    }
+    return true;
+}
+
+bool fused_moe_down_accumulate(const float* x, const Tensor& w,
+                               const int* expert_idx, const float* route_weight,
+                               int n_experts, int K, int N, float* output) {
+    if (kernels::moe_down_fn fn = [] {
+        const char* off = std::getenv("LAPLACE_NOSIMD");
+        if (off && off[0] == '1') return static_cast<kernels::moe_down_fn>(nullptr);
+        return kernels::get_simd_moe_down();
+    }()) {
+        if (fn(x, w.data, w.type, expert_idx, route_weight, n_experts,
+               output, K, N)) return true;
+    }
+
+    std::vector<float> expert_out(static_cast<size_t>(n_experts) * N);
+    fused_moe_gemm_multi(x, w, expert_out.data(), expert_idx, n_experts, K, N);
+    for (int k = 0; k < n_experts; k++)
+        for (int j = 0; j < N; j++)
+            output[j] += route_weight[k] *
+                expert_out[static_cast<size_t>(k) * N + j];
+    return true;
 }
 
 // ---------------- Dequantize (embeddings, verification) ---------------------

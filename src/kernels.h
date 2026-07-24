@@ -111,12 +111,22 @@ using moe_gemv_multi_fn = bool (*)(const float* x, const uint8_t* w, GGMLType ty
                                    const int* expert_idx, int n_experts,
                                    float* y, int K, int N);
 
+using moe_gate_up_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
+                                const int* expert_idx, int n_experts,
+                                float* hidden, int K, int hidden_dim);
+
+using moe_down_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
+                             const int* expert_idx, const float* route_weight,
+                             int n_experts, float* output, int K, int N);
+
 // Returns the best GEMM entry point this build provides for the RUNNING
 // cpu, or nullptr when the CPU (or architecture) lacks the required
 // features.
 gemm_fn get_simd_gemm();
 moe_gemv_fn get_simd_moe_gemv();
 moe_gemv_multi_fn get_simd_moe_gemv_multi();
+moe_gate_up_fn get_simd_moe_gate_up();
+moe_down_fn get_simd_moe_down();
 
 } // namespace kernels
 } // namespace Laplace

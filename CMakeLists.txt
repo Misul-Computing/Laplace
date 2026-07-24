@@ -98,7 +98,7 @@ add_executable(test_safetensors tests/test_safetensors.cpp src/safetensors.cpp s
 target_include_directories(test_safetensors PRIVATE src)
 add_test(NAME test_safetensors COMMAND test_safetensors)
 
-add_executable(test_matmul tests/test_matmul.cpp src/matmul.cpp src/matmul_simd.cpp)
+add_executable(test_matmul tests/test_matmul.cpp src/matmul.cpp src/matmul_simd.cpp src/ops.cpp)
 target_include_directories(test_matmul PRIVATE src)
 if(LAPLACE_OMP_TARGET)
     target_link_libraries(test_matmul PRIVATE ${LAPLACE_OMP_TARGET})

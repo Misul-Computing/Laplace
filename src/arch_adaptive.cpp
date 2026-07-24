@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <numeric>
-#include <thread>
 
 #include "matmul.h"
 #include "model.h"
@@ -511,14 +510,10 @@ void AdaptiveArch::moe_ffn(const LayerWeights& W, const ModelConfig& cfg,
 
     // Reusable scratch buffers - avoid per-token heap allocations in the
     // expert loop (was 8 * 30 = 240 malloc/free per token).
-    static thread_local std::vector<float> tmp_buf, moe_in_buf, expert_out_buf;
-    static thread_local std::vector<float> gu_bufs, hidden_bufs, expert_outs;
+    static thread_local std::vector<float> tmp_buf, moe_in_buf, hidden_bufs;
     if ((int)tmp_buf.size() < H) tmp_buf.resize(H);
     if ((int)moe_in_buf.size() < H) moe_in_buf.resize(H);
-    if ((int)expert_out_buf.size() < H) expert_out_buf.resize(H);
-    if ((int)gu_bufs.size() < top_k * 2 * exp_inter) gu_bufs.resize(top_k * 2 * exp_inter);
     if ((int)hidden_bufs.size() < top_k * exp_inter) hidden_bufs.resize(top_k * exp_inter);
-    if ((int)expert_outs.size() < top_k * H) expert_outs.resize(top_k * H);
 
     for (int m = 0; m < M; m++) {
         const float* x = residual + static_cast<size_t>(m) * H;
@@ -571,68 +566,41 @@ void AdaptiveArch::moe_ffn(const LayerWeights& W, const ModelConfig& cfg,
             ops::rmsnorm(x, pn2w, moe_in, H, cfg.rms_eps);
         }
 
-        for (int k = 0; k < top_k; k++) {
-            LaplaceMoE::touch_expert(W.moe_gate_up_exps, top_idx[k]);
-            LaplaceMoE::touch_expert(W.moe_down_exps, top_idx[k]);
-        }
-
         {
             KTimer _t(KernelProf::k_moe_prefetch_gu);
             if (LaplaceMoE::streaming_enabled()) {
-                LaplaceMoE::pagein_all_mt(W.moe_gate_up_exps, top_idx, top_k);
+                LaplaceMoE::acquire(W.moe_gate_up_exps, top_idx, top_k);
             }
         }
 
+        ExpertAcquireTicket down_ticket;
         {
             KTimer _t(KernelProf::k_moe_gate_up);
 
-            std::thread prefetch_dn;
             if (LaplaceMoE::streaming_enabled()) {
                 KTimer _t2(KernelProf::k_moe_prefetch_dn);
-                const Tensor* dn_exps = W.moe_down_exps;
-                std::array<int, 16> idx_copy{};
-                for (int k = 0; k < top_k; k++) idx_copy[k] = top_idx[k];
-                int top_k_val = top_k;
-                prefetch_dn = std::thread([dn_exps, top_k_val, idx_copy]() {
-                    LaplaceMoE::pagein_all_mt(dn_exps, idx_copy.data(), top_k_val);
-                });
+                down_ticket =
+                    LaplaceMoE::prefetch(W.moe_down_exps, top_idx, top_k);
             }
 
-            fused_moe_gemm_idx(moe_in, *W.moe_gate_up_exps, gu_bufs.data(),
-                               top_idx, top_k, H, 2 * exp_inter);
+            fused_moe_gate_up_geglu(
+                moe_in, *W.moe_gate_up_exps, hidden_bufs.data(),
+                top_idx, top_k, H, exp_inter);
 
-            if (prefetch_dn.joinable()) {
+            if (LaplaceMoE::streaming_enabled()) {
                 KTimer _t2(KernelProf::k_moe_gate_wait);
-                prefetch_dn.join();
+                LaplaceMoE::wait(down_ticket);
             }
         }
 
-        // CPU: all geglus (gate * up, element-wise)
-        {
-            KTimer _t(KernelProf::k_moe_geglu);
-            for (int k = 0; k < top_k; k++) {
-                float* gu = gu_bufs.data() + k * 2 * exp_inter;
-                float* hidden = hidden_bufs.data() + k * exp_inter;
-                ops::geglu(gu, gu + exp_inter, hidden, exp_inter);
-            }
-        }
-
-        // Batch 2: all down matmuls. Each has a different input (hidden[k]).
+        float route_weight[16];
+        for (int k = 0; k < top_k; k++)
+            route_weight[k] = top_w[k] * down_scale[top_idx[k]];
         {
             KTimer _t(KernelProf::k_moe_down);
-            fused_moe_gemm_multi(hidden_bufs.data(), *W.moe_down_exps,
-                                 expert_outs.data(), top_idx, top_k,
-                                 exp_inter, H);
-        }
-
-        // CPU: weighted accumulation of all expert outputs
-        {
-            KTimer _t(KernelProf::k_moe_combine);
-            for (int k = 0; k < top_k; k++) {
-                float weight = top_w[k] * down_scale[top_idx[k]];
-                float* eo = expert_outs.data() + k * H;
-                for (int i = 0; i < H; i++) out[i] += weight * eo[i];
-            }
+            fused_moe_down_accumulate(
+                hidden_bufs.data(), *W.moe_down_exps, top_idx,
+                route_weight, top_k, exp_inter, H, out);
         }
     }
 }
