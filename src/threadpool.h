@@ -1,14 +1,8 @@
-// threadpool.h - spin-then-park thread pool with dynamic power management.
+// threadpool.h - spin-then-park thread pool.
 //
-// Apple Silicon only. Workers spin briefly for back-to-back matmuls (zero
-// latency), then park via os_sync_wait_on_address (Apple's futex) during
-// gaps. Idle power drops to near zero between matmuls.
-//
-// Dynamic activation: all possible workers are created at startup. The
-// power monitor adjusts how many are active at runtime via active_count_.
-// Inactive workers park on standby_epoch_ and consume zero CPU. Active
-// workers can be confined to E-cores (QOS_CLASS_BACKGROUND) or run on
-// mixed P+E cores, switched at runtime via core_mode_.
+// Apple Silicon only. Workers spin briefly for back-to-back matmuls, then
+// park via os_sync_wait_on_address. Thread count is P-cores, or
+// LAPLACE_THREADS. No battery, thermal, or E-core policy.
 //
 // The barrier is a flat barrier: each worker has its own done-flag on a
 // separate cache line (alignas(64)), so there is zero atomic RMW contention.
@@ -112,70 +106,18 @@ public:
         return pool;
     }
 
-    // Initial thread count based on power state at startup. The power
-    // monitor adjusts this at runtime via set_active_count().
     static int initial_active_count() {
         const char* env = std::getenv("LAPLACE_THREADS");
         if (env && env[0]) {
             int n = std::atoi(env);
             if (n > 0) return n;
         }
-        auto topo = laplace_core_topology();
-        auto ps = laplace_power_state();
-        const char* ecore_env = std::getenv("LAPLACE_ECORES");
-        CoreMode mode;
-        if (ecore_env && ecore_env[0])
-            mode = std::atoi(ecore_env) != 0 ? CoreMode::Ecore : CoreMode::Performance;
-        else
-            mode = (ps.on_battery && topo.e_cores > 0) ? CoreMode::Hybrid : CoreMode::Performance;
-        return compute_target(topo, ps, 0, mode);
+        return laplace_core_topology().p_cores;
     }
 
-    // Policy: compute target active thread count from system state.
-    // Called by the power monitor every few seconds.
-    static int compute_target(CoreTopology topo, PowerState ps,
-                              int thermal, CoreMode mode) {
-        if (topo.e_cores <= 0) return topo.p_cores;
-
-        if (mode == CoreMode::Ecore) {
-            // E-core mode: 1 P-core (main) + E-cores scaled by battery
-            // and thermal. Workers on E-cores only.
-            int e = topo.e_cores;
-            if (ps.battery_pct < 20)      e = e / 4;
-            else if (ps.battery_pct < 50) e = e / 2;
-            else                          e = (e * 3) / 4;
-            if (thermal >= 3)      e = 1;
-            else if (thermal == 2) e = e / 2;
-            else if (thermal == 1) e = (e * 3) / 4;
-            if (e < 1) e = 1;
-            return 1 + e;
-        }
-
-        if (mode == CoreMode::Hybrid) {
-            // Hybrid: 1 P-core (main) + some P-core workers + E-cores.
-            // Use 2-3 P-core workers for compute-bound matmuls, rest E.
-            // Fewer P-core workers than performance mode to save power.
-            int p_workers = std::min(2, topo.p_cores - 1);
-            int e = topo.e_cores;
-            if (ps.battery_pct < 20)      e = e / 4;
-            else if (ps.battery_pct < 50) e = e / 2;
-            else                          e = (e * 3) / 4;
-            if (thermal >= 3)      e = 0;
-            else if (thermal == 2) e = e / 2;
-            else if (thermal == 1) e = (e * 3) / 4;
-            if (e < 1) e = 1;
-            return 1 + p_workers + e;
-        }
-
-        // Performance: P-cores only for memory-bound decode. Adding E-cores
-        // increases bandwidth pressure without improving throughput, and
-        // E-cores are slower so they become the bottleneck in flat barriers.
-        // Research on M3 Max shows >P-core count hurts due to L2 contention.
-        int e_used = 0;
-        if (thermal >= 3)      e_used = 0;
-        else if (thermal == 2) e_used = e_used / 2;
-        else if (thermal == 1) e_used = (e_used * 3) / 4;
-        return topo.p_cores + e_used;
+    // Throughput only. No battery or thermal derate.
+    static int compute_target(CoreTopology topo, PowerState, int, CoreMode) {
+        return topo.p_cores > 0 ? topo.p_cores : 1;
     }
 
     // Called by the power monitor to adjust active thread count at runtime.
@@ -276,31 +218,14 @@ private:
     ThreadPool() {
         debug_ = std::getenv("LAPLACE_DEBUG_THREADS") != nullptr;
         auto topo = laplace_core_topology();
-        auto ps = laplace_power_state();
         max_threads_ = topo.p_cores + topo.e_cores;
         p_cores_ = topo.p_cores;
         done_ = std::make_unique<DoneFlag[]>(max_threads_);
         active_count_.store(initial_active_count(), std::memory_order_relaxed);
-        // E-core mode: auto from battery, or forced via LAPLACE_ECORES.
-        const char* ecore_env = std::getenv("LAPLACE_ECORES");
-        CoreMode init_mode;
-        if (ecore_env && ecore_env[0]) {
-            // Forced mode: 1=Ecore, 0=Performance.
-            init_mode = std::atoi(ecore_env) != 0
-                ? CoreMode::Ecore : CoreMode::Performance;
-        } else {
-            // Auto: Hybrid on battery, Performance on AC.
-            init_mode = (ps.on_battery && topo.e_cores > 0)
-                ? CoreMode::Hybrid : CoreMode::Performance;
-        }
-        core_mode_.store((int)init_mode, std::memory_order_relaxed);
+        core_mode_.store((int)CoreMode::Performance, std::memory_order_relaxed);
         if (debug_)
-            fprintf(stderr, "[threadpool] %dP+%dE, initial active=%d, mode=%s, "
-                    "battery=%d(%d%%)\n", topo.p_cores, topo.e_cores,
-                    active_count_.load(),
-                    init_mode == CoreMode::Hybrid ? "hybrid" :
-                    init_mode == CoreMode::Ecore ? "ecore" : "performance",
-                    (int)ps.on_battery, ps.battery_pct);
+            fprintf(stderr, "[threadpool] %dP+%dE, initial active=%d\n",
+                    topo.p_cores, topo.e_cores, active_count_.load());
         if (max_threads_ <= 1) return;
         workers_.reserve(max_threads_ - 1);
         for (int i = 1; i < max_threads_; i++)
@@ -420,20 +345,8 @@ private:
         }
     }
 
-    void apply_qos(CoreMode mode, int tid) {
-        if (mode == CoreMode::Ecore) {
-            pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
-        } else if (mode == CoreMode::Hybrid) {
-            // In hybrid mode, workers with tid < p_cores_ run on P-cores
-            // (default QoS), the rest on E-cores (BACKGROUND).
-            if (tid < p_cores_)
-                pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-            else
-                pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
-        } else {
-            // Performance: all workers on default QoS (P+E mix).
-            pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-        }
+    void apply_qos(CoreMode, int) {
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     }
 
     static void laplace_futex_wake(std::atomic<uint32_t>* addr) {

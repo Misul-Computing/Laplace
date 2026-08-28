@@ -23,6 +23,8 @@ enum class GGMLType : uint32_t {
     Q5_K    = 13,
     Q6_K    = 14,
     Q8_K    = 15,
+    IQ2_XXS = 16,
+    IQ1_S   = 19,
     BF16    = 30,
     I8      = 31,
     I32     = 32,
@@ -61,6 +63,8 @@ inline constexpr size_t bytes_per_block(GGMLType t) {
         case GGMLType::Q5_K: return 2 + 2 + 12 + 32 + 128;   // d, dmin, scales, qh, 256 * (4+1)-bit
         case GGMLType::Q6_K: return 2 + 16 + 128 + 64;       // d, scales, ql, qh
         case GGMLType::Q8_K: return 2 + 256 + 64 + 32;       // d, qs, bsums, scales (placeholder)
+        case GGMLType::IQ2_XXS: return 2 + 64;                // d + 32 packed uint16 words
+        case GGMLType::IQ1_S: return 2 + 32 + 16;             // d + 32 grid bytes + 8 uint16 metadata
         case GGMLType::MLX_AFFINE: return 4;                  // packed uint32 (32/bits elements)
         default: return 0;
     }
@@ -91,6 +95,8 @@ inline constexpr int elements_per_block(GGMLType t) {
         case GGMLType::Q5_K:
         case GGMLType::Q6_K:
         case GGMLType::Q8_K:
+        case GGMLType::IQ2_XXS:
+        case GGMLType::IQ1_S:
             return QK_KQUANT;
         case GGMLType::MLX_AFFINE:
             return 1;  // variable, handled by mlx_bits/mlx_group_size
@@ -122,6 +128,8 @@ inline const char* type_name(GGMLType t) {
         case GGMLType::Q5_K: return "Q5_K";
         case GGMLType::Q6_K: return "Q6_K";
         case GGMLType::Q8_K: return "Q8_K";
+        case GGMLType::IQ2_XXS: return "IQ2_XXS";
+        case GGMLType::IQ1_S: return "IQ1_S";
         case GGMLType::MLX_AFFINE: return "MLX_AFFINE";
         default: return "??";
     }

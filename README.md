@@ -1,35 +1,72 @@
 # Laplace
 
-## The Apple Silicon inference engine
+Laplace is an Apple Silicon inference engine for engineers who need a local
+model path they can inspect. It maps a local package, derives an experimental
+structural semantic model from checked evidence, selects one complete Metal
+plan, and executes an admitted token in a session-owned Metal command buffer.
 
-Laplace is an Apple Silicon inference-engine project written in C++20. It uses
-Apple-specific SIMD kernels and an opt-in Metal backend.
+The important boundary is simple: a package either has an admitted complete
+plan, or Laplace returns a `CompatibilityReport`. It does not select a
+model-family implementation by name. It does not run model layers on the CPU
+after a Metal error. It does not use an LM-head-only GPU handoff.
 
-## Current public scope
+## Why Laplace exists
 
-Today, the command-line program accepts one GGUF file. It reads GGUF metadata,
-loads supported tensor layouts, tokenizes a prompt, and generates tokens. The
-source contains named Gemma 4, Llama-style, Qwen3-Next, and Phi-3 architecture
-paths. The public scope does not yet include a universal model loader, an MLX
-runtime, or general MoE serving.
+Conventional local runtimes commonly dispatch by model family and can cross
+between CPU and GPU as they go. Laplace turns checked package evidence into
+one Apple-native Metal token transaction over unified memory. There is no
+layer-by-layer transfer and no hidden CPU continuation after a Metal failure.
 
-Each model and quantization layout needs an explicit correctness test. See
-[Support](docs/support.md) for the current compatibility boundary.
+New architectures can map to semantic operators instead of adding another
+family executor. When Laplace cannot prove a complete contract, it refuses
+deterministically instead of producing plausible but incorrect output. This
+is an architectural boundary, not a published speed claim.
 
-The current Metal switch has narrow scope. `LAPLACE_METAL=1` is consulted for
-the final output projection. Model layers stay on the existing path. The CLI
-does not report per-operation fallback or command-buffer status. Do not use the
-switch as a model-wide GPU comparison.
+## Current contract
 
-The repository also contains research code for KV storage, streaming, and MoE
-residency. Those components are not a blanket quality, memory, or speed claim.
+Laplace builds and runs on native macOS arm64 Apple Silicon. The public route
+uses unified memory for mapped weights and session-owned Metal resources.
+For every admitted token, Metal executes the embedding, layer operations,
+final normalization, and output projection. A failed submission aborts the
+transaction. The CLI reports the refusal code, phase, operator, tensor, and
+detail instead of continuing on another backend.
 
-For the detailed contract, see [Architecture](docs/architecture.md),
-[Support](docs/support.md), and the [benchmark procedure](docs/benchmarks.md).
+The loader has separate stages:
 
-## Build Laplace
+- A GGUF file can become executable only after checked artifact mapping,
+  semantic import, and canonical planning.
+- A SafeTensors file and an MLX package are parsed into a checked physical
+  artifact index. They currently have no accepted semantic certificate, so
+  the CLI refuses execution with `IMPORT_SEMANTICS_MISSING`.
+- Mixture-of-experts execution is disabled pending dataflow qualification.
+  Laplace refuses it with `KERNEL_UNAVAILABLE`.
+- The public session currently owns FP32 global state. Compressed, resident,
+  and streamed LaplaceKV modes are not admitted by this route.
 
-Build on an Apple Silicon Mac with a current CMake toolchain.
+Generic GGUF resolution is experimental structural inference, not a proof of
+arbitrary package semantics. Universal semantic loading is the architecture
+and goal; current execution requires explicit resolver coverage plus
+independent package and device qualification. This is intentionally not a
+claim that every GGUF, SafeTensors, MLX package, quantization format, model
+family, or Apple GPU is supported.
+
+The current tokenizer and chat-template behavior is also experimental and
+approximate. It is initialized from the retained validated package bytes, not
+by reopening the path. Initialization failures refuse with
+`TOKENIZER_RUNTIME_UNSUPPORTED`, but successful CLI generation is not a
+tokenizer-conformance qualification.
+
+The CLI submits dense prompts as one prefill span; it does not loop over tokens
+to hide a missing dense batch contract. The checked native F16 witness covers
+two initial tokens. For semantic models that declare recurrent convolution or
+delta-matrix state, the CLI submits one token at a time through the same
+session-owned Metal route until candidate-state chaining is admitted. This is
+not a CPU fallback. Other prompt spans remain capability-gated and return a
+report when they are not admitted.
+
+## Build
+
+Use an Apple Silicon Mac with CMake and the macOS Metal toolchain.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLAPLACE_NATIVE=ON
@@ -37,72 +74,55 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-Omit `LAPLACE_NATIVE=ON` to avoid host-specific `-march=native`. That choice
-does not make a binary portable across Apple Silicon generations. Test the
-binary on each target device. CMake can warn when it cannot find OpenMP. That
-warning does not make the build invalid.
+`LAPLACE_NATIVE=ON` is the default. It creates a binary for the local Apple
+Silicon host. Build and test on each target system before you make a device
+claim.
 
-## Run a GGUF model
+## Run
 
-Pass a GGUF file with no prompt to inspect its metadata.
-
-```bash
-./build/laplace model.gguf
-```
-
-Generate text with a prompt.
+Inspect the package and create its canonical Metal plan:
 
 ```bash
-./build/laplace model.gguf -p "Hello, Laplace" -n 32 --kv-fp32
+./build/laplace /absolute/path/to/model.gguf
 ```
 
-Use a deterministic, non-speculative command when you compare runs.
+Generate with deterministic sampling settings:
 
 ```bash
-./build/laplace model.gguf -p "Hello, Laplace" -n 32 \
-  --greedy --seed 7 --no-spec --max-seq 128 --kv-fp32 --bench
+./build/laplace /absolute/path/to/model.gguf \
+  -p "Hello, Laplace" -n 32 --greedy --seed 7 --max-seq 2048 --bench
 ```
 
-The current default is the experimental LaplaceKV mode. With that default, a
-configured `--max-seq` above `4096` automatically selects file-backed
-streaming. Use `--kv-fp32` for the basic reproducible commands above.
+`--bench` reports prefill and decode separately. It also reports how many
+Metal command buffers the CLI submitted in each phase. It does not convert one
+local measurement into a device or model family claim.
 
-The command accepts these commonly used options:
+The supported CLI options are `-p`, `-n`, `-t`, `--top-k`, `--top-p`,
+`--greedy`, `--seed`, `--max-seq`, `--no-chat`, `--raw-channels`, `--no-spec`,
+and `--bench`. `--no-spec` is accepted for reproducible scripts. Speculative
+generation is not implemented in the canonical route.
 
-| Option | Purpose |
-| --- | --- |
-| `-n N` | Set the maximum number of generated tokens. |
-| `-t T` | Set the sampling temperature. |
-| `--top-k K` | Set the top-k sampling limit. |
-| `--top-p P` | Set the nucleus-sampling limit. |
-| `--greedy` | Use greedy token selection. |
-| `--seed S` | Set the sampling seed. |
-| `--max-seq L` | Set the maximum sequence length. |
-| `--no-spec` | Disable speculative decoding. |
-| `--bench` | Print prefill and decode timing. |
-| `--kv-fp16` | Select the FP16 KV cache. |
-| `--kv-fp32` | Select the FP32 KV cache. |
-| `--laplace-kv` | Select the LaplaceKV research cache mode. |
-| `--laplace-stream` | Request streaming storage for the LaplaceKV research mode. |
-| `--laplace-resident` | Request resident storage for the LaplaceKV research mode. |
+The legacy `--laplace-kv`, `--laplace-resident`, `--laplace-stream`,
+`--laplace-kv-q4`, `--kv-fp16`, and `--kv-fp32` options fail closed. They do
+not select a hidden CPU or cache fallback.
 
-Run `./build/laplace` without arguments to print basic usage.
+## Verify a native Metal transaction
 
-## Report results responsibly
+The normal test suite uses synthetic packages and no model download. It covers
+artifact checks, semantic import, compatibility reports, capability planning,
+SafeTensors and MLX physical ingestion, and the public CLI refusal contract.
 
-Report the model artifact, digest, quantization, and prompt token count.
-Report the generated token count and `--max-seq`. Report sampling settings,
-build revision, macOS version, hardware, power state, thermal state when
-available, and Metal status. Keep prefill and decode results separate. A local
-result does not establish a claim for another model, layout, or M-series device.
+Run this additional native-device witness on an Apple Silicon desktop session:
 
-Follow the [benchmark procedure](docs/benchmarks.md) for the required record.
+```bash
+cmake --build build --target test_canonical_metal
+./build/test_canonical_metal --prefill-batch
+```
 
-## Contribute to Laplace
-
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before you change code or documentation.
-Use a focused branch for an independent change. Preserve unrelated changes.
-Publish performance claims only with reproducible evidence.
+That witness is separate because a sandbox can compile Metal code without
+having access to a Metal device. See [Architecture](docs/architecture.md),
+[Support](docs/support.md), and [Benchmarks](docs/benchmarks.md) for the
+current boundary and measurement procedure.
 
 ## License
 

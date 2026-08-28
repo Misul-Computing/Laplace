@@ -24,16 +24,30 @@ bool MappedFile::open(const char* path) {
         fprintf(stderr, "mmap: fstat failed for %s\n", path);
         return false;
     }
-    void* p = ::mmap(nullptr, static_cast<size_t>(st.st_size),
-                     PROT_READ, MAP_SHARED, fd, 0);
-    if (p == MAP_FAILED) {
-        ::close(fd);
+    if (!map_owned_fd(fd, static_cast<size_t>(st.st_size))) {
         fprintf(stderr, "mmap: mmap failed for %s\n", path);
         return false;
     }
-    file_handle_ = reinterpret_cast<void*>(static_cast<intptr_t>(fd));
+    return true;
+}
+
+bool MappedFile::map_owned_fd(int fd, size_t exact_size) {
+    if (fd < 0) return false;
+    struct stat st;
+    if (exact_size == 0 || fstat(fd, &st) != 0 || st.st_size < 0 ||
+        static_cast<uint64_t>(st.st_size) != exact_size) {
+        ::close(fd);
+        return false;
+    }
+    void* p = ::mmap(nullptr, exact_size, PROT_READ, MAP_SHARED, fd, 0);
+    if (p == MAP_FAILED) {
+        ::close(fd);
+        return false;
+    }
+    close();
+    fd_ = fd;
     data_ = static_cast<const uint8_t*>(p);
-    size_ = static_cast<size_t>(st.st_size);
+    size_ = exact_size;
     return true;
 }
 
@@ -42,9 +56,9 @@ void MappedFile::close() {
         ::munmap(const_cast<uint8_t*>(data_), size_);
         data_ = nullptr;
     }
-    if (file_handle_) {
-        ::close(static_cast<int>(reinterpret_cast<intptr_t>(file_handle_)));
-        file_handle_ = nullptr;
+    if (fd_ >= 0) {
+        ::close(fd_);
+        fd_ = -1;
     }
     size_ = 0;
 }

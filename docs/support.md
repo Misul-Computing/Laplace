@@ -1,67 +1,37 @@
 # Support
 
-## Support levels
+Laplace reports support per package contract, not per marketing family name.
+`Implemented` means source exists. `Admitted` means the package passed
+artifact checks, semantic import, and complete-plan selection on the current
+runtime. `Qualified` requires a separate recorded correctness result for an
+exact artifact and device.
 
-Laplace uses three support levels.
-
-| Level | Meaning |
-| --- | --- |
-| Implemented | The checked-in source contains a path for the stated input or operation. |
-| Qualified | A named artifact and configuration passed the required correctness gate. |
-| Released | The project documents the behavior as a public support commitment. |
-
-Implemented does not mean qualified or released. A benchmark does not extend
-support to another quantization, model revision, or hardware generation.
-This support document lists no qualified model artifact or configuration.
-
-## Package inputs
-
-| Input | Current level | Notes |
+| Input or feature | Current level | Public behavior |
 | --- | --- | --- |
-| One GGUF file | Implemented | The public CLI accepts a GGUF path. The loader checks only the contracts implemented by the selected path. |
-| Sharded GGUF | Not released | Do not assume that the CLI accepts a GGUF shard set. |
-| SafeTensors file or index | Parser only | Unit-tested parsing exists, but the public CLI does not load SafeTensors models. |
-| MLX directory or package | Future work | Package parsing, model detection, and execution need implementation and qualification. |
-| Remote model code, Python hooks, or globs | Unsupported | The runtime must not execute package-provided code to infer a model. |
+| One regular GGUF file | Admitted only by exact plan | The CLI maps it through `ArtifactSet`, imports semantic operators, and creates a full Metal plan or reports a refusal. |
+| SafeTensors file | Physical ingestion | The parser and `ArtifactIndex` validate the physical tensors. Execution refuses because no semantic certificate is accepted. |
+| Closed MLX package | Physical ingestion | The loader validates the declared shard graph without executing package code. Execution refuses because no semantic certificate is accepted. |
+| Dense causal token | Admitted only by exact plan | Metal executes the embedding, attention, FFN, final normalization, and output projection in the session transaction. |
+| Dense prompt prefill span | Admitted only by exact plan | The CLI submits one span. The native F16 witness covers two initial tokens; other lengths remain capability-gated. |
+| Recurrent prompt prefill | Metal-only token sequence | Recurrent convolution or delta-matrix state is submitted one token at a time in the same session until candidate-state chaining is admitted. |
+| Recurrent token | Candidate surface | It must satisfy exact semantic and pipeline checks. No package or device qualification is published. |
+| MoE token | Unsupported | `KERNEL_UNAVAILABLE`. The former synthetic MoE slice is not qualified. |
+| Compressed or streamed KV | Unsupported | The canonical route owns FP32 global state only. |
 
-## Model layouts
+## Failure contract
 
-The source has paths for Gemma 4, Llama-style, Qwen3-Next hybrid, and Phi-3
-layouts. The exact metadata mapping is in [Architecture](architecture.md).
-This list describes source coverage. It does not certify every exported model
-with a related marketing name.
+The CLI prints a `CompatibilityReport` with a stable error code and phase.
+Common examples are:
 
-The source also contains MoE-related code. It does not make every MoE model
-compatible. Router dimensions, expert tensor layouts, quantization planes,
-state layout, and output handling need an explicit model-level test.
+- `IMPORT_SEMANTICS_MISSING`: a physical SafeTensors or MLX package has no
+  accepted semantic proof.
+- `KERNEL_UNAVAILABLE`: the semantic model needs an operation that has no
+  admitted complete Metal implementation.
+- `CAPABILITY_MISSING`: the active Apple device cannot create the required
+  Metal resource or pipeline.
+- `FALLBACK_FORBIDDEN`: a complete plan would require a non-Metal execution
+  continuation.
 
-## Quantization and numerical behavior
-
-The source implements several GGUF quantization kernels. Kernel presence is
-not format-wide support. A valid route must match the tensor role, logical
-shape, physical layout, quantization type, and storage planes.
-
-For an unsupported matmul format, the current runtime prints
-`matmul: unsupported weight type`, zeroes the output, and continues. Treat that
-run as failed. Do not use its generated text or timing as evidence.
-
-Compare generated token IDs or logits against an independent reference before
-you report numerical agreement. Check multi-token state behavior, not only the
-first token. Record the error bound and the exact artifact.
-
-## Metal and Apple Silicon
-
-Metal has narrow public scope in this branch. `LAPLACE_METAL=1` is consulted
-only for the final output projection. Model layers stay on the existing path.
-The CLI does not report per-operation fallback or command-buffer status. Do not
-label an environment-variable run as a model-wide GPU result.
-
-Do not generalize a result from one Apple Silicon generation to another. Apple
-GPU, memory, and storage capabilities vary by device configuration.
-
-## Report an unsupported input
-
-When an input fails, report the package format and full digest. Report relevant
-metadata, tensor role when known, logical shape, physical layout, quantization
-type, error text, and the exact command. Do not attach proprietary weights or
-access tokens. Prefer a small synthetic fixture for a reproducer.
+Do not treat a parse result, a model-family label, a single kernel result, or
+a one-device run as support for another package or device. Report the package
+digest, command, report fields, and device state when you file an issue.

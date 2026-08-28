@@ -31,6 +31,8 @@ public:
     int im_end_id()   const { return im_end_id_; }
     int turn_start_id() const { return turn_start_id_; }
     int turn_end_id()   const { return turn_end_id_; }
+    int channel_start_id() const { return channel_start_id_; }
+    int channel_end_id() const { return channel_end_id_; }
 
 private:
     // Tokenize one pre-token (already byte->unicode mapped) via BPE merges,
@@ -52,6 +54,8 @@ private:
     int im_end_id_   = -1;
     int turn_start_id_ = -1;  // <|turn> (Gemma4)
     int turn_end_id_   = -1;  // <turn|> (Gemma4)
+    int channel_start_id_ = -1;
+    int channel_end_id_ = -1;
     bool is_spm_ = false;  // SentencePiece tokenizer (gemma/llama)
 
     // Precomputed byte (0..255) -> canonical GPT-2/Qwen unicode string, and

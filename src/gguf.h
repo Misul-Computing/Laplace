@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <map>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
@@ -46,6 +47,7 @@ public:
     GGUFContext& operator=(const GGUFContext&) = delete;
 
     bool open(const char* path);
+    bool parse(std::span<const uint8_t> bytes);
     void close();
 
     const std::map<std::string, MetaValue>& metadata() const { return metadata_; }
@@ -65,6 +67,7 @@ public:
     const std::string& path() const { return path_; }
 
 private:
+    bool parse_bytes(const uint8_t* bytes, size_t size);
     MappedFile file_;
     std::map<std::string, MetaValue> metadata_;
     std::vector<GGUFTensorInfo> tensor_infos_;

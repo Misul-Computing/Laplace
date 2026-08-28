@@ -159,6 +159,8 @@ bool Tokenizer::init(const GGUFContext& gguf) {
     im_end_id_   = find("<|im_end|>");
     turn_start_id_ = find("<|turn>");
     turn_end_id_   = find("<turn|>");
+    channel_start_id_ = find("<|channel>");
+    channel_end_id_ = find("<channel|>");
 
     return true;
 }

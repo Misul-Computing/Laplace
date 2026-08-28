@@ -21,10 +21,10 @@ Keep each change narrow. A runtime change needs:
 4. A source and behavior check for fallback, ownership, and numerical state.
 5. A fresh build, relevant tests, and `git diff --check`.
 
-Current architecture paths use `general.architecture` plus fixed tensor-name
-mappings. Document both when you add or change a path. Do not use an artifact
-digest as a runtime selector. Do not hide a CPU path in a GPU result or convert
-unsupported quantization data without reporting it.
+The public route derives semantics from checked package evidence. Do not add a
+model-family switch or use an artifact digest as a runtime selector. Do not
+hide a CPU path in a GPU result or convert unsupported quantization data
+without reporting it.
 
 ## Build and test
 
@@ -38,8 +38,10 @@ git diff --check
 ```
 
 Run the smallest relevant test while you develop. Run the full configured test
-suite before you describe a change as complete. A skipped device test does not
-qualify a Metal feature.
+suite before you describe a change as complete. Build and run
+`test_canonical_metal --prefill-batch` on a native Apple Silicon session when
+the change affects the canonical Metal transaction. A skipped device test does
+not qualify a Metal feature.
 
 ## Benchmark and model work
 

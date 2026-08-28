@@ -219,7 +219,21 @@ bool GGUFContext::open(const char* path) {
     if (!file_.open(path)) return false;
     path_ = path;
 
-    Reader r(file_.data(), file_.size());
+    if (!parse_bytes(file_.data(), file_.size())) {
+        close();
+        return false;
+    }
+    return true;
+}
+
+bool GGUFContext::parse(std::span<const uint8_t> bytes) {
+    close();
+    if (bytes.empty()) return false;
+    return parse_bytes(bytes.data(), bytes.size());
+}
+
+bool GGUFContext::parse_bytes(const uint8_t* bytes, size_t size) {
+    Reader r(bytes, size);
 
     uint32_t magic = 0;
     if (!r.read(magic)) {
@@ -321,13 +335,13 @@ bool GGUFContext::open(const char* path) {
         for (uint32_t d = 0; d < ti.n_dims; d++) t.dims[d] = ti.dims[d];
         uint64_t file_off = data_section_offset_ + ti.offset;
         uint64_t need = t.nbytes();
-        if (file_off > file_.size() || need > file_.size() - file_off) {
+        if (file_off > size || need > size - file_off) {
             fprintf(stderr, "gguf: tensor '%s' data [%llu, +%llu) past EOF (%zu)\n",
                     ti.name.c_str(), (unsigned long long)file_off,
-                    (unsigned long long)need, file_.size());
+                    (unsigned long long)need, size);
             return false;
         }
-        t.data = file_.data() + file_off;
+        t.data = bytes + file_off;
         tensors_.push_back(std::move(t));
     }
 

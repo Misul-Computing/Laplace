@@ -1,71 +1,65 @@
 # Architecture
 
-## Scope of this branch
+## Package to plan
 
-This branch contains a GGUF command-line runtime. Broader package formats and
-automatic model detection are future work. They need source, correctness, and
-performance gates before they become public support.
+The public executable has one route:
 
-The architecture described here is a source map, not a promise that any model
-package will run.
+```text
+local package
+  -> ArtifactSet or MLX physical graph
+  -> ArtifactIndex
+  -> semantic model and LAPIR operators
+  -> capability planner
+  -> session-owned canonical Metal program
+  -> one-token transaction or CompatibilityReport
+```
 
-## Input and model construction
+`ArtifactSet` maps only checked regular files and retains their identity and
+digest. `ArtifactIndex` records physical facts, tensor planes, aliases, and
+diagnostics without treating raw tensor names as execution semantics. The
+current generic GGUF importer is experimental structural inference from
+normalized metadata and tensor evidence; it is not a proof of arbitrary
+activation, normalization, position, residual, or tokenizer semantics.
+Universal semantic loading is the architecture goal. Current execution needs
+explicit resolver coverage and independent package/device qualification.
 
-`src/gguf.cpp` opens a GGUF file and exposes its metadata and tensors.
-`src/model.cpp` builds a `Model` from that data. `src/laplace_arch.cpp` selects
-the current named architecture path from `general.architecture` metadata:
+SafeTensors and MLX ingestion stop at the physical stage today. This is a
+deliberate boundary. A parser must not invent an operator graph or execute
+package-supplied code to make a model run.
 
-| Metadata value | Current path |
-| --- | --- |
-| `gemma4` | `Gemma4Arch` |
-| `llama`, `qwen2`, `qwen3` | `LlamaArch` |
-| `qwen3next`, `qwen35` | `Qwen3NextArch` |
-| `phi3` | `Phi3Arch` |
+## Token transaction
 
-The table does not make all layouts with a related name safe. Each named path
-also uses fixed tensor-name mappings in its architecture source. If model
-metadata or tensor geometry is incomplete, the loader can fail to construct a
-model.
+The canonical program owns mapped weight registration, Metal resources,
+persistent state, command submission, and the token position. The planner
+admits a package only when every required operation has one compatible Metal
+implementation. A failed plan or command submission returns a
+`CompatibilityReport`; it does not continue tensor execution on the CPU.
 
-`src/safetensors.cpp` is a SafeTensors parser with unit tests. The current CLI
-does not accept a SafeTensors or MLX package as its model argument. Support for
-those package formats and automatic model detection is future work.
+For an admitted dense token, the transaction contains:
 
-## Execution
+1. Token embedding.
+2. Attention projections, position transform, causal attention, and residual.
+3. FFN normalization, projections, activation, combine, and residual.
+4. Final normalization and LM output projection.
 
-The current path executes embeddings, layers, a final normalization, and an
-output projection through `Model`. `src/matmul.cpp` selects available matrix
-operations. `src/matmul_simd.cpp` provides Apple SIMD implementations. On
-Apple platforms, `src/metal.mm` supplies the optional Metal implementation.
+The session commits its position only after the command transaction completes.
+An aborted transaction does not publish provisional state to the next token.
 
-`LAPLACE_METAL=1` is consulted only by `matmul_lm_head` for the final output
-projection. The existing model layers do not use that switch. The CLI does not
-expose per-operation fallback or command-buffer status. A run with the switch
-is not a model-wide Metal result.
+The code also has a recurrent lowering surface. It remains capability-gated
+and has no published package qualification. MoE admission is disabled pending
+an independent dataflow qualification. The runtime must not substitute a
+different residual edge, payload formula, or expert geometry to make an MoE
+package run.
 
-The command-line generator uses `src/tokenizer.cpp`, `src/sampler.cpp`, and
-`src/kvcache.cpp`. It can perform batched prompt prefill and token-at-a-time
-decode. It can also use prompt lookup or lookahead speculative decoding when
-the sampling mode permits it.
+## Resource rules
 
-## State and storage experiments
+Laplace uses Apple unified memory for host-visible mapped artifacts and
+session-owned Metal resources. The canonical program registers the exact
+retained tensor ranges and checks their coverage. Derived load-time storage is
+allowed only when its source and replacement ranges are explicit. It is not a
+per-token CPU fallback.
 
-The tree contains research paths for LaplaceKV, recurrence, and MoE residency.
-They have separate acceptance conditions because memory reduction, numerical
-agreement, and token throughput are different properties. In particular, a
-format with a smaller stored payload can still reduce decode speed or change
-model output.
-
-Treat the following areas as experimental until a model-level gate qualifies
-them for a stated package and configuration:
-
-- LaplaceKV compressed and streaming modes.
-- Model-file-backed expert residency in `src/laplace_moe.cpp`.
-- Quantization conversion or derived-weight experiments.
-
-## Future work
-
-Future work can broaden package parsing and model detection. It must not make a
-new model format public support without an explicit correctness and performance
-record. This branch remains a GGUF runtime with limited, source-defined paths.
-See [Support](support.md) for the current boundary.
+The public session currently uses FP32 global state. Legacy compressed and
+streaming KV modes are outside this route. The planner also treats unsupported
+physical layouts, state formats, and capability gaps as refusals, not as
+requests to reuse an old named architecture implementation.

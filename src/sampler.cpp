@@ -10,8 +10,8 @@ int Sampler::sample(const float* logits, int n) {
     // Greedy
     if (params_.temperature <= 0.0f) {
         int best = 0;
-        float bestv = logits[0];
-        for (int i = 1; i < n; i++) {
+        float bestv = logits[best];
+        for (int i = 0; i < n; i++) {
             if (logits[i] > bestv) { bestv = logits[i]; best = i; }
         }
         return best;
@@ -20,7 +20,9 @@ int Sampler::sample(const float* logits, int n) {
     // Softmax with temperature.
     probs_.assign(n, 0.0f);
     float maxv = logits[0];
-    for (int i = 1; i < n; i++) if (logits[i] > maxv) maxv = logits[i];
+    for (int i = 0; i < n; i++) {
+        if (logits[i] > maxv) maxv = logits[i];
+    }
     float invT = 1.0f / params_.temperature;
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
