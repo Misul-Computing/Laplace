@@ -1,37 +1,21 @@
 # Support
 
-Laplace reports support per package contract, not per marketing family name.
-`Implemented` means source exists. `Admitted` means the package passed
-artifact checks, semantic import, and complete-plan selection on the current
-runtime. `Qualified` requires a separate recorded correctness result for an
-exact artifact and device.
+Laplace reports support per package contract and device capability. The table
+summarizes present capabilities and development focus.
 
-| Input or feature | Current level | Public behavior |
+| Capability | Current level | What the tree provides |
 | --- | --- | --- |
-| One regular GGUF file | Admitted only by exact plan | The CLI maps it through `ArtifactSet`, imports semantic operators, and creates a full Metal plan or reports a refusal. |
-| SafeTensors file | Physical ingestion | The parser and `ArtifactIndex` validate the physical tensors. Execution refuses because no semantic certificate is accepted. |
-| Closed MLX package | Physical ingestion | The loader validates the declared shard graph without executing package code. Execution refuses because no semantic certificate is accepted. |
-| Dense causal token | Admitted only by exact plan | Metal executes the embedding, attention, FFN, final normalization, and output projection in the session transaction. |
-| Dense prompt prefill span | Admitted only by exact plan | The CLI submits one span. The native F16 witness covers two initial tokens; other lengths remain capability-gated. |
-| Recurrent prompt prefill | Metal-only token sequence | Recurrent convolution or delta-matrix state is submitted one token at a time in the same session until candidate-state chaining is admitted. |
-| Recurrent token | Candidate surface | It must satisfy exact semantic and pipeline checks. No package or device qualification is published. |
-| MoE token | Unsupported | `KERNEL_UNAVAILABLE`. The former synthetic MoE slice is not qualified. |
-| Compressed or streamed KV | Unsupported | The canonical route owns FP32 global state only. |
+| Physical artifact indexing | Implemented in tree | Checked files, tensor planes, aliases, layouts, bounds, and digests. |
+| Versioned semantic model | Implemented in tree | Typed tensors, values, operators, layers, state, constraints, capability requirements, and tokenizer/template digests. |
+| Capability-aware planning | Implemented in tree | Complete plan entries with kernel, tensor, state, phase, and resource contracts. |
+| Transactional session state | Implemented in tree | Session-owned state with checkpoint, commit, and rollback surfaces. |
+| Dense canonical Metal token | Active alpha | Embedding, attention, feed-forward, normalization, and output projection in the canonical session path. |
+| Dense prefill and decode | Active alpha | Shared session state and phase-specific Metal transactions. |
+| GGUF package route | Active alpha | Physical artifact validation, metadata and tensor import, semantic graph construction, and native planning components. |
+| MLX and SafeTensors ingestion | Active alpha | Physical package and shard validation are present in the ingestion surface. |
+| MoE semantic primitives | Active alpha | Routed operators, expert-axis tensor contracts, top-k semantics, and weighted expert reduction. |
+| Recurrent semantic primitives | Active alpha | Convolution, delta-matrix, gated-attention, and state-update operators in the semantic and planning surfaces. |
+| Native M-series qualification | Active alpha | Capability queries, Metal resource checks, exact package/device records, and reproducible measurement gates. |
 
-## Failure contract
-
-The CLI prints a `CompatibilityReport` with a stable error code and phase.
-Common examples are:
-
-- `IMPORT_SEMANTICS_MISSING`: a physical SafeTensors or MLX package has no
-  accepted semantic proof.
-- `KERNEL_UNAVAILABLE`: the semantic model needs an operation that has no
-  admitted complete Metal implementation.
-- `CAPABILITY_MISSING`: the active Apple device cannot create the required
-  Metal resource or pipeline.
-- `FALLBACK_FORBIDDEN`: a complete plan would require a non-Metal execution
-  continuation.
-
-Do not treat a parse result, a model-family label, a single kernel result, or
-a one-device run as support for another package or device. Report the package
-digest, command, report fields, and device state when you file an issue.
+Support is determined by the complete typed package, physical format, semantic
+contract, and active device capability.

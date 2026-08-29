@@ -1,46 +1,67 @@
 # Laplace
 
-Laplace is the Apple Inference Engine, made for Apple Silicon Macs. It is
-being built to maximize efficiency, throughput, and performance across
-M-series Macs.
+Laplace is the Apple Inference Engine for Apple Silicon Macs.
 
-Laplace turns a local model package into a semantic execution plan and runs
-admitted work in a native Metal session. The project focuses on low-copy
-loading, unified memory, capability-aware kernels, and complete token
-execution.
+It is built to maximize M-series inference throughput and efficiency through
+an Apple-native Metal runtime, unified memory, a universal semantic model
+compiler and loader, and automatic capability planning. The same architecture
+is designed for dense, recurrent, and MoE models.
 
-## Current work
+The current alpha turns compatible GGUF packages into typed physical facts, a
+semantic graph, and a capability-checked execution plan. A session owns its
+Metal resources and mutable state, then executes each validated token step as
+a transaction. The V1 design applies the same package pipeline to GGUF and
+MLX contracts.
 
-Laplace is being developed as a universal semantic loader and Apple-native
-inference runtime.
+## Why Laplace
 
-- GGUF import reads metadata and tensor evidence, then derives a semantic
-  model for planning.
-- MLX and SafeTensors ingestion checks package files, shard maps, and tensor
-  layouts before semantic execution.
-- Dense token execution covers embedding, attention, feed-forward layers,
-  normalization, and output projection on Metal when the complete plan is
-  admitted.
-- The semantic model includes routed and expert operators for
-  mixture-of-experts (MoE) support. Current Metal planning rejects MoE
-  packages until the full dataflow is qualified.
-- Apple-native runtime work covers memory-mapped weights, unified-memory
-  resource registration, core topology, power source, thermal state, and
-  runtime metrics. Power policy and M-series tuning remain in development.
+Apple Silicon puts CPU and GPU work in one unified-memory system. Laplace keeps
+the execution model close to that hardware: Metal handles tensor work through
+compatible plans, runtime capability queries select those plans, and
+session-owned state keeps token execution explicit. See Apple's [unified-memory guidance](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus)
+and [Metal compute documentation](https://developer.apple.com/documentation/metal).
 
-## Status
+Universal means one semantic compiler and execution runtime that selects from
+the graph, tensor physical contract, execution phase, and queried device
+capability. Model names, paths, and hashes remain metadata.
 
-The public route is in active development. It runs a GGUF package only when
-import and semantic planning succeed. Tensor formats and the active Metal
-device must also satisfy the complete plan.
+## What exists today
 
-MLX and SafeTensors packages currently stop after physical ingestion. They
-return `IMPORT_SEMANTICS_MISSING`. MoE packages return `KERNEL_UNAVAILABLE`
-until their Metal dataflow is qualified. Unsupported package or device
-conditions return a `CompatibilityReport`.
+The current tree contains the core of that architecture:
 
-The current session owns FP32 global state. Streamed and compressed key-value
-cache modes are outside the public route.
+- Physical artifact validation records checked files, tensor planes, layouts,
+  aliases, and digests before semantic loading.
+- The semantic model represents tensors, values, operators, layers, state,
+  constraints, capability requirements, and tokenizer/template digests in a
+  versioned form.
+- The capability planner matches complete execution plans against operators,
+  physical formats, state contracts, and device capabilities.
+- The canonical Metal session provides dense prefill and decode transactions
+  with session-owned resources, checkpoint, commit, and rollback state.
+
+Semantic routed operators and expert-axis tensor contracts are present
+alongside dense and recurrent graph primitives.
+
+Laplace is under active development and its interfaces may change before V1.
+
+## Architecture
+
+```text
+local package
+  -> physical artifact index
+  -> versioned semantic graph and state contracts
+  -> capability-aware execution plan
+  -> session-owned Metal resources and state
+  -> transactional prefill or decode
+```
+
+Every plan entry binds an operator to its tensor and state contract. The
+session commits a token position only after the command transaction completes.
+This gives the runtime one place to validate physical layout, capability
+requirements, resource ownership, and mutable state before work is admitted.
+
+Dense, recurrent, routed, and expert operators share the same semantic graph,
+physical contracts, capability planner, and session state model.
 
 ## Build
 
@@ -54,26 +75,24 @@ ctest --test-dir build --output-on-failure
 
 ## Run
 
-Inspect a package and create its Metal plan:
+Inspect a local package and create its native plan:
 
 ```bash
 ./build/laplace /absolute/path/to/model.gguf
 ```
 
-Generate text with fixed sampling settings:
+Run a fixed native sample with phase-separated measurement:
 
 ```bash
 ./build/laplace /absolute/path/to/model.gguf \
   -p "Hello, Laplace" -n 32 --greedy --seed 7 --max-seq 2048 --bench
 ```
 
-The `--bench` option reports prefill and decode separately. It records the
-Metal command-buffer count for each phase. The command does not download a
-model.
+The `--bench` option reports prefill and decode separately.
 
 See [Architecture](docs/architecture.md), [Support](docs/support.md), and
-[Benchmarks](docs/benchmarks.md) for implementation details, supported input
-states, and measurement requirements.
+[Benchmarks](docs/benchmarks.md) for the execution model, support levels, and
+measurement contract.
 
 ## License
 

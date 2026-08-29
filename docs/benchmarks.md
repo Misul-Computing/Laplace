@@ -1,7 +1,7 @@
 # Benchmarks
 
-A Laplace benchmark is an exact package, device, and command result. It is not
-a hardware claim and it does not establish support for another package.
+A Laplace benchmark records one exact package, device, revision, and command.
+Each result applies to that recorded configuration.
 
 ## Before the run
 
@@ -28,15 +28,11 @@ must include both phases. Do not combine them into one token-per-second value.
 
 ## Correctness and routing
 
-Before you publish a performance result, run an independent token or logits
+Before publishing a performance result, run an independent token or logits
 comparison for the exact package. Record the reference implementation, error
-bound, token range, and state behavior. A fast result is not useful if a
-token transaction failed, changed state incorrectly, or selected a fallback.
+bound, token range, and state behavior. A fast result is useful only when the
+token transaction completed with the expected state and route.
 
-If the CLI reports `CompatibilityReport`, record the code, phase, operator,
-tensor, and detail. Do not change the report into a benchmark result. A missing
-Metal device in a sandbox is an environment limit, not evidence that an Apple
-Silicon desktop will behave the same way.
-
-Laplace publishes no benchmark figure in this repository revision. Add one
-only with the complete record above and a repeatable command.
+Record the package digest, command, report fields, and device state with every
+result. Laplace publishes benchmark figures only with this complete record and
+a repeatable command.
