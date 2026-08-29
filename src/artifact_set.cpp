@@ -2,6 +2,7 @@
 
 #include <CommonCrypto/CommonDigest.h>
 
+#include <cerrno>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -11,6 +12,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,9 @@ struct ArtifactIdentity {
     uint64_t size;
     int64_t mtime_seconds;
     int64_t mtime_nanoseconds;
+    int64_t ctime_seconds;
+    int64_t ctime_nanoseconds;
+    uint64_t generation;
 };
 
 ArtifactIdentity identity_from_stat(const struct stat& st) {
@@ -35,13 +40,27 @@ ArtifactIdentity identity_from_stat(const struct stat& st) {
         static_cast<uint64_t>(st.st_size),
         static_cast<int64_t>(st.st_mtimespec.tv_sec),
         static_cast<int64_t>(st.st_mtimespec.tv_nsec),
+        static_cast<int64_t>(st.st_ctimespec.tv_sec),
+        static_cast<int64_t>(st.st_ctimespec.tv_nsec),
+#ifdef __APPLE__
+        static_cast<uint64_t>(st.st_gen),
+#else
+        0,
+#endif
     };
 }
 
 bool identity_equal(const ArtifactIdentity& left, const ArtifactIdentity& right) {
     return left.device == right.device && left.inode == right.inode &&
            left.size == right.size && left.mtime_seconds == right.mtime_seconds &&
-           left.mtime_nanoseconds == right.mtime_nanoseconds;
+           left.mtime_nanoseconds == right.mtime_nanoseconds &&
+           left.ctime_seconds == right.ctime_seconds &&
+           left.ctime_nanoseconds == right.ctime_nanoseconds &&
+           left.generation == right.generation;
+}
+
+bool same_file(const ArtifactIdentity& left, const ArtifactIdentity& right) {
+    return left.device == right.device && left.inode == right.inode;
 }
 
 Sha256Digest digest_bytes(std::span<const uint8_t> bytes) {
@@ -55,6 +74,26 @@ Sha256Digest digest_bytes(std::span<const uint8_t> bytes) {
     Sha256Digest digest;
     CC_SHA256_Final(digest.bytes.data(), &context);
     return digest;
+}
+
+bool digest_fd(int fd, size_t size, Sha256Digest& digest) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    std::unique_ptr<uint8_t[]> buffer(new (std::nothrow) uint8_t[1024 * 1024]);
+    if (!buffer) return false;
+    size_t offset = 0;
+    while (offset < size) {
+        const size_t requested = std::min<size_t>(1024 * 1024, size - offset);
+        ssize_t received;
+        do {
+            received = ::pread(fd, buffer.get(), requested, static_cast<off_t>(offset));
+        } while (received < 0 && errno == EINTR);
+        if (received <= 0) return false;
+        CC_SHA256_Update(&context, buffer.get(), static_cast<CC_LONG>(received));
+        offset += static_cast<size_t>(received);
+    }
+    CC_SHA256_Final(digest.bytes.data(), &context);
+    return true;
 }
 
 #ifdef LAPLACE_ARTIFACT_SET_TESTING
@@ -85,6 +124,13 @@ public:
     std::vector<std::shared_ptr<const ArtifactBytesOwner>> artifacts;
 };
 
+class ArtifactBlobOwner {
+public:
+    std::vector<uint8_t> bytes;
+};
+
+constexpr size_t kMaximumOwnedBlobBytes = size_t{1} << 30;
+
 CompatibilityReport package_failure(CompatibilityError code, ArtifactId id, std::string detail) {
     CompatibilityReport report = package_report(code, std::move(detail));
     report.artifact_id = id;
@@ -95,6 +141,19 @@ CompatibilityReport package_failure(CompatibilityError code, ArtifactId id, std:
 CompatibilityReport source_failure(ArtifactId id) {
     return package_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID, id,
                            "source is not one nonempty regular file");
+}
+
+CompatibilityReport snapshot_failure(ArtifactId id, int snapshot_errno) {
+    std::string detail = "immutable artifact snapshot unavailable";
+    if (snapshot_errno == EFBIG) {
+        detail += ": disk-copy fallback is limited to 1 GiB; source must be on a clone-capable same filesystem";
+    }
+    if (snapshot_errno != 0) {
+        detail += ": ";
+        detail += std::strerror(snapshot_errno);
+    }
+    errno = snapshot_errno;
+    return package_failure(CompatibilityError::PACKAGE_SNAPSHOT_UNAVAILABLE, id, std::move(detail));
 }
 
 ArtifactId source_id(const ArtifactSource& source, size_t index) {
@@ -111,6 +170,32 @@ std::string Sha256Digest::hex() const {
         text[2 * i + 1] = digits[bytes[i] & 0x0f];
     }
     return text;
+}
+
+std::variant<PackageView, CompatibilityReport>
+ArtifactSet::make_owned_blob(ArtifactId id, ArtifactRole role,
+                             std::span<const uint8_t> bytes) {
+    if (id.value == UINT32_MAX ||
+        (role != ArtifactRole::Primary && role != ArtifactRole::Shard &&
+         role != ArtifactRole::Sidecar)) {
+        return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
+                               "owned artifact blob has an invalid identity or role");
+    }
+    if (bytes.empty() || bytes.size() > kMaximumOwnedBlobBytes) {
+        return package_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID, id,
+                               "owned artifact blob is empty or exceeds its 1 GiB bound");
+    }
+    try {
+        auto owner = std::make_shared<ArtifactBlobOwner>();
+        owner->bytes.assign(bytes.begin(), bytes.end());
+        const Sha256Digest digest = digest_bytes(owner->bytes);
+        return PackageView(id, role,
+                           std::span<const uint8_t>(owner->bytes.data(), owner->bytes.size()),
+                           digest, std::move(owner));
+    } catch (const std::bad_alloc&) {
+        return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
+                               "owned artifact blob allocation failed");
+    }
 }
 
 std::variant<ArtifactSet, CompatibilityReport>
@@ -167,15 +252,26 @@ ArtifactSet::load_graph(std::span<const ArtifactSource> sources) {
         }
         const ArtifactIdentity before = identity_from_stat(before_stat);
         if (std::find_if(identities.begin(), identities.end(), [&](const ArtifactIdentity& known) {
-                return identity_equal(known, before);
+                return same_file(known, before);
             }) != identities.end()) {
             ::close(fd);
             return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
                                    "package graph has a duplicate source artifact");
         }
 
+        const int validation_fd = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+        if (validation_fd < 0) {
+            ::close(fd);
+            return source_failure(id);
+        }
+
         auto owner = std::make_shared<ArtifactBytesOwner>();
-        if (!owner->mapping.map_owned_fd(fd, static_cast<size_t>(before.size))) return source_failure(id);
+        if (!owner->mapping.map_snapshot_fd(fd, static_cast<size_t>(before.size))) {
+            const int snapshot_errno = errno;
+            ::close(validation_fd);
+            errno = snapshot_errno;
+            return snapshot_failure(id, snapshot_errno);
+        }
 #ifdef LAPLACE_ARTIFACT_SET_TESTING
         owner->mapped_ = true;
         ++g_live_mapping_count;
@@ -188,12 +284,24 @@ ArtifactSet::load_graph(std::span<const ArtifactSource> sources) {
         if (g_test_hook) g_test_hook(owner->mapping.fd());
 #endif
 
+        if (owner->mapping.snapshot_kind() == SnapshotKind::DiskCopy) {
+            Sha256Digest source_digest;
+            if (!digest_fd(validation_fd, static_cast<size_t>(before.size), source_digest) ||
+                source_digest != owner->digest) {
+                ::close(validation_fd);
+                return package_failure(CompatibilityError::PACKAGE_SOURCE_CHANGED, id,
+                                       "source bytes changed while creating disk snapshot");
+            }
+        }
+
         struct stat after_stat {};
-        if (fstat(owner->mapping.fd(), &after_stat) != 0 ||
+        if (fstat(validation_fd, &after_stat) != 0 ||
             !identity_equal(before, identity_from_stat(after_stat))) {
+            ::close(validation_fd);
             return package_failure(CompatibilityError::PACKAGE_SOURCE_CHANGED, id,
                                    "source identity changed while validating");
         }
+        ::close(validation_fd);
         identities.push_back(before);
         owners->artifacts.push_back(std::move(owner));
     }
@@ -219,7 +327,10 @@ bool artifact_identity_equal_for_testing(const ArtifactIdentityForTesting& left,
                                          const ArtifactIdentityForTesting& right) {
     return left.device == right.device && left.inode == right.inode &&
            left.size == right.size && left.mtime_seconds == right.mtime_seconds &&
-           left.mtime_nanoseconds == right.mtime_nanoseconds;
+           left.mtime_nanoseconds == right.mtime_nanoseconds &&
+           left.ctime_seconds == right.ctime_seconds &&
+           left.ctime_nanoseconds == right.ctime_nanoseconds &&
+           left.generation == right.generation;
 }
 
 void ArtifactSet::set_test_hook(void (*hook)(int)) {

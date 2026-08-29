@@ -24,10 +24,14 @@ public:
     int sample(const float* logits, int n);
 
 private:
+    int remember(int token);
+
     SamplerParams params_;
     std::mt19937 rng_;
     std::vector<float> probs_;
     std::vector<int>   indices_;
+    int last_token_ = -1;
+    int repeat_run_ = 0;
 };
 
 } // namespace Laplace

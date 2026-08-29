@@ -2,24 +2,49 @@
 
 #include <CommonCrypto/CommonDigest.h>
 
+#include <array>
 #include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <map>
 #include <optional>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>
 
 #include "gguf.h"
+#include "gguf_import_internal.h"
+#include "gguf_index.h"
 
 namespace Laplace {
 
 namespace {
 
+bool checked_multiply_u64(uint64_t left, uint64_t right, uint64_t& result) {
+    if (left != 0 && right > UINT64_MAX / left) return false;
+    result = left * right;
+    return true;
+}
+
 CompatibilityReport import_error(CompatibilityError error) {
     CompatibilityReport report = package_report(error);
     report.stage = CompatibilityStage::Import;
+    return report;
+}
+
+CompatibilityReport physical_import_error(CompatibilityError error, const PackageView& artifact,
+                                           std::string detail, uint32_t tensor = UINT32_MAX,
+                                           CanonicalFactKey fact = {}) {
+    CompatibilityReport report = import_error(error);
+    report.detail = std::move(detail);
+    report.artifact_id = artifact.artifact_id();
+    report.artifact_index = artifact.artifact_id().value;
+    report.tensor_id = tensor;
+    report.fact_key = fact;
     return report;
 }
 
@@ -76,6 +101,7 @@ bool physical_tensor_format(GGMLType input, PackageTensorEvidence& output) {
     case GGMLType::F16:
         output.storage_type = ScalarType::F16;
         return true;
+    case GGMLType::Q4_0:
     case GGMLType::Q4_K:
     case GGMLType::Q5_0:
     case GGMLType::Q6_K:
@@ -95,46 +121,6 @@ void digest_update_u16(CC_SHA256_CTX& context, uint16_t value) {
     CC_SHA256_Update(&context, bytes, sizeof(bytes));
 }
 
-void digest_update_u32(CC_SHA256_CTX& context, uint32_t value) {
-    uint8_t bytes[4];
-    for (unsigned index = 0; index != 4; ++index) bytes[index] = static_cast<uint8_t>(value >> (index * 8));
-    CC_SHA256_Update(&context, bytes, sizeof(bytes));
-}
-
-void digest_update_u64(CC_SHA256_CTX& context, uint64_t value) {
-    uint8_t bytes[8];
-    for (unsigned index = 0; index != 8; ++index) bytes[index] = static_cast<uint8_t>(value >> (index * 8));
-    CC_SHA256_Update(&context, bytes, sizeof(bytes));
-}
-
-Sha256Digest model_fingerprint(const SemanticModel& semantics, const PackageView& package,
-                               const Sha256Digest& semantic_source) {
-    Sha256Digest artifact_fingerprint;
-    CC_SHA256_CTX artifact_context;
-    CC_SHA256_Init(&artifact_context);
-    constexpr char artifact_domain[] = "laplace-artifact-v1";
-    CC_SHA256_Update(&artifact_context, artifact_domain, sizeof(artifact_domain));
-    digest_update_u32(artifact_context, package.artifact_id().value);
-    digest_update_u16(artifact_context, 1);
-    digest_update_u16(artifact_context, 0);
-    digest_update_u64(artifact_context, package.bytes().size());
-    CC_SHA256_Update(&artifact_context, package.digest().bytes.data(), package.digest().bytes.size());
-    CC_SHA256_Final(artifact_fingerprint.bytes.data(), &artifact_context);
-
-    Sha256Digest fingerprint;
-    CC_SHA256_CTX context;
-    CC_SHA256_Init(&context);
-    constexpr char model_domain[] = "laplace-model-v1";
-    CC_SHA256_Update(&context, model_domain, sizeof(model_domain));
-    const Sha256Digest semantic = semantic_model_digest(semantics);
-    CC_SHA256_Update(&context, semantic.bytes.data(), semantic.bytes.size());
-    CC_SHA256_Update(&context, semantic_source.bytes.data(), semantic_source.bytes.size());
-    digest_update_u32(context, 1);
-    CC_SHA256_Update(&context, artifact_fingerprint.bytes.data(), artifact_fingerprint.bytes.size());
-    CC_SHA256_Final(fingerprint.bytes.data(), &context);
-    return fingerprint;
-}
-
 Sha256Digest generic_resolver_fingerprint() {
     Sha256Digest fingerprint;
     CC_SHA256_CTX context;
@@ -144,6 +130,120 @@ Sha256Digest generic_resolver_fingerprint() {
     digest_update_u16(context, 5);
     CC_SHA256_Final(fingerprint.bytes.data(), &context);
     return fingerprint;
+}
+
+void digest_bytes(CC_SHA256_CTX& context, std::span<const uint8_t> bytes) {
+    for (size_t offset = 0; offset != bytes.size();) {
+        const size_t count = std::min<size_t>(bytes.size() - offset,
+                                              static_cast<size_t>(std::numeric_limits<CC_LONG>::max()));
+        CC_SHA256_Update(&context, bytes.data() + offset, static_cast<CC_LONG>(count));
+        offset += count;
+    }
+}
+
+void digest_update_u32(CC_SHA256_CTX& context, uint32_t value) {
+    const std::array<uint8_t, 4> bytes = {
+        static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
+        static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24),
+    };
+    digest_bytes(context, bytes);
+}
+
+void digest_update_u64(CC_SHA256_CTX& context, uint64_t value) {
+    const std::array<uint8_t, 8> bytes = {
+        static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
+        static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24),
+        static_cast<uint8_t>(value >> 32), static_cast<uint8_t>(value >> 40),
+        static_cast<uint8_t>(value >> 48), static_cast<uint8_t>(value >> 56),
+    };
+    digest_bytes(context, bytes);
+}
+
+Sha256Digest tokenizer_metadata_digest(const PackageView& package, const GGUFContext& context) {
+    std::vector<const GGUFMetadataEntry*> entries;
+    for (const GGUFMetadataEntry& entry : context.metadata_entries()) {
+        if (entry.key.starts_with("tokenizer.")) entries.push_back(&entry);
+    }
+    if (entries.empty()) return {};
+    std::sort(entries.begin(), entries.end(), [](const GGUFMetadataEntry* left,
+                                                const GGUFMetadataEntry* right) {
+        return left->key < right->key;
+    });
+
+    CC_SHA256_CTX digest;
+    CC_SHA256_Init(&digest);
+    constexpr char domain[] = "laplace-gguf-tokenizer-metadata-v1\0";
+    digest_bytes(digest, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(domain), sizeof(domain)));
+    digest_update_u32(digest, static_cast<uint32_t>(entries.size()));
+    const std::span<const uint8_t> package_bytes = package.bytes();
+    for (const GGUFMetadataEntry* entry : entries) {
+        if (entry->key.size() > UINT32_MAX || entry->source_offset > package_bytes.size() ||
+            entry->source_length > package_bytes.size() - entry->source_offset) {
+            return {};
+        }
+        digest_update_u32(digest, static_cast<uint32_t>(entry->key.size()));
+        digest_bytes(digest, std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(entry->key.data()),
+                                                       entry->key.size()));
+        digest_update_u32(digest, entry->value_type);
+        digest_update_u64(digest, entry->source_length);
+        digest_bytes(digest, package_bytes.subspan(static_cast<size_t>(entry->source_offset),
+                                                   static_cast<size_t>(entry->source_length)));
+    }
+    Sha256Digest result;
+    CC_SHA256_Final(result.bytes.data(), &digest);
+    return result;
+}
+
+bool rebind_semantic_tensors_to_physical_index(const ArtifactIndex& physical,
+                                               SemanticModel& model) {
+    if (physical.tensors().size() != model.tensors.size() ||
+        physical.tensors().size() > UINT32_MAX) {
+        return false;
+    }
+    std::vector<uint32_t> semantic_to_physical(model.tensors.size(), UINT32_MAX);
+    std::vector<SemanticTensor> rebound(model.tensors.size());
+    for (SemanticTensor& tensor : model.tensors) {
+        if (tensor.id >= semantic_to_physical.size() || tensor.planes.empty()) return false;
+        const ArtifactTensorRecord* match = nullptr;
+        for (const ArtifactTensorRecord& candidate : physical.tensors()) {
+            if (candidate.id >= rebound.size() || candidate.planes.size() != tensor.planes.size()) continue;
+            bool same_spans = true;
+            for (const TensorPlane& source : tensor.planes) {
+                const auto found = std::find_if(candidate.planes.begin(), candidate.planes.end(),
+                                                [&](const ArtifactTensorPlane& plane) {
+                                                    return plane.kind == source.kind &&
+                                                           plane.source.artifact_id == source.artifact_id &&
+                                                           plane.source.offset == source.offset &&
+                                                           plane.source.length == source.length;
+                                                });
+                if (found == candidate.planes.end()) {
+                    same_spans = false;
+                    break;
+                }
+            }
+            if (!same_spans) continue;
+            if (match != nullptr || !rebound[candidate.id].planes.empty()) return false;
+            match = &candidate;
+        }
+        if (!match || semantic_to_physical[tensor.id] != UINT32_MAX) return false;
+        semantic_to_physical[tensor.id] = match->id;
+        tensor.id = match->id;
+        tensor.quantization = match->quantization;
+        rebound[match->id] = std::move(tensor);
+    }
+    for (uint32_t mapped : semantic_to_physical) {
+        if (mapped == UINT32_MAX) return false;
+    }
+    for (SemanticOperator& operation : model.operators) {
+        for (uint32_t& tensor_id : operation.tensors) {
+            if (tensor_id >= semantic_to_physical.size() || semantic_to_physical[tensor_id] == UINT32_MAX) {
+                return false;
+            }
+            tensor_id = semantic_to_physical[tensor_id];
+        }
+    }
+    model.tensors = std::move(rebound);
+    return true;
 }
 
 CompatibilityReport resolver_error(CompatibilityError error, std::string detail) {
@@ -157,6 +257,10 @@ bool key_has_suffix(const std::string& key, std::string_view suffix) {
            key[key.size() - suffix.size() - 1] == '.';
 }
 
+bool key_matches_suffix(const std::string& key, std::string_view suffix) {
+    return key == suffix || key_has_suffix(key, suffix);
+}
+
 std::optional<uint64_t> unique_metadata_u64(const PackageEvidence& package, std::string_view suffix) {
     std::optional<uint64_t> result;
     for (const auto& [key, value] : package.metadata) {
@@ -166,6 +270,49 @@ std::optional<uint64_t> unique_metadata_u64(const PackageEvidence& package, std:
         result = *number;
     }
     return result;
+}
+
+std::optional<std::vector<uint64_t>> layer_metadata_u64(const PackageEvidence& package,
+                                                        std::string_view suffix,
+                                                        size_t layer_count,
+                                                        std::string& error) {
+    const PackageMetadataValue* found = nullptr;
+    for (const auto& [key, value] : package.metadata) {
+        if (!key_has_suffix(key, suffix)) continue;
+        if (found) {
+            error = "generic resolver has duplicate per-layer " + std::string(suffix) + " geometry";
+            return std::nullopt;
+        }
+        found = &value;
+    }
+    if (!found) return std::nullopt;
+    if (const auto* scalar = std::get_if<uint64_t>(found)) {
+        return std::vector<uint64_t>(layer_count, *scalar);
+    }
+    const auto* values = std::get_if<std::vector<uint64_t>>(found);
+    if (!values || values->empty() || (values->size() != 1 && values->size() != layer_count)) {
+        error = "generic resolver per-layer " + std::string(suffix) +
+                " length must be 1 or block_count";
+        return std::nullopt;
+    }
+    if (values->size() == 1) return std::vector<uint64_t>(layer_count, values->front());
+    return *values;
+}
+
+// This parser is consumed only by the existing versioned semantic importer
+// below. The physical ArtifactIndex builder never calls it and retains tensor
+// spellings solely as diagnostics.
+bool parse_block_member(const std::string& name, uint32_t& layer, std::string_view& member) {
+    constexpr std::string_view prefix = "blk.";
+    if (!name.starts_with(prefix)) return false;
+    const size_t member_start = name.find('.', prefix.size());
+    if (member_start == std::string::npos || member_start == prefix.size() ||
+        member_start + 1 >= name.size()) return false;
+    const std::string_view layer_text(name.data() + prefix.size(), member_start - prefix.size());
+    const auto parsed = std::from_chars(layer_text.data(), layer_text.data() + layer_text.size(), layer);
+    if (parsed.ec != std::errc{} || parsed.ptr != layer_text.data() + layer_text.size()) return false;
+    member = std::string_view(name).substr(member_start + 1);
+    return true;
 }
 
 const PackageTensorEvidence* tensor_by_name(const PackageEvidence& package, const std::string& name,
@@ -180,18 +327,6 @@ const PackageTensorEvidence* tensor_by_name(const PackageEvidence& package, cons
     }
     if (result) used[result_index] = true;
     return result;
-}
-
-bool parse_block_member(std::string_view name, uint32_t& layer, std::string_view& member) {
-    if (!name.starts_with("blk.")) return false;
-    const size_t dot = name.find('.', 4);
-    if (dot == std::string_view::npos || dot == 4 || dot + 1 == name.size()) return false;
-    const char* begin = name.data() + 4;
-    const char* end = name.data() + dot;
-    auto parsed = std::from_chars(begin, end, layer);
-    if (parsed.ec != std::errc{} || parsed.ptr != end) return false;
-    member = name.substr(dot + 1);
-    return true;
 }
 
 uint32_t f32_bits(float value) {
@@ -322,13 +457,36 @@ bool add_recurrent_states(SemanticModel& model, uint64_t channels, uint64_t valu
 
 } // namespace
 
+bool detail::bind_gguf_semantics_to_physical_index(const ArtifactIndex& physical,
+                                                   SemanticModel& model) {
+    return rebind_semantic_tensors_to_physical_index(physical, model);
+}
+
 RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
+    // GGUF tensor names are source evidence, not an executable graph. Routed
+    // tensors require an independently bound semantic manifest or a closed
+    // declarative source schema before any SemanticModel can be emitted.
+    constexpr std::array<std::string_view, 13> routed_suffixes = {
+        "ffn_gate_inp.weight", "ffn_gate_inp.scale", "ffn_gate_up_exps.weight",
+        "ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_gate_exp.weight",
+        "ffn_up_exp.weight", "ffn_down_exps.weight", "ffn_down_exps.scale",
+        "pre_ffw_norm_2.weight", "post_ffw_norm_1.weight", "post_ffw_norm_2.weight",
+        "layer_output_scale.weight"};
+    for (const auto& tensor : package.tensors) {
+        for (const std::string_view suffix : routed_suffixes) {
+            if (key_matches_suffix(tensor.name, suffix)) {
+                return resolver_error(
+                    CompatibilityError::IMPORT_SEMANTICS_MISSING,
+                    "routed GGUF evidence requires a complete semantic manifest or closed declarative source schema");
+            }
+        }
+    }
+
     const auto block_count = unique_metadata_u64(package, "block_count");
     const auto maximum_context = unique_metadata_u64(package, "context_length");
     const auto hidden = unique_metadata_u64(package, "embedding_length");
     const auto intermediate = unique_metadata_u64(package, "feed_forward_length");
     const auto attention_heads = unique_metadata_u64(package, "attention.head_count");
-    const auto attention_kv_heads = unique_metadata_u64(package, "attention.head_count_kv");
     const auto attention_key = unique_metadata_u64(package, "attention.key_length");
     const auto attention_value = unique_metadata_u64(package, "attention.value_length");
     const auto rotary = unique_metadata_u64(package, "rope.dimension_count");
@@ -336,21 +494,28 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
     const auto epsilon = unique_metadata_u64(package, "attention.layer_norm_rms_epsilon");
     const auto bos = unique_metadata_u64(package, "ggml.bos_token_id");
     const auto eos = unique_metadata_u64(package, "ggml.eos_token_id");
-    for (const auto& [key, value] : package.metadata) {
-        if (key_has_suffix(key, "attention.head_count_kv") && std::holds_alternative<std::vector<uint64_t>>(value)) {
-            return resolver_error(CompatibilityError::IMPORT_SEMANTICS_MISSING,
-                                  "generic resolver has no per-layer attention.head_count_kv geometry");
-        }
+    std::string attention_kv_error;
+    const auto attention_kv_heads_by_layer = block_count && *block_count <= 4096
+        ? layer_metadata_u64(package, "attention.head_count_kv", static_cast<size_t>(*block_count), attention_kv_error)
+        : std::nullopt;
+    if (!attention_kv_error.empty()) {
+        return resolver_error(CompatibilityError::IMPORT_SEMANTICS_MISSING, std::move(attention_kv_error));
     }
-    if (!block_count || !maximum_context || !hidden || !intermediate || !attention_heads || !attention_kv_heads ||
+    if (!block_count || !maximum_context || !hidden || !intermediate || !attention_heads || !attention_kv_heads_by_layer ||
         !attention_key || !attention_value || !rotary || !rope_base || !epsilon || !bos || !eos ||
         *block_count == 0 || *block_count > 4096 || *maximum_context == 0 || *maximum_context > 262144 ||
         *hidden == 0 || *hidden > UINT32_MAX || *intermediate == 0 || *intermediate > UINT32_MAX ||
-        *attention_heads == 0 || *attention_kv_heads == 0 || *attention_heads % *attention_kv_heads != 0 ||
+        *attention_heads == 0 ||
         *attention_key == 0 || *attention_key != *attention_value || *rotary == 0 || *rotary > *attention_key ||
         *rotary % 2 != 0 || *rope_base > UINT32_MAX || *epsilon > UINT32_MAX || *bos > UINT32_MAX || *eos > UINT32_MAX) {
         return resolver_error(CompatibilityError::IMPORT_SEMANTICS_MISSING,
                               "generic resolver is missing a required normalized metadata field");
+    }
+    for (const uint64_t kv_heads : *attention_kv_heads_by_layer) {
+        if (kv_heads == 0 || *attention_heads % kv_heads != 0) {
+            return resolver_error(CompatibilityError::IMPORT_SEMANTICS_MISSING,
+                                  "generic resolver attention head geometry is inconsistent");
+        }
     }
     std::optional<std::array<uint32_t, 4>> multi_rope_sections;
     for (const auto& [key, value] : package.metadata) {
@@ -470,21 +635,19 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
     }
     model.vocabulary_size = static_cast<uint32_t>(vocabulary);
     const uint32_t token_ids = add_value(model, 1, ScalarType::U32);
-    const uint32_t mtp_token_ids = nextn_layers != 0 ? add_value(model, 1, ScalarType::U32) : UINT32_MAX;
     const uint32_t embedded = add_value(model, *hidden);
     model.input_values_first = token_ids;
-    model.input_values_count = nextn_layers != 0 ? 2 : 1;
+    model.input_values_count = 1;
     add_operator(model, OperatorKind::EmbeddingLookup, {token_ids}, {embedded}, {embedding}, {},
                  EmbeddingLookupPayload{0x3f800000u, model.vocabulary_size, static_cast<uint32_t>(*hidden), 0});
     uint32_t current = embedded;
-    const uint64_t attention_width64 = *attention_heads * *attention_key;
-    const uint64_t key_width64 = *attention_kv_heads * *attention_key;
-    if (attention_width64 > UINT32_MAX || key_width64 > UINT32_MAX || attention_width64 > UINT32_MAX / 2) {
+    uint64_t attention_width64 = 0;
+    if (!checked_multiply_u64(*attention_heads, *attention_key, attention_width64) ||
+        attention_width64 > UINT32_MAX || attention_width64 > UINT32_MAX / 2) {
         return resolver_error(CompatibilityError::IMPORT_SEMANTICS_MISSING, "attention dimensions exceed canonical limits");
     }
     const uint32_t head_dimension = static_cast<uint32_t>(*attention_key);
     const uint32_t attention_width = static_cast<uint32_t>(attention_width64);
-    const uint32_t key_width = static_cast<uint32_t>(key_width64);
     const float attention_scale = 1.0f / std::sqrt(static_cast<float>(head_dimension));
     const uint32_t rms_epsilon = static_cast<uint32_t>(*epsilon);
 
@@ -500,7 +663,8 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
                      RmsNormPayload{rms_epsilon, -1, 1});
         add_operator(model, OperatorKind::Linear, {normalized}, {gate}, {ffn_gate}, {}, LinearPayload{});
         add_operator(model, OperatorKind::Linear, {normalized}, {up}, {ffn_up}, {}, LinearPayload{});
-        add_operator(model, OperatorKind::SwiGlu, {gate, up}, {activated}, {}, {}, SwiGluPayload{ActivationKind::Silu});
+        add_operator(model, OperatorKind::SwiGlu, {gate, up}, {activated}, {}, {},
+                     SwiGluPayload{ActivationKind::Silu});
         add_operator(model, OperatorKind::Linear, {activated}, {down}, {ffn_down}, {}, LinearPayload{});
         add_operator(model, OperatorKind::Add, {input, down}, {next}, {}, {}, AddPayload{});
         (void)layer;
@@ -519,6 +683,16 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
         }
         uint32_t next = 0;
         if (attention[layer]) {
+            const uint64_t layer_kv_heads64 = (*attention_kv_heads_by_layer)[layer];
+            uint64_t layer_key_width64 = 0;
+            if (layer_kv_heads64 > UINT32_MAX ||
+                !checked_multiply_u64(layer_kv_heads64, *attention_key, layer_key_width64) ||
+                layer_key_width64 > UINT32_MAX) {
+                return resolver_error(CompatibilityError::IMPORT_SEMANTICS_MISSING,
+                                      "attention dimensions exceed canonical limits");
+            }
+            const uint32_t layer_kv_heads = static_cast<uint32_t>(layer_kv_heads64);
+            const uint32_t layer_key_width = static_cast<uint32_t>(layer_key_width64);
             const std::string query_name = "blk." + std::to_string(layer) + ".attn_q.weight";
             const PackageTensorEvidence* query_source = tensor_by_name(package, query_name, used);
             const bool fused_query_gate = query_source && query_source->dimensions == std::vector<uint64_t>{*hidden, 2ull * attention_width};
@@ -530,8 +704,8 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
             if (!add_resolved_tensor(model, *query_source,
                                      fused_query_gate ? TensorRole::AttentionQueryGateWeight : TensorRole::QueryWeight,
                                      query_source->dimensions, query) ||
-                !take_layer(layer, "attn_k.weight", TensorRole::KeyWeight, {*hidden, key_width}, model, key) ||
-                !take_layer(layer, "attn_v.weight", TensorRole::ValueWeight, {*hidden, key_width}, model, value) ||
+                !take_layer(layer, "attn_k.weight", TensorRole::KeyWeight, {*hidden, layer_key_width}, model, key) ||
+                !take_layer(layer, "attn_v.weight", TensorRole::ValueWeight, {*hidden, layer_key_width}, model, value) ||
                 !take_layer(layer, "attn_output.weight", TensorRole::AttentionOutputWeight,
                             {attention_width, *hidden}, model, attention_out) ||
                 (fused_query_gate &&
@@ -546,18 +720,18 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
             const uint32_t query_gate = fused_query_gate ? add_value(model, 2ull * attention_width) : UINT32_MAX;
             const uint32_t q = add_value(model, attention_width);
             const uint32_t gate = fused_query_gate ? add_value(model, attention_width) : UINT32_MAX;
-            const uint32_t k = add_value(model, key_width);
-            const uint32_t v = add_value(model, key_width);
+            const uint32_t k = add_value(model, layer_key_width);
+            const uint32_t v = add_value(model, layer_key_width);
             const uint32_t normalized_q = fused_query_gate ? add_value(model, attention_width) : UINT32_MAX;
-            const uint32_t normalized_k = fused_query_gate ? add_value(model, key_width) : UINT32_MAX;
+            const uint32_t normalized_k = fused_query_gate ? add_value(model, layer_key_width) : UINT32_MAX;
             const uint32_t rotated_q = add_value(model, attention_width);
-            const uint32_t rotated_k = add_value(model, key_width);
+            const uint32_t rotated_k = add_value(model, layer_key_width);
             const uint32_t context = add_value(model, attention_width);
             const uint32_t gated_context = fused_query_gate ? add_value(model, attention_width) : UINT32_MAX;
             const uint32_t projected = add_value(model, *hidden);
             const uint32_t residual = add_value(model, *hidden);
-            const uint32_t key_state = add_kv_state(model, StateKind::KeyCache, *attention_kv_heads, *attention_key);
-            const uint32_t value_state = add_kv_state(model, StateKind::ValueCache, *attention_kv_heads, *attention_key);
+            const uint32_t key_state = add_kv_state(model, StateKind::KeyCache, layer_kv_heads, *attention_key);
+            const uint32_t value_state = add_kv_state(model, StateKind::ValueCache, layer_kv_heads, *attention_key);
             add_operator(model, OperatorKind::RmsNorm, {current}, {normalized}, {attn_norm}, {}, RmsNormPayload{rms_epsilon, -1, 1});
             add_operator(model, OperatorKind::Linear, {normalized}, {fused_query_gate ? query_gate : q}, {query}, {}, LinearPayload{});
             if (fused_query_gate) {
@@ -579,7 +753,7 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
                                      true, static_cast<uint32_t>(*rotary), static_cast<uint32_t>(*rope_base),
                                      0x3f800000u, multi_rope_sections.value_or(std::array<uint32_t, 4>{})});
             add_operator(model, OperatorKind::CausalAttention, {rotated_q, rotated_k, v}, {context}, {}, {key_state, value_state},
-                         CausalAttentionPayload{static_cast<uint32_t>(*attention_heads), static_cast<uint32_t>(*attention_kv_heads),
+                         CausalAttentionPayload{static_cast<uint32_t>(*attention_heads), layer_kv_heads,
                                                 head_dimension, f32_bits(attention_scale), AttentionMask::Causal, CachePolicy::Global});
             if (fused_query_gate) {
                 add_operator(model, OperatorKind::GatedAttention, {context, gate}, {gated_context}, {}, {},
@@ -663,8 +837,24 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
     const uint32_t logits = add_value(model, vocabulary);
     add_operator(model, OperatorKind::RmsNorm, {current}, {normalized}, {final_norm}, {}, RmsNormPayload{rms_epsilon, -1, 1});
     add_operator(model, OperatorKind::Linear, {normalized}, {logits}, {output}, {}, LinearPayload{});
+    const size_t inactive_tensor_first = model.tensors.size();
+    const size_t primary_value_count = model.values.size();
+    const size_t primary_operator_count = model.operators.size();
+    const size_t primary_layer_count = model.layers.size();
+    const size_t primary_state_count = model.states.size();
     if (nextn_layers != 0) {
+        const uint32_t mtp_token_ids = add_value(model, 1, ScalarType::U32);
         const uint32_t layer = trunk_block_count;
+        const uint64_t layer_kv_heads64 = (*attention_kv_heads_by_layer)[layer];
+        uint64_t layer_key_width64 = 0;
+        if (layer_kv_heads64 > UINT32_MAX ||
+            !checked_multiply_u64(layer_kv_heads64, *attention_key, layer_key_width64) ||
+            layer_key_width64 > UINT32_MAX) {
+            return resolver_error(CompatibilityError::IMPORT_SEMANTICS_MISSING,
+                                  "attention dimensions exceed canonical limits");
+        }
+        const uint32_t layer_kv_heads = static_cast<uint32_t>(layer_kv_heads64);
+        const uint32_t layer_key_width = static_cast<uint32_t>(layer_key_width64);
         const uint32_t first = static_cast<uint32_t>(model.operators.size());
         uint32_t hnorm = 0, enorm = 0, eh_projection = 0, shared_head_norm = 0;
         uint32_t attn_norm = 0, post_norm = 0, ffn_gate = 0, ffn_up = 0, ffn_down = 0;
@@ -689,8 +879,8 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
         uint32_t query = 0, key = 0, value = 0, attention_out = 0, query_norm = 0, key_norm = 0;
         if (!add_resolved_tensor(model, *query_source, TensorRole::AttentionQueryGateWeight,
                                  query_source->dimensions, query) ||
-            !take_layer(layer, "attn_k.weight", TensorRole::KeyWeight, {*hidden, key_width}, model, key) ||
-            !take_layer(layer, "attn_v.weight", TensorRole::ValueWeight, {*hidden, key_width}, model, value) ||
+            !take_layer(layer, "attn_k.weight", TensorRole::KeyWeight, {*hidden, layer_key_width}, model, key) ||
+            !take_layer(layer, "attn_v.weight", TensorRole::ValueWeight, {*hidden, layer_key_width}, model, value) ||
             !take_layer(layer, "attn_output.weight", TensorRole::AttentionOutputWeight,
                         {attention_width, *hidden}, model, attention_out) ||
             !take_layer(layer, "attn_q_norm.weight", TensorRole::AttentionQueryNormWeight,
@@ -709,18 +899,18 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
         const uint32_t query_gate = add_value(model, 2ull * attention_width);
         const uint32_t q = add_value(model, attention_width);
         const uint32_t gate = add_value(model, attention_width);
-        const uint32_t k = add_value(model, key_width);
-        const uint32_t v = add_value(model, key_width);
+        const uint32_t k = add_value(model, layer_key_width);
+        const uint32_t v = add_value(model, layer_key_width);
         const uint32_t normalized_q = add_value(model, attention_width);
-        const uint32_t normalized_k = add_value(model, key_width);
+        const uint32_t normalized_k = add_value(model, layer_key_width);
         const uint32_t rotated_q = add_value(model, attention_width);
-        const uint32_t rotated_k = add_value(model, key_width);
+        const uint32_t rotated_k = add_value(model, layer_key_width);
         const uint32_t context = add_value(model, attention_width);
         const uint32_t gated_context = add_value(model, attention_width);
         const uint32_t projected = add_value(model, *hidden);
         const uint32_t residual = add_value(model, *hidden);
-        const uint32_t key_state = add_kv_state(model, StateKind::KeyCache, *attention_kv_heads, *attention_key);
-        const uint32_t value_state = add_kv_state(model, StateKind::ValueCache, *attention_kv_heads, *attention_key);
+        const uint32_t key_state = add_kv_state(model, StateKind::KeyCache, layer_kv_heads, *attention_key);
+        const uint32_t value_state = add_kv_state(model, StateKind::ValueCache, layer_kv_heads, *attention_key);
         const uint32_t head_hidden = add_value(model, *hidden);
         const uint32_t mtp_logits = add_value(model, vocabulary);
         add_operator(model, OperatorKind::EmbeddingLookup, {mtp_token_ids}, {candidate_embedding}, {embedding}, {},
@@ -746,7 +936,7 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
                                  true, static_cast<uint32_t>(*rotary), static_cast<uint32_t>(*rope_base),
                                  0x3f800000u, multi_rope_sections.value_or(std::array<uint32_t, 4>{})});
         add_operator(model, OperatorKind::CausalAttention, {rotated_q, rotated_k, v}, {context}, {}, {key_state, value_state},
-                     CausalAttentionPayload{static_cast<uint32_t>(*attention_heads), static_cast<uint32_t>(*attention_kv_heads),
+                     CausalAttentionPayload{static_cast<uint32_t>(*attention_heads), layer_kv_heads,
                                             head_dimension, f32_bits(attention_scale), AttentionMask::Causal, CachePolicy::Global});
         add_operator(model, OperatorKind::GatedAttention, {context, gate}, {gated_context}, {}, {}, GatedAttentionPayload{});
         add_operator(model, OperatorKind::Linear, {gated_context}, {projected}, {attention_out}, {}, LinearPayload{});
@@ -758,6 +948,14 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
         add_operator(model, OperatorKind::Linear, {head_hidden}, {mtp_logits}, {output}, {}, LinearPayload{});
         model.layers.push_back({layer, first, static_cast<uint32_t>(model.operators.size()) - first,
                                 kSemanticLayerFlagSpeculative});
+        for (size_t tensor_id = inactive_tensor_first;
+             tensor_id != model.tensors.size(); ++tensor_id) {
+            model.tensors[tensor_id].flags = kSemanticTensorFlagInactiveProgram;
+        }
+        model.values.resize(primary_value_count);
+        model.operators.resize(primary_operator_count);
+        model.layers.resize(primary_layer_count);
+        model.states.resize(primary_state_count);
     }
     model.output_values_first = logits;
     model.output_values_count = 1;
@@ -777,10 +975,83 @@ RuleEvaluationResult resolve_gguf_semantics(const PackageEvidence& package) {
 
 using EvidenceResult = std::variant<PackageEvidence, CompatibilityReport>;
 
+bool indexed_tensor_matches_evidence(const ArtifactTensorRecord& indexed,
+                                     const PackageTensorEvidence& evidence) {
+    if (indexed.logical_dimensions != evidence.dimensions || indexed.planes.size() != 1) return false;
+    const ArtifactTensorPlane& plane = indexed.planes.front();
+    const bool blocked = evidence.layout == PhysicalLayoutKind::GgufBlocked;
+    const ArtifactScalarType storage_type = blocked
+        ? ArtifactScalarType::Packed
+        : (evidence.storage_type == ScalarType::F16 ? ArtifactScalarType::F16 : ArtifactScalarType::F32);
+    const uint32_t expected_block_elements = blocked ? evidence.block_elements : 1;
+    const uint32_t expected_block_bytes = blocked
+        ? evidence.block_bytes
+        : (evidence.storage_type == ScalarType::F16 ? 2u : 4u);
+    if (plane.kind != PlaneKind::Values || plane.source.artifact_id != evidence.artifact_id ||
+        plane.source.offset != evidence.offset || plane.source.length != evidence.length ||
+        plane.storage_type != storage_type ||
+        plane.alignment != evidence.alignment) {
+        return false;
+    }
+    if (plane.bytes_per_block != expected_block_bytes || plane.elements_per_block != expected_block_elements) {
+        return false;
+    }
+    const ArtifactScalarType logical_type = blocked
+        ? ArtifactScalarType::F32
+        : (evidence.storage_type == ScalarType::F16 ? ArtifactScalarType::F16 : ArtifactScalarType::F32);
+    if (indexed.logical_type != logical_type || indexed.layout.kind != evidence.layout ||
+        indexed.quantization.kind != evidence.quantization ||
+        indexed.format.block_elements != expected_block_elements ||
+        indexed.format.block_bytes != expected_block_bytes ||
+        indexed.axis.source_rank != evidence.dimensions.size()) {
+        return false;
+    }
+    uint64_t elements = 1;
+    for (const uint64_t dimension : evidence.dimensions) {
+        if (!checked_multiply_u64(elements, dimension, elements)) return false;
+    }
+    if (plane.logical_elements != elements) return false;
+    const uint64_t element_bytes = evidence.storage_type == ScalarType::F16 ? 2 : 4;
+    const uint64_t expected_row_stride = blocked
+        ? (evidence.dimensions.empty() || evidence.block_elements == 0
+               ? 0
+               : (evidence.dimensions.front() / evidence.block_elements) * evidence.block_bytes)
+        : (evidence.dimensions.empty() ? 0 : evidence.dimensions.front() * element_bytes);
+    return expected_row_stride != 0 && indexed.axis.row_stride_bytes == expected_row_stride;
+}
+
+bool physical_index_matches_evidence(const ArtifactIndex& index, const PackageEvidence& evidence) {
+    const auto indexed = index.tensors();
+    if (indexed.size() != evidence.tensors.size() || index.artifacts().size() != 1) return false;
+    std::map<std::tuple<uint32_t, uint64_t, uint64_t>, size_t> by_span;
+    for (size_t index = 0; index != indexed.size(); ++index) {
+        if (indexed[index].planes.size() != 1) return false;
+        const auto& span = indexed[index].planes.front().source;
+        if (!by_span.emplace(std::make_tuple(span.artifact_id.value, span.offset, span.length), index).second) {
+            return false;
+        }
+    }
+    for (const PackageTensorEvidence& tensor : evidence.tensors) {
+        const auto found = by_span.find(std::make_tuple(tensor.artifact_id.value, tensor.offset, tensor.length));
+        if (found == by_span.end() || !indexed_tensor_matches_evidence(indexed[found->second], tensor)) return false;
+        by_span.erase(found);
+    }
+    return by_span.empty();
+}
+
 EvidenceResult normalized_gguf_evidence(const PackageView& package) {
     if (package.artifact_id().value != 0 || package.bytes().empty()) return import_error(CompatibilityError::PACKAGE_BOUNDS_INVALID);
+
+    // The semantic evidence below still needs tensor spellings for the
+    // versioned resolver. It is a temporary manifest-compiler boundary: the
+    // hardened physical index is authoritative for spans, dimensions, and
+    // storage, and this duplicate parse must agree with it before resolution.
+    auto physical = build_gguf_artifact_index(package);
+    if (const auto* report = std::get_if<CompatibilityReport>(&physical)) return *report;
+    const ArtifactIndex& physical_index = std::get<ArtifactIndex>(physical);
+
     GGUFContext context;
-    if (!context.parse(package.bytes())) return import_error(CompatibilityError::PACKAGE_BAD_MAGIC);
+    if (!context.parse(package)) return import_error(CompatibilityError::PACKAGE_BAD_MAGIC);
 
     PackageEvidence evidence;
     evidence.metadata.emplace("artifact.content_sha256", package.digest());
@@ -805,6 +1076,10 @@ EvidenceResult normalized_gguf_evidence(const PackageView& package) {
         tensor.alignment = static_cast<uint32_t>(context.alignment());
         evidence.tensors.push_back(std::move(tensor));
     }
+    if (!physical_index_matches_evidence(physical_index, evidence)) {
+        return physical_import_error(CompatibilityError::PACKAGE_BOUNDS_INVALID, package,
+                                     "GGUF semantic tensor evidence contradicts its physical index");
+    }
     return evidence;
 }
 
@@ -825,14 +1100,73 @@ ValidatedLoadResult load_validated_gguf(const PackageView& package) {
     auto imported = import_gguf(package);
     if (const auto* report = std::get_if<CompatibilityReport>(&imported)) return *report;
     SemanticModel semantics = std::get<SemanticModel>(std::move(imported));
+    // Raw GGUF carries tokenizer evidence in its metadata rather than in the
+    // sidecar used by the carried-manifest product route. Bind the diagnostic
+    // TokenIds contract to that immutable, normalized evidence so a raw load
+    // cannot manufacture a tokenizer authority from a model name or constant.
+    GGUFContext tokenizer_context;
+    if (!tokenizer_context.parse(package)) return import_error(CompatibilityError::PACKAGE_BAD_MAGIC);
+    semantics.tokenizer_digest = tokenizer_metadata_digest(package, tokenizer_context).bytes;
     const Sha256Digest resolver = generic_resolver_fingerprint();
-    auto runtime = std::make_shared<RuntimePackage>(semantics, package, model_fingerprint(semantics, package, resolver),
-                                                    resolver, 2, RuleQualificationState::Draft);
     DiagnosticProvenance diagnostics;
     diagnostics.format_name = "GGUF";
     diagnostics.importer_name = "gguf-v3";
     diagnostics.rule_id = "gguf-semantic-resolver-v1";
     diagnostics.rule_revision = 2;
+    auto physical = build_gguf_artifact_index(package);
+    if (const auto* report = std::get_if<CompatibilityReport>(&physical)) return *report;
+    ArtifactIndex& physical_index = std::get<ArtifactIndex>(physical);
+    if (!rebind_semantic_tensors_to_physical_index(physical_index, semantics)) {
+        return resolver_error(CompatibilityError::IR_LAYOUT_MISMATCH,
+                              "generic semantic tensor bindings do not match immutable GGUF spans");
+    }
+    TokenIdContract token_contract;
+    token_contract.vocabulary_size = semantics.vocabulary_size;
+    token_contract.bos_id = semantics.bos_id;
+    token_contract.eos_id = semantics.eos_id;
+    token_contract.stop_ids = semantics.stop_ids;
+    token_contract.authoritative_tokenizer_digest = {semantics.tokenizer_digest};
+    token_contract.authoritative_template_digest = {semantics.template_digest};
+    auto manifest = SemanticManifest::build(physical_index, semantics, token_contract);
+    if (const auto* report = std::get_if<CompatibilityReport>(&manifest)) return *report;
+    auto runtime = RuntimePackage::make_diagnostic(
+        std::get<SemanticManifest>(std::move(manifest)), resolver, 2);
+    return ValidatedPackage(std::move(runtime), std::move(diagnostics));
+}
+
+ValidatedLoadResult load_expected_fixture_gguf(const PackageView& package,
+                                               const std::vector<CompatibilityRule>& rules) {
+    std::vector<std::pair<const CompatibilityRule*, SemanticModel>> matches;
+    for (const CompatibilityRule& rule : rules) {
+        auto candidate = import_expected_fixture_gguf(package, {rule});
+        if (auto* semantics = std::get_if<SemanticModel>(&candidate)) matches.emplace_back(&rule, std::move(*semantics));
+    }
+    if (matches.empty()) {
+        auto result = import_expected_fixture_gguf(package, rules);
+        return std::get<CompatibilityReport>(std::move(result));
+    }
+    if (matches.size() > 1) return import_error(CompatibilityError::IMPORT_RULE_CONFLICT);
+    const auto& [rule, semantics] = matches.front();
+    auto physical = build_gguf_artifact_index(package);
+    if (const auto* report = std::get_if<CompatibilityReport>(&physical)) return *report;
+    TokenIdContract token_contract;
+    token_contract.vocabulary_size = semantics.vocabulary_size;
+    token_contract.bos_id = semantics.bos_id;
+    token_contract.eos_id = semantics.eos_id;
+    token_contract.stop_ids = semantics.stop_ids;
+    token_contract.authoritative_tokenizer_digest = {semantics.tokenizer_digest};
+    token_contract.authoritative_template_digest = {semantics.template_digest};
+    auto manifest = SemanticManifest::build(std::get<ArtifactIndex>(physical), semantics, token_contract);
+    if (const auto* report = std::get_if<CompatibilityReport>(&manifest)) return *report;
+    auto runtime = std::shared_ptr<const RuntimePackage>(new RuntimePackage(
+        std::get<SemanticManifest>(std::move(manifest)), rule_fingerprint(*rule),
+        rule->rule_revision, rule->qualification_state,
+        PackageAuthorityKind::DiagnosticRaw));
+    DiagnosticProvenance diagnostics;
+    diagnostics.format_name = "GGUF";
+    diagnostics.importer_name = "gguf-v3";
+    diagnostics.rule_id = rule->rule_id;
+    diagnostics.rule_revision = rule->rule_revision;
     return ValidatedPackage(std::move(runtime), std::move(diagnostics));
 }
 

@@ -8,6 +8,7 @@
 #include <span>
 #include <vector>
 
+#include "column_grouped_affine_uint2_skip.h"
 #include "tensor.h"
 
 namespace Laplace {
@@ -24,6 +25,7 @@ enum class DerivedStorageError : uint16_t {
     InvalidImportance = 8,
     ContractMismatch = 9,
     DestinationAlignmentMismatch = 10,
+    DestinationOverlap = 11,
 };
 
 // Derived affine UInt2 storage. Each logical 256-value block has one 64-byte
@@ -70,6 +72,19 @@ bool derive_affine_u2_block256_from_gguf(
     uint64_t logical_k, uint64_t logical_n, std::span<const float> importance,
     std::span<uint8_t> packed_weights, std::span<uint16_t> scales,
     std::span<uint16_t> biases, DerivedAffineUInt2Record* record,
+    DerivedStorageError* error);
+
+// Converts a row-major GGUF Q4_K/Q6_K matrix W[N,K] into the output-block-
+// major ColumnGroupedAffineUInt2SkipV1 physical layout. The K-length
+// importance vector is the validated activation statistic and is recorded in
+// the provenance digest; zero-observation columns receive an unweighted fit
+// so the storage remains complete. The caller owns all three output planes.
+bool derive_column_grouped_affine_u2_skip_v1_from_gguf(
+    GGMLType source_format, std::span<const uint8_t> source,
+    uint64_t logical_k, uint64_t logical_n, std::span<const float> importance,
+    std::span<uint8_t> packed_weights, std::span<uint16_t> scales,
+    std::span<uint16_t> biases,
+    ColumnGroupedAffineUInt2SkipV1Storage* storage,
     DerivedStorageError* error);
 
 struct DerivedQ2KContract {
@@ -187,6 +202,63 @@ void matmul_gpu_end();
 bool matmul_gpu_available();
 bool matmul_gpu_batch(const MatmulBatchSpec* specs, int n);
 
+// Versioned sampler contract. V1 implements only deterministic greedy
+// selection. The temperature, top-k, top-p, and counter-RNG fields are
+// reserved in the descriptor so later policies do not change the call ABI.
+enum class MetalSamplerMode : uint8_t { Greedy = 1 };
+enum class MetalSamplerTiePolicy : uint8_t { FirstIndex = 1 };
+enum class MetalSamplerNonFinitePolicy : uint8_t { Reject = 1 };
+enum class MetalSamplerResultStatus : uint32_t {
+    Success = 0,
+    InvalidInput = 1,
+    NonFiniteLogit = 2,
+    MetalFailure = 3,
+};
+
+struct MetalSamplerDescriptor {
+    uint16_t version = 1;
+    MetalSamplerMode mode = MetalSamplerMode::Greedy;
+    MetalSamplerTiePolicy tie_policy = MetalSamplerTiePolicy::FirstIndex;
+    MetalSamplerNonFinitePolicy nonfinite_policy = MetalSamplerNonFinitePolicy::Reject;
+    uint8_t reserved = 0;
+    float temperature = 1.0f;
+    uint32_t top_k = 0;
+    float top_p = 1.0f;
+    uint64_t rng_seed = 0;
+    uint64_t rng_counter = 0;
+};
+
+// Borrowed MTLBuffer view. `buffer` is an opaque id<MTLBuffer>; the caller
+// keeps it alive until metal_sampler_greedy returns.
+struct MetalSamplerDeviceLogits {
+    const void* buffer = nullptr;
+    size_t byte_offset = 0;
+    uint32_t vocabulary = 0;
+};
+
+struct MetalSamplerResult {
+    uint32_t token_id = 0;
+    float logit = 0.0f;
+    MetalSamplerResultStatus status = MetalSamplerResultStatus::InvalidInput;
+    uint32_t reserved = 0;
+};
+static_assert(sizeof(MetalSamplerResult) == 16, "Metal sampler result ABI");
+
+// Consumes device-resident F32 logits and copies only MetalSamplerResult back
+// to the caller. A failed command leaves `result` unchanged.
+bool metal_sampler_greedy(const MetalSamplerDescriptor& descriptor,
+                          const MetalSamplerDeviceLogits& logits,
+                          MetalSamplerResult* result);
+
+#if defined(LAPLACE_TESTING)
+// Test-only upload seam. It uploads input logits, then exercises the device
+// buffer API; it does not download the full vocabulary.
+bool metal_test_sampler_greedy(const MetalSamplerDescriptor& descriptor,
+                               const float* logits, uint32_t vocabulary,
+                               MetalSamplerResult* result,
+                               uint32_t* command_buffers);
+#endif
+
 // One GPU command buffer for a decode token. Residual stays on device.
 struct MetalTokLayer {
     const Tensor* attn_norm = nullptr;
@@ -204,6 +276,11 @@ struct MetalTokLayer {
     const Tensor* ffn_gate = nullptr;
     const Tensor* ffn_up = nullptr;
     const Tensor* ffn_down = nullptr;
+    const Tensor* moe_gate = nullptr;
+    const Tensor* moe_gate_scale = nullptr;
+    const Tensor* moe_up = nullptr;
+    const Tensor* moe_dn = nullptr;
+    const Tensor* moe_dn_scale = nullptr;
     const Tensor* pre_ffw_2 = nullptr;
     const Tensor* post_ffw_1 = nullptr;
     const Tensor* post_ffw_2 = nullptr;
@@ -212,10 +289,16 @@ struct MetalTokLayer {
     const float* rope_freqs = nullptr;
     int n_rope_freqs = 0;
     uint32_t rope_sections[4]{};
-    int H = 0, inter = 0;
-    int Hq = 0, Hk = 0, Dh = 0, rope_dim = 0, window = 0, cache_id = 0;
-    float rope_base = 0, rms_eps = 0, q_norm_eps = 0, k_norm_eps = 0;
+    int H = 0, inter = 0, exp_inter = 0, n_experts = 0, n_used = 0;
+    int Hq = 0, Hk = 0, Dh = 0, rope_dim = 0, rope_frequency_dimension = 0,
+        window = 0, cache_id = 0;
+    // Offset in cached scalar values per sequence position. UINT64_MAX keeps
+    // the legacy fixed-stride cache addressing used outside canonical sessions.
+    uint64_t cache_width_offset = UINT64_MAX;
+    uint32_t moe_router_normalization_scale_bits = 0;
+    float rope_base = 0, attention_scale = 0, rms_eps = 0, q_norm_eps = 0, k_norm_eps = 0;
     bool swiglu = false, owns_kv = true, is_global = false, query_gate_split = false,
+         moe_gelu_tanh = false, moe_reduce_left_to_right = false, key_state_alias = false,
          sparse_ffn = false,
          sparse_ffn_dense_oracle = false,
          rope_interleaved = false, rope_multi_section = false;
@@ -266,6 +349,13 @@ struct MetalTokRecurrentLayer {
 // Private token resources for one canonical runtime/session. The legacy
 // token-graph wrappers below retain their process-default context.
 class MetalTokSession;
+struct MetalTokAttentionCapacity {
+    int query_width = 0;
+    int key_value_width = 0;
+    // Sum of the exact per-attention-layer K/V widths. Zero selects the
+    // legacy layer-count times maximum-width allocation.
+    uint64_t key_value_width_sum = 0;
+};
 struct MetalSparseBlockRun {
     uint32_t first = 0;
     uint32_t count = 0;
@@ -274,7 +364,8 @@ struct MetalTokMetrics {
     double cpu_wait_ms = 0.0;
     double gpu_time_ms = 0.0;
     uint64_t peak_session_bytes = 0;
-    uint64_t projection_weight_bytes = 0;
+    uint64_t kv_cache_bytes = 0;
+    uint64_t requested_projection_source_bytes = 0;
     uint32_t projection_dispatches = 0;
     // A projection dispatched with more than one activation row. This is
     // intentionally separate from the legacy total so a one-command-buffer
@@ -282,6 +373,8 @@ struct MetalTokMetrics {
     uint32_t batched_projection_dispatches = 0;
     uint32_t q4k_projection_dispatches = 0;
     uint32_t q6k_projection_dispatches = 0;
+    uint32_t grouped_affine_u2_projection_dispatches = 0;
+    uint32_t column_grouped_affine_u2_skip_projection_dispatches = 0;
     uint64_t counter_sample_count = 0;
     bool profiled = false;
     bool counter_samples = false;
@@ -301,6 +394,15 @@ struct MetalResourceSnapshot {
     uint64_t recommended_max_working_set_size = 0;
     uint64_t registered_weight_bytes = 0;
     uint64_t implicit_weight_copies = 0;
+    uint64_t session_owned_metadata_bytes = 0;
+    uint64_t transient_workspace_bytes = 0;
+};
+struct MetalTokMoeCapabilities {
+    bool router_topk = false;
+    bool gate_up_q4_k = false;
+    bool down_q5_0 = false;
+    bool down_q8_0 = false;
+    bool reduce = false;
 };
 void metal_dispatch_metrics_reset();
 MetalDispatchMetrics metal_dispatch_metrics();
@@ -311,9 +413,28 @@ void metal_tok_session_require_registered_weights(MetalTokSession&, bool);
 uint32_t metal_tok_session_weight_span_coverage(const MetalTokSession&, const void*, size_t);
 MetalResourceSnapshot metal_tok_session_resource_snapshot(const MetalTokSession&);
 bool metal_tok_session_dense_ready(MetalTokSession&);
+// Capability snapshot for the canonical three-plane UInt2/256 GEMV leaf.
+// This is a query of the loaded Metal library and pipeline limits, not a
+// device-family or model-name assumption.
+bool metal_tok_session_affine_u2_256_ready(MetalTokSession&);
+// Capability and session-owned metadata binding for the distinct
+// output-block-major UInt2 layout. This never aliases the legacy row-major
+// GROUPED_AFFINE_U2_256 contract.
+bool metal_tok_session_column_grouped_affine_u2_skip_256_ready(MetalTokSession&);
+bool metal_tok_session_register_column_grouped_affine_u2_skip_256(
+    MetalTokSession&, const Tensor&);
+MetalTokMoeCapabilities metal_tok_session_moe_capabilities(MetalTokSession&);
+bool metal_tok_session_moe_ready(MetalTokSession&);
 bool metal_tok_session_recurrent_ready(MetalTokSession&);
 bool metal_tok_session_register_weights(MetalTokSession&, const void* base, size_t size);
 void metal_tok_session_unregister_weights(MetalTokSession&, const void* base);
+#if defined(LAPLACE_TESTING)
+// Test-only registration seam. The chunk limit forces split-buffer coverage;
+// fail_after_chunk uses zero-based indexing and UINT32_MAX disables failure.
+bool metal_tok_session_register_weights_for_testing(MetalTokSession&, const void* base,
+                                                    size_t size, size_t chunk_limit,
+                                                    uint32_t fail_after_chunk);
+#endif
 bool metal_tok_session_set_sparse_ffn_runs(MetalTokSession&, const MetalSparseBlockRun*, uint32_t count);
 bool metal_tok_session_set_sparse_ffn_layer_ids(MetalTokSession&, const uint32_t* ids,
                                                 const uint32_t* offsets,
@@ -330,14 +451,25 @@ bool metal_tok_session_read_importance(const MetalTokSession&, uint32_t slot,
 bool metal_tok_session_begin(MetalTokSession&, int H, int inter, int exp_inter, int n_used, int n_experts,
                              int Hq, int Hk, int Dh, int max_seq, int n_layers, int pos,
                              uint32_t profile_token_count = 1);
+bool metal_tok_session_begin_with_attention_capacity(
+    MetalTokSession&, int H, int inter, int exp_inter, int n_used, int n_experts,
+    MetalTokAttentionCapacity, int max_seq, int n_layers, int pos,
+    uint32_t profile_token_count = 1);
 bool metal_tok_session_begin_prefill_batch(MetalTokSession&, int H, int inter, int exp_inter,
                                            int n_used, int n_experts, int Hq, int Hk, int Dh,
                                            int max_seq, int n_layers, int pos, uint32_t rows);
+bool metal_tok_session_begin_prefill_batch_with_attention_capacity(
+    MetalTokSession&, int H, int inter, int exp_inter, int n_used, int n_experts,
+    MetalTokAttentionCapacity, int max_seq, int n_layers, int pos, uint32_t rows);
 bool metal_tok_session_begin_continuing(MetalTokSession&, int H, int inter, int exp_inter, int n_used, int n_experts,
                                         int Hq, int Hk, int Dh, int max_seq, int n_layers, int pos);
-bool metal_tok_session_upload_embedding(MetalTokSession&, const Tensor&, uint32_t token, int H, int vocab);
+bool metal_tok_session_begin_continuing_with_attention_capacity(
+    MetalTokSession&, int H, int inter, int exp_inter, int n_used, int n_experts,
+    MetalTokAttentionCapacity, int max_seq, int n_layers, int pos);
+bool metal_tok_session_upload_embedding(MetalTokSession&, const Tensor&, uint32_t token, int H, int vocab,
+                                        float scale);
 bool metal_tok_session_upload_embeddings_batch(MetalTokSession&, const Tensor&, const uint32_t* tokens,
-                                               uint32_t rows, int H, int vocab);
+                                               uint32_t rows, int H, int vocab, float scale);
 bool metal_tok_session_upload_x(MetalTokSession&, const float*, int H);
 bool metal_tok_session_layer(MetalTokSession&, const MetalTokLayer&);
 bool metal_tok_session_dense_prefill_batch_layer(MetalTokSession&, const MetalTokLayer&, uint32_t rows);
@@ -348,8 +480,14 @@ bool metal_tok_session_commit_token(MetalTokSession&);
 bool metal_tok_session_seal_token(MetalTokSession&);
 bool metal_tok_session_final(MetalTokSession&, const Tensor& norm, const Tensor& lm, float* logits,
                              int H, int vocab, float eps);
+bool metal_tok_session_final_sampled(MetalTokSession&, const Tensor& norm, const Tensor& lm,
+                                     const MetalSamplerDescriptor&, MetalSamplerResult*,
+                                     int H, int vocab, float eps);
 MetalTokMetrics metal_tok_session_metrics(const MetalTokSession&);
 void metal_tok_session_abort(MetalTokSession&);
+#if defined(LAPLACE_TESTING)
+uintptr_t metal_tok_session_queue_identity_for_testing(const MetalTokSession&);
+#endif
 #if defined(LAPLACE_METAL_TESTING)
 bool metal_tok_session_enable_sparse_ffn_dense_oracle_for_testing(MetalTokSession&, uint32_t slots);
 bool metal_tok_session_sparse_ffn_windows_for_testing(const MetalTokSession&, uint32_t* starts,
@@ -357,6 +495,73 @@ bool metal_tok_session_sparse_ffn_windows_for_testing(const MetalTokSession&, ui
 const char* metal_tok_recurrent_layer_preflight_for_testing(const MetalTokRecurrentLayer&, int H, int inter, int Dh);
 #endif
 #if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_TESTING)
+enum class MetalRouterScoreDomain : uint8_t { Logits = 1 };
+enum class MetalRouterNormalization : uint8_t { SelectThenNormalizeSoftmax = 1 };
+enum class MetalRouterTiePolicy : uint8_t { LowestExpertId = 1 };
+
+enum class MetalMoeActivationTestPath : uint8_t {
+    PerExpertLoop = 1,
+    Batched2D = 2,
+};
+
+struct MetalMoeActivationTestMetrics {
+    double gpu_ms = 0.0;
+    uint32_t command_buffers = 0;
+    uint32_t activation_dispatches = 0;
+    bool expert_ids_unchanged = false;
+    bool gate_up_unchanged = false;
+};
+
+// Test-only A/B seam for the selected-expert activation slice. gate_up is
+// laid out as [selected][gate, up][intermediate]. Both paths execute in one
+// command buffer; Batched2D must encode exactly one activation dispatch.
+bool metal_test_moe_batched_activation(
+    const float* gate_up, size_t gate_up_values,
+    const uint32_t* expert_ids, uint32_t selected_count,
+    uint32_t intermediate, bool swiglu, MetalMoeActivationTestPath path,
+    float* output, size_t output_values,
+    MetalMoeActivationTestMetrics* metrics);
+
+struct MetalRouterTopKSpec {
+    uint32_t expert_count = 0;
+    uint32_t selected_count = 0;
+    MetalRouterScoreDomain score_domain = MetalRouterScoreDomain::Logits;
+    MetalRouterNormalization normalization =
+        MetalRouterNormalization::SelectThenNormalizeSoftmax;
+    MetalRouterTiePolicy tie_policy = MetalRouterTiePolicy::LowestExpertId;
+};
+
+struct MetalRouterPipelineCaps {
+    uint32_t thread_execution_width = 0;
+    uint32_t max_total_threads_per_threadgroup = 0;
+};
+
+bool metal_test_router_top_k(const MetalRouterTopKSpec&, const float* logits,
+                             uint32_t* ids, float* weights,
+                             MetalRouterPipelineCaps* capabilities);
+
+struct MetalMoeDownReduceSpec {
+    uint32_t input_width = 0;
+    uint32_t output_width = 0;
+    uint32_t expert_count = 0;
+    uint32_t selected_count = 0;
+};
+
+struct MetalMoeDownReducePipelineCaps {
+    uint32_t thread_execution_width = 0;
+    uint32_t max_total_threads_per_threadgroup = 0;
+};
+
+// Test-only gathered down projection and deterministic weighted reduction.
+// The worklist owns expert order. expert_scales is optional, but when present
+// it must contain one finite F32 value for every expert.
+bool metal_test_moe_down_reduce(
+    const MetalMoeDownReduceSpec&, const Tensor&, size_t source_bytes,
+    const float* input, size_t input_values, const uint32_t* expert_ids,
+    const float* route_weights, const float* expert_scales,
+    size_t expert_scale_values, float* output, size_t output_values,
+    double* gpu_ms, MetalMoeDownReducePipelineCaps* capabilities);
+
 bool metal_tok_profile_sample_count_for_testing(uint32_t token_count, uint32_t layer_count,
                                                 uint64_t* sample_count);
 #endif
@@ -413,6 +618,46 @@ bool metal_test_q4k_embedding(const Tensor& embedding, uint32_t token, float* ou
                               int width, int vocabulary);
 bool metal_test_q6k_embedding(const Tensor& embedding, uint32_t token, float* output,
                               int width, int vocabulary);
+
+// One GPU command buffer for dense FFN + routed experts. QKV stays on CPU.
+bool matmul_decode_ffn_moe(
+    const float* x_norm, const Tensor& ffn_gate, const Tensor& ffn_up,
+    const Tensor& ffn_down, float* xb, int H, int inter, bool swiglu,
+    const float* moe_in, const Tensor* moe_up_stack, const Tensor* moe_dn_stack,
+    const int* expert_ids, int n_exp, int exp_inter, const float* route_w,
+    float* moe_out);
+
+// Run subsequent matmul_rows on a GCD queue (E-cores) instead of the
+// P-core ThreadPool. For overlapping dense FFN with MoE.
+void matmul_use_gcd(bool on);
+
+// Fused MoE GEMV with indirect expert access. expert_idx[k] selects which
+// expert from the stacked weight tensor to use. y[k * N + j] = output of
+// expert expert_idx[k], column j. One parallel_for for all experts.
+void fused_moe_gemm_idx(const float* x, const Tensor& w, float* y,
+                        const int* expert_idx, int n_experts,
+                        int K, int N);
+
+// Fused MoE GEMV with per-expert activations. x[k * K + i] is expert k's
+// input. y[k * N + j] = output of expert expert_idx[k], column j.
+// One parallel_for for all experts.
+void fused_moe_gemm_multi(const float* x, const Tensor& w, float* y,
+                          const int* expert_idx, int n_experts,
+                          int K, int N);
+
+// Computes the selected experts' gate and up projections and applies GeGLU
+// without materializing the 2 * hidden_dim projection.
+bool fused_moe_gate_up_geglu(const float* x, const Tensor& w, float* hidden,
+                             const int* expert_idx, int n_experts,
+                             int K, int hidden_dim,
+                             const uint8_t* const* bases = nullptr);
+
+// Adds the route-weighted selected expert projections directly to output,
+// without materializing one output vector per expert.
+bool fused_moe_down_accumulate(const float* x, const Tensor& w,
+                               const int* expert_idx, const float* route_weight,
+                               int n_experts, int K, int N, float* output,
+                               const uint8_t* const* bases = nullptr);
 
 // Standalone dequantize (for testing and verification).
 // dst must hold exactly `n` floats.

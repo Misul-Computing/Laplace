@@ -110,11 +110,39 @@ inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
 using gemm_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
                          float* y, int M, int K, int N);
 
+// Fused MoE GEMV with shared activation: for each expert k, column j:
+//   y[k * N + j] = dot(x, w + expert_idx[k] * per_expert + j * rb, K)
+// Quantizes x once, then one parallel_for across n_experts * N.
+using moe_gemv_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
+                             const int* expert_idx, int n_experts,
+                             float* y, int K, int N);
+
+// Fused MoE GEMV with per-expert activations: for each expert k, column j:
+//   y[k * N + j] = dot(x + k * K, w + expert_idx[k] * per_expert + j * rb, K)
+// Quantizes all n_experts rows of x, then one parallel_for.
+using moe_gemv_multi_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
+                                   const int* expert_idx, int n_experts,
+                                   float* y, int K, int N);
+
+using moe_gate_up_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
+                                const int* expert_idx, int n_experts,
+                                float* hidden, int K, int hidden_dim,
+                                const uint8_t* const* bases);
+
+using moe_down_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
+                             const int* expert_idx, const float* route_weight,
+                             int n_experts, float* output, int K, int N,
+                             const uint8_t* const* bases);
+
 // Returns the best GEMM entry point this build provides for the RUNNING
 // cpu, or nullptr when the CPU (or architecture) lacks the required
 // features.
 void set_gcd_gemm(bool on);
 gemm_fn get_simd_gemm();
+moe_gemv_fn get_simd_moe_gemv();
+moe_gemv_multi_fn get_simd_moe_gemv_multi();
+moe_gate_up_fn get_simd_moe_gate_up();
+moe_down_fn get_simd_moe_down();
 
 } // namespace kernels
 } // namespace Laplace

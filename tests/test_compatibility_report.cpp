@@ -14,11 +14,30 @@ void expect_stage(CompatibilityError code, CompatibilityStage expected) {
 void test_refusal_taxonomy() {
     expect_stage(CompatibilityError::PACKAGE_BAD_MAGIC, CompatibilityStage::Package);
     expect_stage(CompatibilityError::IMPORT_SEMANTICS_AMBIGUOUS, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_SCHEMA_NOT_FOUND, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_SCHEMA_INCOMPLETE, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_SCHEMA_LIMIT, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_MANIFEST_INVALID, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_MANIFEST_DOWNGRADE, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_CLOSURE_INCOMPLETE, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_ALIAS_AMBIGUOUS, CompatibilityStage::Semantic);
+    expect_stage(CompatibilityError::IMPORT_INTERACTION_UNSUPPORTED, CompatibilityStage::Tokenizer);
     expect_stage(CompatibilityError::IR_QUANTIZATION_UNSUPPORTED, CompatibilityStage::PhysicalFormat);
     expect_stage(CompatibilityError::CAPABILITY_MISSING, CompatibilityStage::Capability);
     expect_stage(CompatibilityError::STATE_ABI_MISMATCH, CompatibilityStage::StateRollback);
     expect_stage(CompatibilityError::TOKENIZER_RUNTIME_UNSUPPORTED, CompatibilityStage::Tokenizer);
     expect_stage(CompatibilityError::RULE_QUALIFICATION_REQUIRED, CompatibilityStage::Benchmark);
+    expect_stage(CompatibilityError::PACKAGE_AUTHORITY_REQUIRED, CompatibilityStage::Session);
+    expect_stage(CompatibilityError::AUTHORITY_INVALID, CompatibilityStage::Session);
+    CHECK(compatibility_phase(CompatibilityError::PACKAGE_AUTHORITY_REQUIRED) ==
+          CompatibilityPhase::Session);
+    CHECK(compatibility_message(CompatibilityError::PACKAGE_AUTHORITY_REQUIRED) ==
+          "package execution authority is required");
+    CHECK(compatibility_message(CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS) ==
+          "source schema match is ambiguous");
+    CHECK(compatibility_message(CompatibilityError::AUTHORITY_INVALID) ==
+          "package execution authority is invalid");
 }
 
 void test_diagnostic_location_does_not_change_refusal() {

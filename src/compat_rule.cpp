@@ -604,4 +604,6 @@ RuleEvaluationResult evaluate_rules(const std::vector<CompatibilityRule>& rules,
                         "no bundled LAPRUL10 rule matches package metadata and tensor contracts");
 }
 
+#include "compat_rules_v1.inc"
+
 } // namespace Laplace

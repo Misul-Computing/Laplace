@@ -110,7 +110,6 @@ CompatibilityReport wire_error(CompatibilityError code) {
 constexpr uint32_t kMaxTensors = 65536;
 constexpr uint32_t kMaxValues = 262144;
 constexpr uint32_t kMaxOperators = 1048576;
-constexpr uint32_t kMaxLayers = 4096;
 constexpr uint32_t kMaxStates = 4096;
 constexpr uint32_t kMaxConstraints = 65536;
 constexpr uint32_t kMaxVector = 1048576;
@@ -167,8 +166,8 @@ bool valid_dimensions(const std::vector<Dimension>& dimensions) {
 }
 
 bool valid_layout(const PhysicalLayout& layout, uint8_t rank) {
-    if (!enum_between(layout.kind, 1, 2) || layout.version != 1 ||
-        !enum_between(layout.packing, 0, 1) || layout.rank != rank || layout.block_rank > rank ||
+    if (!enum_between(layout.kind, 1, 4) || layout.version != 1 ||
+        !enum_between(layout.packing, 0, 2) || layout.rank != rank || layout.block_rank > rank ||
         layout.flags != 0) {
         return false;
     }
@@ -186,7 +185,19 @@ bool valid_layout(const PhysicalLayout& layout, uint8_t rank) {
         return layout.packing == PackingKind::None && layout.block_rank == 0 &&
                layout.block_elements == 0 && layout.block_bytes == 0;
     }
-    return layout.packing == PackingKind::Gguf && layout.block_elements != 0 && layout.block_bytes != 0;
+    if (layout.kind == PhysicalLayoutKind::GgufBlocked) {
+        return layout.packing == PackingKind::Gguf && layout.block_elements != 0 &&
+               layout.block_bytes != 0;
+    }
+    if (layout.kind == PhysicalLayoutKind::GroupedAffine) {
+        return layout.packing == PackingKind::LsbBitPacked && layout.block_rank == 1 &&
+               layout.block_elements != 0 && layout.block_bytes != 0;
+    }
+    if (layout.kind == PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip) {
+        return layout.packing == PackingKind::LsbBitPacked && layout.block_rank == 1 &&
+               layout.block_elements == 256 && layout.block_bytes == 64;
+    }
+    return false;
 }
 
 bool valid_quantization(const Quantization& quantization) {
@@ -247,10 +258,13 @@ bool valid_plane(const TensorPlane& plane) {
     return plane.offset <= std::numeric_limits<uint64_t>::max() - plane.length;
 }
 
-bool valid_tensor(const SemanticTensor& tensor, bool supports_expert_axis) {
+bool valid_tensor(const SemanticTensor& tensor, bool supports_expert_axis,
+                  bool supports_inactive_program) {
+    const uint16_t allowed_flags = supports_inactive_program
+        ? kSemanticTensorFlagInactiveProgram : 0;
     if (!enum_between(tensor.role, 1, 31) || !valid_scalar_type(tensor.logical_type) ||
         !valid_dimensions(tensor.dimensions) || tensor.dimensions.empty() || tensor.planes.empty() ||
-        tensor.planes.size() > kMaxPlanes || tensor.flags != 0 ||
+        tensor.planes.size() > kMaxPlanes || (tensor.flags & ~allowed_flags) != 0 ||
         !valid_layout(tensor.layout, static_cast<uint8_t>(tensor.dimensions.size())) ||
         !valid_quantization(tensor.quantization)) {
         return false;
@@ -283,33 +297,62 @@ bool valid_router_payload(const RouterTopKPayload& payload) {
         return payload.score_domain == RouterScoreDomain::Logits &&
                payload.selected_weight_normalization == SelectedWeightNormalization::Softmax;
     }
-    return payload.normalization_order == RouterNormalizationOrder::NormalizeThenSelect &&
-           (payload.score_domain == RouterScoreDomain::Logits || payload.score_domain == RouterScoreDomain::Probabilities) &&
-           payload.selected_weight_normalization == SelectedWeightNormalization::PreserveSource;
+    if (payload.normalization_order != RouterNormalizationOrder::NormalizeThenSelect) return false;
+    if (payload.selected_weight_normalization == SelectedWeightNormalization::PreserveSource) {
+        return payload.score_domain == RouterScoreDomain::Logits ||
+               payload.score_domain == RouterScoreDomain::Probabilities;
+    }
+    return payload.score_domain == RouterScoreDomain::Logits &&
+           payload.selected_weight_normalization ==
+               SelectedWeightNormalization::RenormalizeSelectedProbabilities;
 }
 
 bool valid_payload(const SemanticOperator& op) {
     if (op.inputs.size() > 64 || op.outputs.size() > 64 || op.tensors.size() > 64 || op.states.size() > 64) {
         return false;
     }
+    if (!semantic_operator_signature_valid(op)) return false;
     if (op.semantic_version >= 2 && op.semantic_version <= 7) {
         switch (op.kind) {
         case OperatorKind::EmbeddingLookup: {
             const auto* payload = std::get_if<EmbeddingLookupPayload>(&op.payload);
-            return payload && payload->vocabulary != 0 && payload->width != 0 && payload->flags == 0;
+            float scale = 0.0f;
+            return payload && f32_bits(payload->scale_f32_bits, scale) && scale > 0.0f &&
+                   payload->vocabulary != 0 && payload->width != 0 && payload->flags == 0 &&
+                   op.inputs.size() == 1 && op.outputs.size() == 1;
         }
         case OperatorKind::RmsNorm: {
             const auto* payload = std::get_if<RmsNormPayload>(&op.payload);
-            return payload && payload->axis == -1 && payload->weight_mode == 1;
+            float epsilon = 0.0f;
+            if (!payload || payload->axis != -1 ||
+                !f32_bits(payload->epsilon_f32_bits, epsilon) || epsilon < 0.0f ||
+                op.inputs.size() != 1 || op.outputs.size() != 1 || !op.states.empty()) {
+                return false;
+            }
+            if (payload->weight_mode == 1) return op.tensors.size() == 1;
+            return op.semantic_version == 7 && payload->weight_mode == 0 &&
+                   op.tensors.empty();
         }
         case OperatorKind::Linear: {
             const auto* payload = std::get_if<LinearPayload>(&op.payload);
-            return payload && payload->accumulation_type == ScalarType::F32;
+            return payload && payload->accumulation_type == ScalarType::F32 &&
+                   op.inputs.size() == 1 && op.outputs.size() == 1;
         }
         case OperatorKind::Rope: {
             const auto* payload = std::get_if<RopePayload>(&op.payload);
+            float base = 0.0f;
+            float scale = 0.0f;
             if (!payload || !payload->position_from_cursor || payload->rotary_dimension == 0 ||
-                payload->rotary_dimension % 2 != 0) {
+                payload->rotary_dimension % 2 != 0 ||
+                !f32_bits(payload->base_f32_bits, base) || base <= 0.0f ||
+                !f32_bits(payload->scale_f32_bits, scale) || scale <= 0.0f) {
+                return false;
+            }
+            const uint32_t frequency_dimension = payload->frequency_dimension == 0
+                ? payload->rotary_dimension : payload->frequency_dimension;
+            if ((op.semantic_version < 7 && payload->frequency_dimension != 0) ||
+                frequency_dimension < payload->rotary_dimension ||
+                frequency_dimension % 2 != 0) {
                 return false;
             }
             if (op.semantic_version < 5) {
@@ -327,12 +370,18 @@ bool valid_payload(const SemanticOperator& op) {
         }
         case OperatorKind::CausalAttention: {
             const auto* payload = std::get_if<CausalAttentionPayload>(&op.payload);
+            float scale = 0.0f;
             if (!payload || payload->query_heads == 0 || payload->kv_heads == 0 ||
                 payload->head_dimension == 0 || payload->query_heads % payload->kv_heads != 0 ||
+                !f32_bits(payload->scale_f32_bits, scale) || scale <= 0.0f ||
                 payload->mask != AttentionMask::Causal || payload->cache_policy != CachePolicy::Global) {
                 return false;
             }
-            if (op.semantic_version < 7) return true;
+            if (op.semantic_version < 7) {
+                return payload->window == AttentionWindowKind::Global && payload->window_tokens == 0 &&
+                       payload->value_source == ValueSource::SeparateProjection &&
+                       payload->value_source_value == UINT32_MAX;
+            }
             return ((payload->window == AttentionWindowKind::Global && payload->window_tokens == 0) ||
                     (payload->window == AttentionWindowKind::Sliding && payload->window_tokens != 0)) &&
                    enum_between(payload->value_source, 1, 4) && payload->value_source_value != UINT32_MAX;
@@ -366,12 +415,17 @@ bool valid_payload(const SemanticOperator& op) {
                    op.outputs.size() == 1 && op.tensors.empty() && op.states.empty();
         case OperatorKind::GatedRmsNorm: {
             const auto* payload = std::get_if<GatedRmsNormPayload>(&op.payload);
-            return payload && payload->gate_activation == ActivationKind::Silu && payload->weight_mode == 1 &&
+            float epsilon = 0.0f;
+            return payload && f32_bits(payload->epsilon_f32_bits, epsilon) && epsilon >= 0.0f &&
+                   payload->gate_activation == ActivationKind::Silu && payload->weight_mode == 1 &&
                    op.inputs.size() == 2 && op.outputs.size() == 1 && op.tensors.size() == 1 && op.states.empty();
         }
-        case OperatorKind::L2Normalize:
-            return std::holds_alternative<L2NormalizePayload>(op.payload) && op.inputs.size() == 1 &&
-                   op.outputs.size() == 1 && op.tensors.empty() && op.states.empty();
+        case OperatorKind::L2Normalize: {
+            const auto* payload = std::get_if<L2NormalizePayload>(&op.payload);
+            float epsilon = 0.0f;
+            return payload && f32_bits(payload->epsilon_f32_bits, epsilon) && epsilon >= 0.0f &&
+                   op.inputs.size() == 1 && op.outputs.size() == 1 && op.tensors.empty() && op.states.empty();
+        }
         case OperatorKind::AxisSplit: {
             const auto* payload = std::get_if<AxisSplitPayload>(&op.payload);
             return op.semantic_version >= 4 && payload &&
@@ -427,26 +481,43 @@ bool valid_payload(const SemanticOperator& op) {
     switch (op.kind) {
     case OperatorKind::EmbeddingLookup: {
         auto* payload = std::get_if<EmbeddingLookupPayload>(&op.payload);
-        return payload && payload->vocabulary != 0 && payload->width != 0 && payload->flags == 0;
+        float scale = 0.0f;
+        return payload && f32_bits(payload->scale_f32_bits, scale) && scale > 0.0f &&
+               payload->vocabulary != 0 && payload->width != 0 && payload->flags == 0 &&
+               op.inputs.size() == 1 && op.outputs.size() == 1;
     }
     case OperatorKind::RmsNorm: {
         auto* payload = std::get_if<RmsNormPayload>(&op.payload);
-        return payload && payload->axis == -1 && payload->weight_mode == 1;
+        float epsilon = 0.0f;
+        return payload && f32_bits(payload->epsilon_f32_bits, epsilon) && epsilon >= 0.0f &&
+               payload->axis == -1 && payload->weight_mode == 1;
     }
     case OperatorKind::Linear: {
         auto* payload = std::get_if<LinearPayload>(&op.payload);
-        return payload && payload->accumulation_type == ScalarType::F32;
+        return payload && payload->accumulation_type == ScalarType::F32 &&
+               op.inputs.size() == 1 && op.outputs.size() == 1;
     }
     case OperatorKind::Rope: {
         auto* payload = std::get_if<RopePayload>(&op.payload);
+        float base = 0.0f;
+        float scale = 0.0f;
         return payload && payload->pairing == RopePairing::HalfSplit && payload->position_from_cursor &&
-               payload->rotary_dimension != 0 && payload->rotary_dimension % 2 == 0;
+               payload->rotary_dimension != 0 && payload->rotary_dimension % 2 == 0 &&
+               payload->frequency_dimension == 0 &&
+               payload->position_sections == std::array<uint32_t, 4>{} &&
+               f32_bits(payload->base_f32_bits, base) && base > 0.0f &&
+               f32_bits(payload->scale_f32_bits, scale) && scale > 0.0f;
     }
     case OperatorKind::CausalAttention: {
         auto* payload = std::get_if<CausalAttentionPayload>(&op.payload);
+        float scale = 0.0f;
         return payload && payload->query_heads != 0 && payload->kv_heads != 0 &&
                payload->head_dimension != 0 && payload->query_heads % payload->kv_heads == 0 &&
-               payload->mask == AttentionMask::Causal && payload->cache_policy == CachePolicy::Global;
+               f32_bits(payload->scale_f32_bits, scale) && scale > 0.0f &&
+               payload->mask == AttentionMask::Causal && payload->cache_policy == CachePolicy::Global &&
+               payload->window == AttentionWindowKind::Global && payload->window_tokens == 0 &&
+               payload->value_source == ValueSource::SeparateProjection &&
+               payload->value_source_value == UINT32_MAX;
     }
     case OperatorKind::SwiGlu: {
         auto* payload = std::get_if<SwiGluPayload>(&op.payload);
@@ -751,7 +822,7 @@ bool valid_model(const SemanticModel& model) {
         model.vocabulary_size == 0 || !valid_token_id(model.bos_id, model.vocabulary_size) ||
         !valid_token_id(model.eos_id, model.vocabulary_size) || model.stop_ids.size() > kMaxVector ||
         model.tensors.size() > kMaxTensors || model.values.size() > kMaxValues ||
-        model.operators.size() > kMaxOperators || model.layers.size() > kMaxLayers ||
+        model.operators.size() > kMaxOperators || model.layers.size() > kSemanticModelMaximumLayers ||
         model.states.size() > kMaxStates || model.constraints.size() > kMaxConstraints ||
         model.capabilities.size() > kMaxVector || model.fallbacks.size() > kMaxVector ||
         !dense_ids(model.tensors) || !dense_ids(model.values) || !dense_ids(model.operators) ||
@@ -763,7 +834,8 @@ bool valid_model(const SemanticModel& model) {
         model.output_values_first > model.values.size() || model.output_values_count > model.values.size() - model.output_values_first) {
         return false;
     }
-    for (const SemanticTensor& tensor : model.tensors) if (!valid_tensor(tensor, v7)) return false;
+    for (const SemanticTensor& tensor : model.tensors)
+        if (!valid_tensor(tensor, v7, v6 || v7)) return false;
     for (const SemanticValue& value : model.values) {
         if (!valid_scalar_type(value.logical_type) || !valid_dimensions(value.dimensions) ||
             value.dimensions.empty() || value.flags != 0) return false;
@@ -793,7 +865,7 @@ bool valid_model(const SemanticModel& model) {
         operator_cursor = layer.first_operator + layer.operator_count;
     }
     for (const SemanticState& state : model.states) {
-        if (!valid_state(state)) return false;
+        if (state.semantic_version != model.opset_major || !valid_state(state)) return false;
         if (state.kind == StateKind::RecurrentDeltaMatrix) {
             const LayoutPolicy expected = (v3 || v4 || v5 || v6 || v7) ? LayoutPolicy::ValueHeadKeyRowOutputColumn
                                               : LayoutPolicy::ValueHeadOutputRowKeyColumn;
@@ -969,6 +1041,7 @@ void append_payload(std::vector<uint8_t>& output, const SemanticOperator& op) {
         if (op.semantic_version >= 5) {
             for (uint32_t section : payload.position_sections) append_u32(output, section);
         }
+        if (op.semantic_version >= 7) append_u32(output, payload.frequency_dimension);
         break;
     }
     case OperatorKind::CausalAttention: {
@@ -1069,7 +1142,7 @@ void append_payload(std::vector<uint8_t>& output, const SemanticOperator& op) {
 uint32_t payload_length(OperatorKind kind, uint16_t semantic_version) {
     switch (kind) {
     case OperatorKind::EmbeddingLookup: case OperatorKind::RmsNorm: return 16;
-    case OperatorKind::Rope: return semantic_version >= 5 ? 32 : 16;
+    case OperatorKind::Rope: return semantic_version >= 7 ? 36 : semantic_version >= 5 ? 32 : 16;
     case OperatorKind::Linear: case OperatorKind::SwiGlu: return 8;
     case OperatorKind::CausalAttention: return semantic_version >= 7 ? 40 : 24;
     case OperatorKind::Add: return 0;
@@ -1126,6 +1199,7 @@ bool read_payload(const std::vector<uint8_t>& bytes, size_t& offset, OperatorKin
         if (semantic_version >= 5) {
             for (uint32_t& section : value.position_sections) if (!read_u32(bytes, offset, section)) return false;
         }
+        if (semantic_version >= 7 && !read_u32(bytes, offset, value.frequency_dimension)) return false;
         value.pairing = static_cast<RopePairing>(pairing); payload = value; return true;
     }
     case OperatorKind::CausalAttention: {
@@ -1271,6 +1345,10 @@ bool read_payload(const std::vector<uint8_t>& bytes, size_t& offset, OperatorKin
 }
 
 } // namespace
+
+bool semantic_operator_contract_valid(const SemanticOperator& op) {
+    return valid_payload(op);
+}
 
 SemanticEncodeResult encode_semantic_model(const SemanticModel& model) {
     if (!valid_model(model)) return wire_error(CompatibilityError::IR_CONSTRAINT_FAILED);
@@ -1477,7 +1555,8 @@ SemanticDecodeResult decode_semantic_model(const std::vector<uint8_t>& bytes) {
         !read_u32(bytes, offset, model.output_values_first) || !read_u32(bytes, offset, model.output_values_count)) {
         return wire_error(CompatibilityError::IR_VERSION_UNSUPPORTED);
     }
-    if (counts[0] > kMaxTensors || counts[1] > kMaxValues || counts[2] > kMaxOperators || counts[3] > kMaxLayers ||
+    if (counts[0] > kMaxTensors || counts[1] > kMaxValues || counts[2] > kMaxOperators ||
+        counts[3] > kSemanticModelMaximumLayers ||
         counts[4] > kMaxStates || counts[5] > kMaxConstraints || counts[6] > kMaxVector || counts[7] > kMaxVector) {
         return wire_error(CompatibilityError::IR_VERSION_UNSUPPORTED);
     }
@@ -1652,7 +1731,7 @@ SemanticVectorResult semantic_embedding_lookup(const std::vector<float>& table,
 
 SemanticVectorResult semantic_rms_norm(const std::vector<float>& input,
                                        const std::vector<float>& weight, float epsilon) {
-    if (input.empty() || input.size() != weight.size()) return shape_error();
+    if (input.empty() || (!weight.empty() && input.size() != weight.size())) return shape_error();
     if (!std::isfinite(epsilon) || epsilon < 0 || !finite(input) || !finite(weight)) {
         return constraint_error();
     }
@@ -1669,7 +1748,8 @@ SemanticVectorResult semantic_rms_norm(const std::vector<float>& input,
     if (!std::isfinite(reciprocal_root)) return constraint_error();
     std::vector<float> output(input.size());
     for (size_t index = 0; index < input.size(); ++index) {
-        output[index] = fp_mul(fp_mul(input[index], reciprocal_root), weight[index]);
+        const float scale = weight.empty() ? 1.0f : weight[index];
+        output[index] = fp_mul(fp_mul(input[index], reciprocal_root), scale);
     }
     return output;
 }
@@ -1710,9 +1790,12 @@ SemanticVectorResult semantic_linear(const std::vector<float>& input,
 SemanticVectorResult semantic_rope_half_split(const std::vector<float>& query,
                                               const std::vector<float>& key,
                                               uint32_t position, uint32_t rotary_dimension,
-                                              float base, float scale) {
+                                              float base, float scale,
+                                              uint32_t frequency_dimension) {
+    if (frequency_dimension == 0) frequency_dimension = rotary_dimension;
     if (query.size() != key.size() || query.empty() || rotary_dimension == 0 ||
-        rotary_dimension > query.size() || rotary_dimension % 2 != 0) {
+        rotary_dimension > query.size() || rotary_dimension % 2 != 0 ||
+        frequency_dimension < rotary_dimension || frequency_dimension % 2 != 0) {
         return shape_error();
     }
     if (!std::isfinite(base) || !std::isfinite(scale) || base <= 0 || scale <= 0 ||
@@ -1722,7 +1805,7 @@ SemanticVectorResult semantic_rope_half_split(const std::vector<float>& query,
     auto rotate = [&](const std::vector<float>& input, std::vector<float>& output) {
         output = input;
         for (uint32_t pair = 0; pair < rotary_dimension / 2; ++pair) {
-            float exponent = fp32(-2.0f * static_cast<float>(pair) / static_cast<float>(rotary_dimension));
+            float exponent = fp32(-2.0f * static_cast<float>(pair) / static_cast<float>(frequency_dimension));
             float angle = fp_mul(fp_mul(static_cast<float>(position), scale), std::pow(base, exponent));
             float cosine = fp32(std::cos(angle));
             float sine = fp32(std::sin(angle));
@@ -1743,9 +1826,12 @@ SemanticVectorResult semantic_rope_half_split(const std::vector<float>& query,
 SemanticVectorResult semantic_rope_interleaved(const std::vector<float>& query,
                                                 const std::vector<float>& key,
                                                 uint32_t position, uint32_t rotary_dimension,
-                                                float base, float scale) {
+                                                float base, float scale,
+                                                uint32_t frequency_dimension) {
+    if (frequency_dimension == 0) frequency_dimension = rotary_dimension;
     if (query.size() != key.size() || query.empty() || rotary_dimension == 0 ||
-        rotary_dimension > query.size() || rotary_dimension % 2 != 0) {
+        rotary_dimension > query.size() || rotary_dimension % 2 != 0 ||
+        frequency_dimension < rotary_dimension || frequency_dimension % 2 != 0) {
         return shape_error();
     }
     if (!std::isfinite(base) || !std::isfinite(scale) || base <= 0 || scale <= 0 ||
@@ -1755,7 +1841,7 @@ SemanticVectorResult semantic_rope_interleaved(const std::vector<float>& query,
     auto rotate = [&](const std::vector<float>& input, std::vector<float>& output) {
         output = input;
         for (uint32_t pair = 0; pair < rotary_dimension / 2; ++pair) {
-            float exponent = fp32(-2.0f * static_cast<float>(pair) / static_cast<float>(rotary_dimension));
+            float exponent = fp32(-2.0f * static_cast<float>(pair) / static_cast<float>(frequency_dimension));
             float angle = fp_mul(fp_mul(static_cast<float>(position), scale), std::pow(base, exponent));
             float cosine = fp32(std::cos(angle));
             float sine = fp32(std::sin(angle));
@@ -1779,9 +1865,12 @@ SemanticVectorResult semantic_rope_multi_section_half_split(const std::vector<fl
                                                              const std::vector<float>& key,
                                                              const std::array<uint32_t, 4>& positions,
                                                              const std::array<uint32_t, 4>& sections,
-                                                             uint32_t rotary_dimension, float base, float scale) {
+                                                             uint32_t rotary_dimension, float base, float scale,
+                                                             uint32_t frequency_dimension) {
+    if (frequency_dimension == 0) frequency_dimension = rotary_dimension;
     if (query.size() != key.size() || query.empty() || rotary_dimension == 0 ||
-        rotary_dimension > query.size() || rotary_dimension % 2 != 0) {
+        rotary_dimension > query.size() || rotary_dimension % 2 != 0 ||
+        frequency_dimension < rotary_dimension || frequency_dimension % 2 != 0) {
         return shape_error();
     }
     uint64_t total_sections = 0;
@@ -1799,7 +1888,7 @@ SemanticVectorResult semantic_rope_multi_section_half_split(const std::vector<fl
                                 : sector < sections[0] + sections[1] ? 1
                                 : sector < sections[0] + sections[1] + sections[2] ? 2
                                 : 3;
-            const float exponent = fp32(-2.0f * static_cast<float>(pair) / static_cast<float>(rotary_dimension));
+            const float exponent = fp32(-2.0f * static_cast<float>(pair) / static_cast<float>(frequency_dimension));
             const float angle = fp_mul(fp_mul(static_cast<float>(positions[axis]), scale), std::pow(base, exponent));
             const float cosine = fp32(std::cos(angle));
             const float sine = fp32(std::sin(angle));
@@ -1895,7 +1984,7 @@ SemanticVectorResult semantic_depthwise_conv1d_silu_step(const std::vector<float
         }
         sum = fp_add(sum, fp_mul(input[channel], weight[weight_base + kernel - 1]));
         output[channel] = fp_mul(sum, sigmoid(sum));
-        for (uint32_t tap = 0; tap + 1 < kernel; ++tap) {
+        for (uint32_t tap = 0; tap + 2 < kernel; ++tap) {
             history[history_base + tap] = state.history[history_base + tap + 1];
         }
         if (kernel > 1) history[history_base + kernel - 2] = input[channel];
@@ -2032,7 +2121,7 @@ SemanticVectorResult semantic_causal_attention_windowed(const std::vector<float>
     if ((window != AttentionWindowKind::Global && window != AttentionWindowKind::Sliding) ||
         (window == AttentionWindowKind::Global && window_tokens != 0) ||
         (window == AttentionWindowKind::Sliding && window_tokens == 0) ||
-        !std::isfinite(scale) || !finite(query) || !finite(key) || !finite(value) ||
+        !std::isfinite(scale) || scale <= 0.0f || !finite(query) || !finite(key) || !finite(value) ||
         !finite(state.key) || !finite(state.value)) {
         return constraint_error();
     }
@@ -2155,6 +2244,13 @@ SemanticRouterResultOrError semantic_router_top_k(const std::vector<float>& scor
         }
     }
     for (size_t index = 0; index != result.ids.size(); ++index) result.weights[index] = normalized[result.ids[index]];
+    if (payload.selected_weight_normalization ==
+        SelectedWeightNormalization::RenormalizeSelectedProbabilities) {
+        float selected_sum = 0.0f;
+        for (float weight : result.weights) selected_sum = fp_add(selected_sum, weight);
+        if (!std::isfinite(selected_sum) || selected_sum <= 0.0f) return constraint_error();
+        for (float& weight : result.weights) weight = fp32(weight / selected_sum);
+    }
     return result;
 }
 

@@ -1,38 +1,52 @@
 # Benchmarks
 
-A Laplace benchmark records one exact package, device, revision, and command.
-Each result applies to that recorded configuration.
+A Laplace benchmark records one model package, one Mac, one source revision,
+and one command. This keeps speed results reproducible.
 
-## Before the run
+## Record the run
 
-1. Build the recorded revision in Release mode and save `git status --short`.
-2. Record the model path, full SHA-256, file size, package format, and tensor
-   layouts that the plan admitted.
-3. Record the Mac model, unified-memory size, macOS version, power source, and
-   thermal condition when available.
-4. Record the prompt or prompt digest and its token count.
-5. Use fixed sampling. `--greedy --seed 7 --no-spec` is the default comparison
-   command for an admitted package.
+Record these values before execution:
 
-## Command
+1. Git revision and working-tree status.
+2. Model file size, format, and full SHA-256 digest.
+3. Mac model, unified-memory size, and macOS version.
+4. Power source and thermal state when macOS reports them.
+5. Prompt, token count, context limit, and sampling settings.
+
+## Build
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLAPLACE_NATIVE=ON
+cmake --build build
+```
+
+## Run
+
+After the product loader admits a package, use a fixed command:
 
 ```bash
 ./build/laplace /absolute/path/to/model.gguf \
-  -p "fixed prompt" -n 128 --greedy --seed 7 --no-spec \
+  -p "fixed prompt" -n 128 --greedy --seed 7 \
   --max-seq 2048 --bench
 ```
 
-Save standard output and standard error. The CLI prints prefill and decode
-separately and records the Metal command-buffer count for each phase. A report
-must include both phases. Do not combine them into one token-per-second value.
+Run the command at least five times under the same device conditions. Report
+the median and full range.
 
-## Correctness and routing
+## Report
 
-Before publishing a performance result, run an independent token or logits
-comparison for the exact package. Record the reference implementation, error
-bound, token range, and state behavior. A fast result is useful only when the
-token transaction completed with the expected state and route.
+Keep these measurements separate:
 
-Record the package digest, command, report fields, and device state with every
-result. Laplace publishes benchmark figures only with this complete record and
-a repeatable command.
+- model load and session construction
+- prompt prefill
+- raw decode tokens per second
+- Metal command buffers per token
+- GPU time and wall time
+- mapped model bytes and session-owned bytes
+
+Record the output token IDs or a checked logit comparison for the same run.
+Also record the selected plan and any compatibility report.
+
+Requested tensor bytes describe kernel addressing. They are not a hardware
+memory-bandwidth measurement. Report measured bandwidth only when a supported
+hardware counter provides it.

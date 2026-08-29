@@ -340,18 +340,8 @@ bool checked_multiply(uint64_t left, uint64_t right, uint64_t& result) {
 std::optional<std::pair<ArtifactScalarType, uint32_t>>
 artifact_scalar_type(SafeTensorsDtype dtype) {
     switch (dtype) {
-    case SafeTensorsDtype::BOOL: return std::pair{ArtifactScalarType::Bool, 1u};
-    case SafeTensorsDtype::U8: return std::pair{ArtifactScalarType::U8, 1u};
-    case SafeTensorsDtype::I8: return std::pair{ArtifactScalarType::I8, 1u};
-    case SafeTensorsDtype::I16: return std::pair{ArtifactScalarType::I16, 2u};
-    case SafeTensorsDtype::U16: return std::pair{ArtifactScalarType::U16, 2u};
     case SafeTensorsDtype::F16: return std::pair{ArtifactScalarType::F16, 2u};
-    case SafeTensorsDtype::BF16: return std::pair{ArtifactScalarType::BF16, 2u};
-    case SafeTensorsDtype::I32: return std::pair{ArtifactScalarType::I32, 4u};
-    case SafeTensorsDtype::U32: return std::pair{ArtifactScalarType::U32, 4u};
     case SafeTensorsDtype::F32: return std::pair{ArtifactScalarType::F32, 4u};
-    case SafeTensorsDtype::I64: return std::pair{ArtifactScalarType::I64, 8u};
-    case SafeTensorsDtype::U64: return std::pair{ArtifactScalarType::U64, 8u};
     default: return std::nullopt;
     }
 }
@@ -515,25 +505,51 @@ combine_shard_indexes(const std::vector<PackageView>& artifacts,
             ArtifactTensorRecord tensor;
             tensor.id = tensor_id;
             tensor.logical_type = scalar->first;
-            tensor.logical_dimensions = source.shape;
+            // SafeTensors records C row-major dimensions from the outermost
+            // axis to the contiguous innermost axis. Laplace's physical
+            // matrix ABI records the contiguous axis first, as GGUF does.
+            // Normalize the dimensions once at the source boundary. The
+            // physical axis contract describes the normalized strides, so it
+            // is identity after this conversion.
+            tensor.logical_dimensions.assign(source.shape.rbegin(), source.shape.rend());
             tensor.layout.kind = PhysicalLayoutKind::ContiguousRowMajor;
             tensor.layout.version = 1;
             tensor.layout.packing = PackingKind::None;
             tensor.layout.rank = static_cast<uint8_t>(source.shape.size());
+            // MLX SafeTensors uses C row-major source order. The physical
+            // format is explicit; semantic axis meaning is manifest data.
+            tensor.axis.source_rank = static_cast<uint8_t>(source.shape.size());
+            tensor.format.version = 1;
+            tensor.format.encoding = scalar->first == ArtifactScalarType::F16
+                ? ArtifactPhysicalEncoding::F16 : ArtifactPhysicalEncoding::F32;
+            tensor.format.value_type = scalar->first;
+            tensor.format.block_elements = 1;
+            tensor.format.block_bytes = scalar->second;
             uint64_t elements = 1;
-            for (size_t reverse = source.shape.size(); reverse != 0; --reverse) {
-                const size_t axis = reverse - 1;
+            for (size_t axis = 0; axis != tensor.logical_dimensions.size(); ++axis) {
                 tensor.layout.axis_order[axis] = static_cast<uint8_t>(axis);
+                tensor.axis.source_axis_order[axis] = static_cast<uint8_t>(axis);
                 tensor.layout.strides[axis] = elements;
-                if (!checked_multiply(elements, source.shape[axis], elements)) {
+                if (!checked_multiply(elements, tensor.logical_dimensions[axis], elements)) {
                     return mlx_failure(CompatibilityError::IR_SHAPE_MISMATCH,
                                        "MLX SafeTensors row-major stride overflows uint64",
                                        shard.artifact_id());
                 }
             }
+            uint64_t row_stride_bytes = scalar->second;
+            if (!tensor.logical_dimensions.empty() &&
+                !checked_multiply(tensor.logical_dimensions.front(), scalar->second,
+                                  row_stride_bytes)) {
+                return mlx_failure(CompatibilityError::IR_SHAPE_MISMATCH,
+                                   "MLX SafeTensors row stride overflows uint64",
+                                   shard.artifact_id());
+            }
+            tensor.axis.row_stride_bytes = row_stride_bytes;
             tensor.quantization.kind = QuantizationKind::None;
             tensor.quantization.version = 1;
-            tensor.quantization.required_plane_mask = artifact_plane_mask(PlaneKind::Values);
+            // This physical slice has one Values plane and no quantization
+            // auxiliary planes.
+            tensor.quantization.required_plane_mask = 0;
             uint64_t source_offset = 0;
             if (!checked_add(data_base, source.data_offset, source_offset)) {
                 return mlx_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID,
@@ -682,6 +698,111 @@ MlxPhysicalPackageResult load_directory(std::string_view root) {
     return MlxPhysicalPackage(std::get<ArtifactIndex>(std::move(combined)));
 }
 
+MlxProductPhysicalPackageResult load_product_directory(std::string_view root) {
+    const std::string directory(root);
+    const std::string manifest_path = directory + "/laplace.lapman";
+    const std::string token_path = directory + "/laplace.laptok";
+    struct stat manifest_status {};
+    if (lstat(manifest_path.c_str(), &manifest_status) != 0 ||
+        !S_ISREG(manifest_status.st_mode) || manifest_status.st_size <= 0) {
+        return mlx_failure(CompatibilityError::PACKAGE_AUTHORITY_REQUIRED,
+                           "MLX product closure lacks a regular nonempty laplace.lapman",
+                           kMlxProductManifestArtifactId);
+    }
+    struct stat token_status {};
+    if (lstat(token_path.c_str(), &token_status) != 0 ||
+        !S_ISREG(token_status.st_mode) || token_status.st_size <= 0) {
+        return mlx_failure(CompatibilityError::TOKENIZER_RUNTIME_UNSUPPORTED,
+                           "MLX product closure lacks a regular nonempty laplace.laptok",
+                           kMlxProductTokenArtifactId);
+    }
+    auto physical_result = load_directory(root);
+    if (const auto* report = std::get_if<CompatibilityReport>(&physical_result)) return *report;
+    const ArtifactIndex& discovered = std::get<MlxPhysicalPackage>(physical_result).physical_index();
+
+    const auto primary = std::find_if(discovered.artifacts().begin(), discovered.artifacts().end(),
+                                      [](const PackageView& artifact) {
+                                          return artifact.role() == ArtifactRole::Primary;
+                                      });
+    const auto index = std::find_if(discovered.artifacts().begin(), discovered.artifacts().end(),
+                                    [](const PackageView& artifact) {
+                                        return artifact.role() == ArtifactRole::Sidecar;
+                                    });
+    if (primary == discovered.artifacts().end() || index == discovered.artifacts().end()) {
+        return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                           "MLX product closure lacks its declared config and index");
+    }
+
+    std::set<std::string> leaves;
+    CompatibilityReport failure;
+    auto discovered_leaves = safetensors_leaves(directory, failure);
+    if (!discovered_leaves) return failure;
+    leaves = std::move(*discovered_leaves);
+    const std::string config_path = directory + "/config.json";
+    const std::string index_path = directory + "/model.safetensors.index.json";
+
+    std::vector<ArtifactSource> sources;
+    sources.reserve(leaves.size() + 4);
+    sources.push_back({config_path, ArtifactRole::Primary, ArtifactId{0}});
+    sources.push_back({index_path, ArtifactRole::Sidecar, ArtifactId{1}});
+    std::vector<std::string> shard_paths;
+    shard_paths.reserve(leaves.size());
+    uint32_t shard_id = 2;
+    for (const std::string& leaf : leaves) {
+        shard_paths.push_back(directory + "/" + leaf);
+        sources.push_back({shard_paths.back(), ArtifactRole::Shard,
+                           ArtifactId{shard_id++}});
+    }
+    sources.push_back({token_path, ArtifactRole::Shard, kMlxProductTokenArtifactId});
+    sources.push_back({manifest_path, ArtifactRole::Sidecar,
+                       kMlxProductManifestArtifactId});
+    auto closure_result = ArtifactSet::load_graph(sources);
+    if (const auto* report = std::get_if<CompatibilityReport>(&closure_result)) {
+        if (report->artifact_id == kMlxProductManifestArtifactId) {
+            return mlx_failure(CompatibilityError::PACKAGE_AUTHORITY_REQUIRED,
+                               "MLX product closure lacks laplace.lapman",
+                               kMlxProductManifestArtifactId);
+        }
+        if (report->artifact_id == kMlxProductTokenArtifactId) {
+            return mlx_failure(CompatibilityError::TOKENIZER_RUNTIME_UNSUPPORTED,
+                               "MLX product closure lacks laplace.laptok",
+                               kMlxProductTokenArtifactId);
+        }
+        return *report;
+    }
+    ArtifactSet closure = std::get<ArtifactSet>(std::move(closure_result));
+    auto closure_config = closure.view(ArtifactId{0});
+    auto closure_index = closure.view(ArtifactId{1});
+    auto closure_manifest = closure.view(kMlxProductManifestArtifactId);
+    auto closure_token = closure.view(kMlxProductTokenArtifactId);
+    if (const auto* report = std::get_if<CompatibilityReport>(&closure_config)) return *report;
+    if (const auto* report = std::get_if<CompatibilityReport>(&closure_index)) return *report;
+    if (const auto* report = std::get_if<CompatibilityReport>(&closure_manifest)) return *report;
+    if (const auto* report = std::get_if<CompatibilityReport>(&closure_token)) return *report;
+    if (std::get<PackageView>(closure_config).digest() != primary->digest() ||
+        std::get<PackageView>(closure_index).digest() != index->digest()) {
+        return mlx_failure(CompatibilityError::PACKAGE_SOURCE_CHANGED,
+                           "MLX source changed while creating its product closure");
+    }
+
+    ArtifactIndexInput input;
+    input.artifacts.push_back(std::get<PackageView>(closure_config));
+    input.artifacts.push_back(std::get<PackageView>(closure_index));
+    for (uint32_t id = 2; id != shard_id; ++id) {
+        auto shard = closure.view(ArtifactId{id});
+        if (const auto* report = std::get_if<CompatibilityReport>(&shard)) return *report;
+        input.artifacts.push_back(std::get<PackageView>(std::move(shard)));
+    }
+    input.artifacts.push_back(std::get<PackageView>(closure_token));
+    input.tensors.assign(discovered.tensors().begin(), discovered.tensors().end());
+    input.diagnostics.assign(discovered.diagnostics().begin(), discovered.diagnostics().end());
+    auto indexed = ArtifactIndex::build(std::move(input));
+    if (const auto* report = std::get_if<CompatibilityReport>(&indexed)) return *report;
+    return MlxProductPhysicalPackage{
+        std::move(closure), std::get<ArtifactIndex>(std::move(indexed)),
+        std::get<PackageView>(std::move(closure_manifest))};
+}
+
 } // namespace
 
 CompatibilityReport MlxPhysicalPackage::semantic_refusal() const {
@@ -704,6 +825,22 @@ MlxPhysicalPackageResult load_mlx_physical_package(std::string_view path) {
     if (S_ISDIR(status.st_mode)) return load_directory(path);
     return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
                        "MLX package entrypoint is not a regular file or directory");
+}
+
+MlxProductPhysicalPackageResult
+load_mlx_product_physical_package(std::string_view path) {
+    if (path.empty()) {
+        return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                           "MLX product package path is empty");
+    }
+    const std::string native_path(path);
+    struct stat status {};
+    if (lstat(native_path.c_str(), &status) != 0 || !S_ISDIR(status.st_mode) ||
+        S_ISLNK(status.st_mode)) {
+        return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                           "MLX product package must be a direct directory");
+    }
+    return load_product_directory(path);
 }
 
 } // namespace Laplace

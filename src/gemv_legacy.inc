@@ -388,6 +388,39 @@ kernel void gemv_id(
     if (tiisg == 0) y[(uint64_t)slot * (uint)N + j] = acc;
 }
 
+// Test-only gathered down projection and weighted reduction. Each output row
+// walks the selected worklist in order, so reduction order is deterministic.
+// QUANT_TYPE is specialized at pipeline creation for the exact source codec.
+kernel void moe_down_reduce(
+    device const uchar* W [[buffer(0)]],
+    device const float* x [[buffer(1)]],
+    device float* y [[buffer(2)]],
+    constant int& K [[buffer(3)]],
+    constant int& N [[buffer(4)]],
+    constant uint64_t& row_bytes [[buffer(5)]],
+    constant uint64_t& expert_stride [[buffer(6)]],
+    device const uint* ids [[buffer(7)]],
+    device const float* route_weights [[buffer(8)]],
+    device const float* expert_scales [[buffer(9)]],
+    constant int& selected_count [[buffer(10)]],
+    constant bool& has_scales [[buffer(11)]],
+    uint j [[thread_position_in_grid]]) {
+    if (j >= (uint)N) return;
+    float reduced = 0.0f;
+    for (int slot = 0; slot < selected_count; ++slot) {
+        const uint eid = ids[slot];
+        device const uchar* row = W + (uint64_t)eid * expert_stride +
+                                  (uint64_t)j * row_bytes;
+        device const float* xslot = x + (uint64_t)slot * (uint)K;
+        float dot = 0.0f;
+        for (int k = 0; k < K; ++k)
+            dot += xslot[k] * dequant(row, k, QUANT_TYPE);
+        const float expert_scale = has_scales ? expert_scales[eid] : 1.0f;
+        reduced += route_weights[slot] * expert_scale * dot;
+    }
+    y[j] = reduced;
+}
+
 // llama.cpp kernel_mul_mv_q4_K_f32 launch: 2 rows / simdgroup, 2 simdgroups /
 // TG. Threads split K-blocks (ix = tiisg/8) so all 32 lanes work on short K.
 // simd_sum is per row. Do not shuffle across a mixed-row group.
@@ -1016,6 +1049,20 @@ kernel void gemv_q4k_id(
     }
 }
 
+inline float gelu_tanh_exact(float g) {
+    const float c = 0.7978845608028654f;
+    const float c2 = 0.044715f;
+    const float z = c * (g + c2 * g * g * g);
+    // Evaluate tanh(z) through its equivalent signed exponential form. On
+    // Apple GPU math, tanh can return NaN for large finite arguments even
+    // though the GELU-tanh equation is well-defined there. Selecting the
+    // sign before forming the exponential also avoids exp overflow for z<0.
+    const float e = z >= 0.0f ? exp(-2.0f * z) : exp(2.0f * z);
+    const float t = z >= 0.0f ? (1.0f - e) / (1.0f + e)
+                              : (e - 1.0f) / (e + 1.0f);
+    return 0.5f * g * (1.0f + t);
+}
+
 kernel void act_glu(
     device const float* gate [[buffer(0)]],
     device const float* up [[buffer(1)]],
@@ -1029,15 +1076,27 @@ kernel void act_glu(
     if (swiglu) {
         out[i] = (g / (1.0f + exp(-g))) * u;
     } else {
-        // |g|>8 is already in the tanh tail (GELU→g or 0). Skip g^3 so
-        // huge GEMV peaks cannot become Inf and NaN the TensorOps down.
-        if (g > 8.0f) out[i] = g * u;
-        else if (g < -8.0f) out[i] = 0.0f;
-        else {
-            const float c = 0.7978845608028654f, c2 = 0.044715f;
-            float g3 = g * g * g;
-            out[i] = 0.5f * g * (1.0f + tanh(c * (g + c2 * g3))) * u;
-        }
+        out[i] = gelu_tanh_exact(g) * u;
+    }
+}
+
+kernel void act_glu_experts(
+    device const float* gate_up [[buffer(0)]],
+    device float* out [[buffer(1)]],
+    constant int& intermediate [[buffer(2)]],
+    constant int& selected [[buffer(3)]],
+    constant int& swiglu [[buffer(4)]],
+    uint2 position [[thread_position_in_grid]]
+) {
+    if (position.x >= (uint)intermediate || position.y >= (uint)selected) return;
+    const uint64_t gate_base = uint64_t(position.y) * uint64_t(intermediate) * 2u;
+    const uint64_t output_index = uint64_t(position.y) * uint64_t(intermediate) + position.x;
+    const float g = gate_up[gate_base + position.x];
+    const float u = gate_up[gate_base + uint64_t(intermediate) + position.x];
+    if (swiglu) {
+        out[output_index] = (g / (1.0f + exp(-g))) * u;
+    } else {
+        out[output_index] = gelu_tanh_exact(g) * u;
     }
 }
 
@@ -1181,9 +1240,10 @@ kernel void embedding_f16(
     device float* output [[buffer(1)]],
     constant uint& token [[buffer(2)]],
     constant int& width [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
     uint i [[thread_position_in_grid]]
 ) {
-    if (i < (uint)width) output[i] = float(table[(uint64_t)token * (uint)width + i]);
+    if (i < (uint)width) output[i] = float(table[(uint64_t)token * (uint)width + i]) * scale;
 }
 
 // GGML Q6_K is not a generic int6 plane. Each 256-value block has two
@@ -1195,6 +1255,7 @@ kernel void embedding_q6k(
     device float* output [[buffer(1)]],
     constant uint& token [[buffer(2)]],
     constant int& width [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
     uint i [[thread_position_in_grid]]
 ) {
     if (i >= (uint)width) return;
@@ -1212,7 +1273,8 @@ kernel void embedding_q6k(
     const int low_bits = (group < 2) ? int(low & 0x0f) : int(low >> 4);
     const int high_bits = int((high >> (group * 2)) & 3);
     const int scale_index = int(half_index * 8 + (within / 16) + group * 2);
-    output[i] = float(source.d) * float(source.scales[scale_index]) * float((low_bits | (high_bits << 4)) - 32);
+    output[i] = float(source.d) * float(source.scales[scale_index]) *
+                float((low_bits | (high_bits << 4)) - 32) * scale;
 }
 
 // GGML Q4_K uses packed scale/min pairs for four 64-value groups. This is a
@@ -1222,6 +1284,7 @@ kernel void embedding_q4k(
     device float* output [[buffer(1)]],
     constant uint& token [[buffer(2)]],
     constant int& width [[buffer(3)]],
+    constant float& scale [[buffer(4)]],
     uint i [[thread_position_in_grid]]
 ) {
     if (i >= (uint)width) return;
@@ -1233,7 +1296,8 @@ kernel void embedding_q4k(
     const uchar2 scale_min = get_scm(int(group * 2 + (lane >= 32 ? 1 : 0)), source.scales);
     const uchar packed = source.qs[group * 32 + lane % 32];
     const float value = float(lane < 32 ? (packed & 0x0f) : (packed >> 4));
-    output[i] = float(source.d) * float(scale_min.x) * value - float(source.dmin) * float(scale_min.y);
+    output[i] = (float(source.d) * float(scale_min.x) * value -
+                 float(source.dmin) * float(scale_min.y)) * scale;
 }
 
 kernel void rope_f32(
@@ -1245,15 +1309,16 @@ kernel void rope_f32(
     constant int& pos [[buffer(5)]],
     constant int& use_pf [[buffer(6)]],
     device const float* pf [[buffer(7)]],
+    constant int& frequency_dimension [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (rope_pairs < 1) return;
+    if (rope_pairs < 1 || frequency_dimension < rope_pairs * 2) return;
     uint n = (uint)n_heads * (uint)rope_pairs;
     if (gid >= n) return;
     uint h = gid / (uint)rope_pairs;
     uint p = gid % (uint)rope_pairs;
     device float* v = qk + (uint64_t)h * head_dim;
-    float inverse = pow(rope_base, -2.0f * float(p) / float(rope_pairs * 2));
+    float inverse = pow(rope_base, -2.0f * float(p) / float(frequency_dimension));
     if (use_pf) inverse *= pf[p];
     float ang = float(pos) * inverse;
     float c = cos(ang), s = sin(ang);
@@ -1271,15 +1336,16 @@ kernel void rope_interleaved_f32(
     constant int& pos [[buffer(5)]],
     constant int& use_pf [[buffer(6)]],
     device const float* pf [[buffer(7)]],
+    constant int& frequency_dimension [[buffer(8)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (rope_pairs < 1) return;
+    if (rope_pairs < 1 || frequency_dimension < rope_pairs * 2) return;
     uint n = (uint)n_heads * (uint)rope_pairs;
     if (gid >= n) return;
     uint h = gid / (uint)rope_pairs;
     uint p = gid % (uint)rope_pairs;
     device float* v = qk + (uint64_t)h * head_dim;
-    float inverse = pow(rope_base, -2.0f * float(p) / float(rope_pairs * 2));
+    float inverse = pow(rope_base, -2.0f * float(p) / float(frequency_dimension));
     if (use_pf) inverse *= pf[p];
     float ang = float(pos) * inverse;
     float c = cos(ang), s = sin(ang);
@@ -1299,9 +1365,11 @@ kernel void rope_multisection_f32(
     constant uint4& sections [[buffer(6)]],
     constant int& use_pf [[buffer(7)]],
     device const float* pf [[buffer(8)]],
+    constant int& frequency_dimension [[buffer(9)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    if (rope_pairs < 1 || sections.x + sections.y + sections.z + sections.w != (uint)rope_pairs) return;
+    if (rope_pairs < 1 || frequency_dimension < rope_pairs * 2 ||
+        sections.x + sections.y + sections.z + sections.w != (uint)rope_pairs) return;
     uint n = (uint)n_heads * (uint)rope_pairs;
     if (gid >= n) return;
     uint h = gid / (uint)rope_pairs;
@@ -1309,7 +1377,7 @@ kernel void rope_multisection_f32(
     uint section = p < sections.x ? 0 : p < sections.x + sections.y ? 1 :
                    p < sections.x + sections.y + sections.z ? 2 : 3;
     device float* v = qk + (uint64_t)h * head_dim;
-    float inverse = pow(rope_base, -2.0f * float(p) / float(rope_pairs * 2));
+    float inverse = pow(rope_base, -2.0f * float(p) / float(frequency_dimension));
     if (use_pf) inverse *= pf[p];
     float ang = float(positions[section]) * inverse;
     float c = cos(ang), s = sin(ang);
@@ -1355,13 +1423,13 @@ kernel void kv_write(
     device float* cache [[buffer(1)]],
     constant int& pos [[buffer(2)]],
     constant int& max_seq [[buffer(3)]],
-    constant int& row [[buffer(4)]],
+    constant ulong& cache_base [[buffer(4)]],
     constant int& n [[buffer(5)]],
     constant int& stride [[buffer(6)]],
     uint i [[thread_position_in_grid]]
 ) {
     if (i >= (uint)n) return;
-    cache[(uint64_t)row * (uint)max_seq * (uint)stride + (uint64_t)pos * (uint)stride + i] = src[i];
+    cache[cache_base + (uint64_t)pos * (uint)stride + i] = src[i];
 }
 
 kernel void attn_decode(
@@ -1375,7 +1443,7 @@ kernel void attn_decode(
     constant int& pos [[buffer(7)]],
     constant int& window [[buffer(8)]],
     constant int& max_seq [[buffer(9)]],
-    constant int& cache_row [[buffer(10)]],
+    constant ulong& cache_base [[buffer(10)]],
     constant float& scale [[buffer(11)]],
     constant int& kn_stride [[buffer(12)]],
     uint h [[threadgroup_position_in_grid]],
@@ -1391,10 +1459,8 @@ kernel void attn_decode(
     }
     int kvh = (int)((uint)h * (uint)Hk / (uint)Hq);
     device const float* q = Q + (uint64_t)h * Dh;
-    device const float* kbase = Kc + (uint64_t)cache_row * (uint)max_seq * (uint)kn_stride
-                                + (uint64_t)kvh * Dh;
-    device const float* vbase = Vc + (uint64_t)cache_row * (uint)max_seq * (uint)kn_stride
-                                + (uint64_t)kvh * Dh;
+    device const float* kbase = Kc + cache_base + (uint64_t)kvh * Dh;
+    device const float* vbase = Vc + cache_base + (uint64_t)kvh * Dh;
     const int DN = Dh / 32;
     float acc[16];
     for (int j = 0; j < 16; j++) acc[j] = 0;
@@ -1418,6 +1484,68 @@ kernel void attn_decode(
     }
     float inv = (sum > 0.f && isfinite(sum)) ? (1.0f / sum) : 0.f;
     for (int j = 0; j < DN; j++) o[(int)tid + j * 32] = acc[j] * inv;
+}
+
+kernel void apply_down_scale(
+    device int* ids [[buffer(0)]],
+    device float* wt [[buffer(1)]],
+    device const float* scale [[buffer(2)]],
+    constant int& top_k [[buffer(3)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i < (uint)top_k) wt[i] *= scale[ids[i]];
+}
+
+kernel void moe_combine(
+    device const float* src [[buffer(0)]],
+    device float* dst [[buffer(1)]],
+    constant int& H [[buffer(2)]],
+    constant int& n [[buffer(3)]],
+    device const float* wt [[buffer(4)]],
+    uint i [[thread_position_in_grid]]
+) {
+    if (i >= (uint)H) return;
+    float acc = 0;
+    for (int k = 0; k < n; k++) acc += wt[k] * src[(uint64_t)k * (uint)H + i];
+    dst[i] = acc;
+}
+
+kernel void router_topk(
+    device const float* logits [[buffer(0)]],
+    device int* ids [[buffer(1)]],
+    device float* wt [[buffer(2)]],
+    constant int& n_exp [[buffer(3)]],
+    constant int& top_k [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint ntg [[threads_per_threadgroup]]
+) {
+    const int n = min(n_exp, 512);
+    threadgroup float loc[512];
+    for (uint i = tid; i < (uint)n; i += ntg)
+        loc[i] = logits[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid != 0) return;
+    float mx = loc[0];
+    for (int e = 1; e < n; e++) mx = max(mx, loc[e]);
+    float sum = 0;
+    for (int e = 0; e < n; e++) {
+        loc[e] = exp(loc[e] - mx);
+        sum += loc[e];
+    }
+    float inv = 1.0f / sum;
+    for (int e = 0; e < n; e++) loc[e] *= inv;
+    for (int k = 0; k < top_k; k++) {
+        int best = 0;
+        float bv = loc[0];
+        for (int e = 1; e < n; e++) if (loc[e] > bv) { bv = loc[e]; best = e; }
+        ids[k] = best;
+        wt[k] = bv;
+        loc[best] = -1e30f;
+    }
+    float wsum = 0;
+    for (int k = 0; k < top_k; k++) wsum += wt[k];
+    float iw = 1.0f / wsum;
+    for (int k = 0; k < top_k; k++) wt[k] *= iw;
 }
 
 // 4-row Q6_K for the tied LM head. Same launch as gemv_q4k.
@@ -1986,7 +2114,7 @@ kernel void gemv_sparse_columns(
     }
 }
 
-// Qwen3Next's recurrent core keeps both input and output state bindings
+// The recurrent core keeps both input and output state bindings
 // distinct. The first production lowering can therefore abandon a failed
 // command without publishing partially updated state.
 kernel void dnet_conv_silu(
@@ -2096,5 +2224,191 @@ kernel void dnet_update(
         const float z = gate[output_base + column];
         output[output_base + column] = raw[column] * inv * norm_weight[column] * z / (1.0f + exp(-z));
     }
+}
+
+// Output-block-major affine UInt2 GEMV with exact zero-column elision.
+// The selector, partial GEMV, and reduction are encoded in the token's one
+// command buffer. The physical group index is output_block * K + column;
+// this is deliberately distinct from gemv_affine_u2_256's row-major ABI.
+kernel void column_grouped_affine_u2_skip_256_select(
+    device const float* input [[buffer(0)]],
+    device atomic_uint* active_count [[buffer(1)]],
+    device uint* active_columns [[buffer(2)]],
+    device atomic_uint* numerical_error [[buffer(3)]],
+    device ulong* selected_encoded_bytes [[buffer(4)]],
+    constant uint& logical_k [[buffer(5)]],
+    constant uint& output_blocks [[buffer(6)]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    threadgroup uint offsets[256];
+    const uint begin = uint((ulong(logical_k) * ulong(thread_index)) / 256ul);
+    const uint end = uint((ulong(logical_k) * ulong(thread_index + 1u)) / 256ul);
+    uint local_count = 0u;
+    for (uint column = begin; column != end; ++column) {
+        const float value = input[column];
+        if (!isfinite(value))
+            atomic_store_explicit(numerical_error, 1u, memory_order_relaxed);
+        else if (value != 0.0f)
+            ++local_count;
+    }
+    offsets[thread_index] = local_count;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 1u; stride < 256u; stride <<= 1u) {
+        const uint index = (thread_index + 1u) * (stride << 1u) - 1u;
+        if (index < 256u) offsets[index] += offsets[index - stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (thread_index == 0u) offsets[255] = 0u;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride != 0u; stride >>= 1u) {
+        const uint index = (thread_index + 1u) * (stride << 1u) - 1u;
+        if (index < 256u) {
+            const uint left = offsets[index - stride];
+            offsets[index - stride] = offsets[index];
+            offsets[index] += left;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint output_index = offsets[thread_index];
+    for (uint column = begin; column != end; ++column) {
+        const float value = input[column];
+        if (isfinite(value) && value != 0.0f) active_columns[output_index++] = column;
+    }
+    if (thread_index == 255u) {
+        const uint count = offsets[255] + local_count;
+        atomic_store_explicit(active_count, count, memory_order_relaxed);
+        *selected_encoded_bytes += ulong(count) * ulong(output_blocks) * 68ul;
+    }
+}
+
+inline void column_grouped_affine_u2_skip_256_accumulate(
+    device const uchar* values, device const uint* metadata,
+    device const float* input, device const uint* active_columns,
+    uint index, uint logical_k, uint group_base, uint simd_lane,
+    thread float* sums0, thread float* sums1, thread float* bias_sum) {
+    const uint column = active_columns[index];
+    if (column >= logical_k) return;
+    const uint group = group_base + column;
+    const uint packed = uint(reinterpret_cast<device const ushort*>(
+        values + ulong(group) * 64ul)[simd_lane]);
+    const uint packed0 = packed & 255u;
+    const uint packed1 = packed >> 8u;
+    const float input_value = input[column];
+    const half2 scale_bias = as_type<half2>(metadata[group]);
+    const float scaled_input = input_value * float(scale_bias.x);
+    *bias_sum += input_value * float(scale_bias.y);
+    sums0[0] = fma(scaled_input, float(packed0 & 3u), sums0[0]);
+    sums0[1] = fma(scaled_input, float((packed0 >> 2u) & 3u), sums0[1]);
+    sums0[2] = fma(scaled_input, float((packed0 >> 4u) & 3u), sums0[2]);
+    sums0[3] = fma(scaled_input, float(packed0 >> 6u), sums0[3]);
+    sums1[0] = fma(scaled_input, float(packed1 & 3u), sums1[0]);
+    sums1[1] = fma(scaled_input, float((packed1 >> 2u) & 3u), sums1[1]);
+    sums1[2] = fma(scaled_input, float((packed1 >> 4u) & 3u), sums1[2]);
+    sums1[3] = fma(scaled_input, float(packed1 >> 6u), sums1[3]);
+}
+
+kernel void column_grouped_affine_u2_skip_256_partial(
+    device const uchar* values [[buffer(0)]],
+    device const uint* metadata [[buffer(1)]],
+    device const float* input [[buffer(2)]],
+    device float* partial_output [[buffer(3)]],
+    device const atomic_uint* active_count [[buffer(4)]],
+    device const uint* active_columns [[buffer(5)]],
+    constant uint& logical_k [[buffer(6)]],
+    constant uint& logical_n [[buffer(7)]],
+    constant uint& split_count [[buffer(8)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint threadgroup_index [[threadgroup_position_in_grid]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]]) {
+    threadgroup float partials[512];
+    const uint output_block = threadgroup_index / split_count;
+    const uint split = threadgroup_index - output_block * split_count;
+    if (thread_index >= 64u || output_block >= (logical_n >> 8u)) return;
+    uint count = 0u;
+    if (simd_lane == 0u)
+        count = min(atomic_load_explicit(active_count, memory_order_relaxed), logical_k);
+    count = simd_broadcast_first(count);
+    const uint simd_count = split_count * 2u;
+    const uint simd_global = split * 2u + simd_index;
+    const uint begin = (count * simd_global) / simd_count;
+    const uint end = (count * (simd_global + 1u)) / simd_count;
+    const uint group_base = output_block * logical_k;
+    float sums0[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float sums1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float bias_sum = 0.0f;
+    uint index = begin;
+    for (; index + 3u < end; index += 4u) {
+        const uint4 columns = uint4(active_columns[index], active_columns[index + 1u],
+                                    active_columns[index + 2u], active_columns[index + 3u]);
+        if (any(columns >= uint4(logical_k))) {
+            for (uint tail = 0u; tail != 4u; ++tail)
+                column_grouped_affine_u2_skip_256_accumulate(
+                    values, metadata, input, active_columns, index + tail, logical_k,
+                    group_base, simd_lane, sums0, sums1, &bias_sum);
+            continue;
+        }
+        const uint4 groups = uint4(group_base) + columns;
+        const float4 input_values = float4(input[columns.x], input[columns.y],
+                                           input[columns.z], input[columns.w]);
+        const half2 sb0 = as_type<half2>(metadata[groups.x]);
+        const half2 sb1 = as_type<half2>(metadata[groups.y]);
+        const half2 sb2 = as_type<half2>(metadata[groups.z]);
+        const half2 sb3 = as_type<half2>(metadata[groups.w]);
+        const float4 scaled_inputs = input_values *
+            float4(float(sb0.x), float(sb1.x), float(sb2.x), float(sb3.x));
+        const float4 biased_inputs = input_values *
+            float4(float(sb0.y), float(sb1.y), float(sb2.y), float(sb3.y));
+        bias_sum += biased_inputs.x + biased_inputs.y + biased_inputs.z + biased_inputs.w;
+        const uint4 packed = uint4(
+            uint(reinterpret_cast<device const ushort*>(
+                values + ulong(groups.x) * 64ul)[simd_lane]),
+            uint(reinterpret_cast<device const ushort*>(
+                values + ulong(groups.y) * 64ul)[simd_lane]),
+            uint(reinterpret_cast<device const ushort*>(
+                values + ulong(groups.z) * 64ul)[simd_lane]),
+            uint(reinterpret_cast<device const ushort*>(
+                values + ulong(groups.w) * 64ul)[simd_lane]));
+        uint4 codes = packed;
+        for (uint part = 0u; part != 4u; ++part) {
+            sums0[part] += dot(scaled_inputs, float4(codes & uint4(3u)));
+            codes >>= uint4(2u);
+        }
+        for (uint part = 0u; part != 4u; ++part) {
+            sums1[part] += dot(scaled_inputs, float4(codes & uint4(3u)));
+            codes >>= uint4(2u);
+        }
+    }
+    for (; index < end; ++index)
+        column_grouped_affine_u2_skip_256_accumulate(
+            values, metadata, input, active_columns, index, logical_k,
+            group_base, simd_lane, sums0, sums1, &bias_sum);
+    const uint local_base = simd_index * 256u + simd_lane * 8u;
+    for (uint part = 0u; part != 4u; ++part) {
+        partials[local_base + part] = sums0[part] + bias_sum;
+        partials[local_base + 4u + part] = sums1[part] + bias_sum;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint row_in_block = thread_index * 4u;
+    const ulong output_base =
+        (ulong(output_block) * ulong(split_count) + ulong(split)) * 256ul;
+    for (uint part = 0u; part != 4u; ++part)
+        partial_output[output_base + ulong(row_in_block + part)] =
+            partials[row_in_block + part] + partials[256u + row_in_block + part];
+}
+
+kernel void column_grouped_affine_u2_skip_256_reduce(
+    device const float* partial_output [[buffer(0)]],
+    device float* output [[buffer(1)]],
+    constant uint& logical_n [[buffer(2)]],
+    constant uint& split_count [[buffer(3)]],
+    uint row_in_block [[thread_index_in_threadgroup]],
+    uint output_block [[threadgroup_position_in_grid]]) {
+    if (row_in_block >= 256u || output_block >= (logical_n >> 8u)) return;
+    float sum = 0.0f;
+    const ulong base = ulong(output_block) * ulong(split_count) * 256ul +
+                       ulong(row_in_block);
+    for (uint split = 0u; split != split_count; ++split)
+        sum += partial_output[base + ulong(split) * 256ul];
+    output[(output_block << 8u) + row_in_block] = sum;
 }
 )METAL";

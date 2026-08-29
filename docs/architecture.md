@@ -1,60 +1,66 @@
 # Architecture
 
-The current alpha compiles compatible GGUF packages into a capability-checked
-semantic program for Apple Silicon. The runtime keeps package facts, graph
-meaning, physical tensor contracts, device capabilities, and mutable session
-state as separate pieces of one route. The V1 design applies this architecture
-to GGUF and MLX package contracts.
+Laplace converts a model package into a complete Metal execution plan. The
+same pipeline handles compatible dense, recurrent, and mixture-of-experts
+(MoE) graphs.
 
-## Package to transaction
+## 1. Package index
 
-```text
-compatible GGUF package
-  -> physical artifact index
-  -> versioned semantic graph and state contracts
-  -> capability-aware execution plan
-  -> session-owned Metal resources
-  -> transactional prefill or decode
-```
+The loader opens each package file once. It records file identity, size, and
+digest. It also checks every tensor span, plane, layout, alias, and physical
+weight format.
 
-`ArtifactSet` retains checked regular files and their digests. `ArtifactIndex`
-records tensor planes, aliases, layouts, and other physical facts. The
-semantic model then carries tensors, values, operators, layers, state,
-constraints, capability requirements, and tokenizer/template digests in a
-versioned form.
+GGUF, MLX, and SafeTensors packages use this physical validation layer.
 
-The planner binds each planned operator to a kernel descriptor, tensor spans,
-state bindings, and a phase. Runtime selection uses semantic graph facts,
-physical format, execution phase, queried Apple capabilities, session
-resources, and planner cost entries. Model names, paths, and hashes stay
-outside kernel selection.
+## 2. Model graph
 
-## Metal session
+The compiler converts package facts into a typed graph. The graph records:
 
-The canonical Metal program owns mapped weight registration, Metal resources,
-command submission, and token position. Dense token execution covers
-embedding, attention, feed-forward layers, normalization, and output
-projection. Dense prefill and decode share the same session-owned state and
-transaction boundary.
+- operators and their input and output edges
+- tensor roles, shapes, layouts, planes, and weight formats
+- layer boundaries and execution order
+- persistent attention, recurrent, routing, and sampler state
+- tokenizer and prompt contracts
 
-The session publishes a new position only after its command transaction
-completes. Checkpoint, commit, and rollback are part of the runtime surface,
-so mutable token effects have one explicit ownership model.
+Runtime kernel selection uses these typed facts. Model names, file paths, and
+artifact hashes stay outside the execution policy.
 
-## Dense, MoE, and recurrent primitives
+## 3. Metal plan
 
-The semantic graph includes routed operators, expert axes, top-k selection,
-routed linear work, activation, and weighted expert reduction. Expert-bank
-physical contracts use the same typed graph and tensor contract system as
-dense layers.
+The planner compares the full graph with the active device. Each plan entry
+binds one graph operation to:
 
-Recurrent convolution, delta-matrix, gated-attention, and state-update
-operators are represented in the semantic model and planner.
+- a Metal kernel and execution phase
+- exact tensor spans and physical formats
+- state inputs and outputs
+- device capabilities and resource limits
 
-## Resource model
+The planner accepts a package when every required operation has a compatible
+entry.
 
-Laplace uses Apple unified memory for host-visible mapped artifacts and
-session-owned Metal resources. Exact retained tensor ranges, layouts, planes,
-and state bindings are checked before execution. Capability queries drive the
-plan, allowing the same semantic machinery to adapt across compatible Apple
-Silicon devices.
+## 4. Metal session
+
+Each model run owns its Metal command queue, weight registrations, temporary
+buffers, logits, and persistent state. The session uses Apple unified memory
+for mapped model data and shared resources.
+
+The runtime registers the exact source ranges required by the plan. Derived
+weights use session-owned storage with explicit source and replacement ranges.
+
+## 5. Token transaction
+
+A token step starts from the last committed state. Laplace encodes the full
+Metal command, submits it, and waits for completion. For an admitted state
+contract, the session then publishes the new token position and state.
+
+This boundary covers key-value state, recurrent matrices, router worklists,
+sampler state, and token history.
+
+## Execution graphs
+
+Dense graphs contain attention and feed-forward operations. Recurrent graphs
+add convolution and state-update operations. MoE graphs add router selection,
+expert work, activation, and weighted reduction.
+
+All three graph classes use the same package index, model graph, planner,
+resource ownership, and token transaction.

@@ -1,5 +1,8 @@
+#include <CommonCrypto/CommonDigest.h>
+
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <vector>
 
 #include "semantic_model.h"
@@ -23,6 +26,231 @@ const std::vector<float>& values(const SemanticVectorResult& result) {
     return std::get<std::vector<float>>(result);
 }
 
+SemanticModel operator_arity_model(uint16_t schema) {
+    SemanticModel model;
+    model.schema_major = schema;
+    model.opset_major = schema;
+    model.maximum_context = schema == 1 ? 32768 : 1;
+    model.vocabulary_size = 1;
+    model.values = {
+        {0, ScalarType::F32, {{DimensionKind::Constant, 1}}, 0},
+        {1, ScalarType::F32, {{DimensionKind::Constant, 1}}, 0},
+        {2, ScalarType::F32, {{DimensionKind::Constant, 1}}, 0},
+    };
+    SemanticTensor tensor;
+    tensor.id = 0;
+    tensor.role = TensorRole::TokenEmbedding;
+    tensor.logical_type = ScalarType::F32;
+    tensor.dimensions = {{DimensionKind::Constant, 1}};
+    tensor.layout.rank = 1;
+    tensor.layout.axis_order[0] = 0;
+    tensor.layout.strides[0] = 1;
+    tensor.planes = {{PlaneKind::Values, ScalarType::F32, ArtifactId{0}, 0, 4, 4, 0}};
+    model.tensors.push_back(tensor);
+    model.operators = {
+        {0, OperatorKind::EmbeddingLookup, schema, {0}, {1}, {0}, {},
+         EmbeddingLookupPayload{0x3f800000u, 1, 1, 0}},
+        {1, OperatorKind::Linear, schema, {1}, {2}, {0}, {}, LinearPayload{}},
+    };
+    return model;
+}
+
+SemanticModel layer_table_model(uint16_t schema) {
+    SemanticModel model;
+    model.schema_major = schema;
+    model.opset_major = schema;
+    model.maximum_context = schema == 1 ? 32768 : 1;
+    model.vocabulary_size = 1;
+    model.values = {
+        {0, ScalarType::F32, {{DimensionKind::Constant, 1}}, 0},
+        {1, ScalarType::F32, {{DimensionKind::Constant, 1}}, 0},
+    };
+    model.operators = {{0, OperatorKind::Add, schema, {0, 0}, {1}, {}, {}, AddPayload{}}};
+    model.layers = {{0, 0, 1, schema >= 6 ? kSemanticLayerFlagSpeculative : 0}};
+    return model;
+}
+
+void refresh_wire_digest(std::vector<uint8_t>& bytes) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH] = {};
+    CC_SHA256(bytes.data() + 64, static_cast<CC_LONG>(bytes.size() - 64), digest);
+    std::memcpy(bytes.data() + 32, digest, sizeof(digest));
+}
+
+void test_semantic_operator_arity() {
+    for (uint16_t schema = 1; schema <= 7; ++schema) {
+        const SemanticModel model = operator_arity_model(schema);
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(encode_semantic_model(model)));
+
+        for (size_t operator_index = 0; operator_index != model.operators.size(); ++operator_index) {
+            auto missing_input = model;
+            missing_input.operators[operator_index].inputs.clear();
+            CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(missing_input)));
+
+            auto extra_input = model;
+            extra_input.operators[operator_index].inputs.push_back(0);
+            CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(extra_input)));
+
+            auto missing_output = model;
+            missing_output.operators[operator_index].outputs.clear();
+            CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(missing_output)));
+
+            auto extra_output = model;
+            extra_output.operators[operator_index].outputs.push_back(0);
+            CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(extra_output)));
+        }
+    }
+}
+
+void test_operator_signature_contract() {
+    const auto make = [](OperatorKind kind) {
+        SemanticOperator op;
+        op.kind = kind;
+        op.semantic_version = 7;
+        switch (kind) {
+        case OperatorKind::EmbeddingLookup:
+            op.inputs = {0}; op.outputs = {1}; op.tensors = {0}; op.payload = EmbeddingLookupPayload{}; break;
+        case OperatorKind::RmsNorm:
+            op.inputs = {0}; op.outputs = {1}; op.tensors = {0}; op.payload = RmsNormPayload{}; break;
+        case OperatorKind::Linear:
+            op.inputs = {0}; op.outputs = {1}; op.tensors = {0}; op.payload = LinearPayload{}; break;
+        case OperatorKind::Rope:
+            op.inputs = {0, 1}; op.outputs = {2, 3}; op.payload = RopePayload{}; break;
+        case OperatorKind::CausalAttention:
+            op.inputs = {0, 1, 2}; op.outputs = {3}; op.states = {0, 1};
+            op.payload = CausalAttentionPayload{}; break;
+        case OperatorKind::SwiGlu:
+            op.inputs = {0, 1}; op.outputs = {2}; op.payload = SwiGluPayload{}; break;
+        case OperatorKind::Add:
+            op.inputs = {0, 1}; op.outputs = {2}; op.payload = AddPayload{}; break;
+        case OperatorKind::DepthwiseConvSilu:
+            op.inputs = {0}; op.outputs = {1, 2, 3}; op.tensors = {0}; op.states = {0};
+            op.payload = DepthwiseConvSiluPayload{}; break;
+        case OperatorKind::GatedDeltaNet:
+            op.inputs = {0, 1, 2, 3, 4}; op.outputs = {5}; op.tensors = {0, 1}; op.states = {0};
+            op.payload = GatedDeltaNetPayload{}; break;
+        case OperatorKind::GatedAttention:
+            op.inputs = {0, 1}; op.outputs = {2}; op.payload = GatedAttentionPayload{}; break;
+        case OperatorKind::GatedRmsNorm:
+            op.inputs = {0, 1}; op.outputs = {2}; op.tensors = {0}; op.payload = GatedRmsNormPayload{}; break;
+        case OperatorKind::L2Normalize:
+            op.inputs = {0}; op.outputs = {1}; op.payload = L2NormalizePayload{}; break;
+        case OperatorKind::AxisSplit:
+            op.inputs = {0}; op.outputs = {1, 2}; op.payload = AxisSplitPayload{1, 1}; break;
+        case OperatorKind::Concat:
+            op.inputs = {0, 1}; op.outputs = {2}; op.payload = ConcatPayload{}; break;
+        case OperatorKind::RouterTopK:
+            op.inputs = {0}; op.outputs = {1, 2}; op.payload = RouterTopKPayload{}; break;
+        case OperatorKind::RoutedLinear:
+            op.inputs = {0, 1, 2}; op.outputs = {3}; op.tensors = {0}; op.payload = RoutedLinearPayload{}; break;
+        case OperatorKind::GatedActivation:
+            op.inputs = {0, 1}; op.outputs = {2}; op.payload = GatedActivationPayload{}; break;
+        case OperatorKind::WeightedExpertReduce:
+            op.inputs = {0, 1, 2}; op.outputs = {3}; op.payload = WeightedExpertReducePayload{}; break;
+        case OperatorKind::Scale:
+            op.inputs = {0}; op.outputs = {1}; op.payload = ScalePayload{}; break;
+        case OperatorKind::TanhSoftcap:
+            op.inputs = {0}; op.outputs = {1}; op.payload = TanhSoftcapPayload{}; break;
+        }
+        return op;
+    };
+
+    for (uint16_t raw = static_cast<uint16_t>(OperatorKind::EmbeddingLookup);
+         raw <= static_cast<uint16_t>(OperatorKind::TanhSoftcap); ++raw) {
+        CHECK(semantic_operator_signature_valid(make(static_cast<OperatorKind>(raw))));
+    }
+
+    auto bad_embedding = make(OperatorKind::EmbeddingLookup);
+    bad_embedding.tensors.clear();
+    CHECK(!semantic_operator_signature_valid(bad_embedding));
+    auto bad_linear = make(OperatorKind::Linear);
+    bad_linear.tensors.push_back(1);
+    CHECK(!semantic_operator_signature_valid(bad_linear));
+    auto biased_linear = make(OperatorKind::Linear);
+    std::get<LinearPayload>(biased_linear.payload).has_bias = true;
+    biased_linear.tensors.push_back(1);
+    CHECK(semantic_operator_signature_valid(biased_linear));
+    auto bad_rope = make(OperatorKind::Rope);
+    bad_rope.outputs.pop_back();
+    CHECK(!semantic_operator_signature_valid(bad_rope));
+    auto alias = make(OperatorKind::CausalAttention);
+    std::get<CausalAttentionPayload>(alias.payload).value_source = ValueSource::KeyStateAlias;
+    alias.inputs.pop_back();
+    alias.states.pop_back();
+    CHECK(semantic_operator_signature_valid(alias));
+    auto bad_l2 = make(OperatorKind::L2Normalize);
+    bad_l2.states.push_back(0);
+    CHECK(!semantic_operator_signature_valid(bad_l2));
+
+    auto v1 = make(OperatorKind::EmbeddingLookup);
+    v1.semantic_version = 1;
+    CHECK(semantic_operator_signature_valid(v1));
+    auto v1_l2 = make(OperatorKind::L2Normalize);
+    v1_l2.semantic_version = 1;
+    CHECK(!semantic_operator_signature_valid(v1_l2));
+}
+
+void test_semantic_layer_table_decode_validation() {
+    for (uint16_t schema = 1; schema <= 7; ++schema) {
+        const SemanticModel model = layer_table_model(schema);
+        auto encoded = encode_semantic_model(model);
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(encoded));
+        if (!std::holds_alternative<std::vector<uint8_t>>(encoded)) continue;
+
+        const auto& valid_bytes = std::get<std::vector<uint8_t>>(encoded);
+        CHECK(std::holds_alternative<SemanticModel>(decode_semantic_model(valid_bytes)));
+
+        auto bad_index = valid_bytes;
+        const size_t layer_offset = bad_index.size() - 16;
+        bad_index[layer_offset] = 1;
+        bad_index[layer_offset + 1] = 0;
+        bad_index[layer_offset + 2] = 0;
+        bad_index[layer_offset + 3] = 0;
+        refresh_wire_digest(bad_index);
+        CHECK(std::holds_alternative<CompatibilityReport>(decode_semantic_model(bad_index)));
+
+        auto bad_flags = valid_bytes;
+        bad_flags[layer_offset + 12] = 2;
+        bad_flags[layer_offset + 13] = 0;
+        bad_flags[layer_offset + 14] = 0;
+        bad_flags[layer_offset + 15] = 0;
+        refresh_wire_digest(bad_flags);
+        CHECK(std::holds_alternative<CompatibilityReport>(decode_semantic_model(bad_flags)));
+    }
+}
+
+void test_inactive_program_tensor_flag_is_schema_bounded() {
+    const auto model_with_flag = [](uint16_t schema) {
+        SemanticModel model = operator_arity_model(schema);
+        SemanticTensor tensor;
+        tensor.id = 0;
+        tensor.role = TensorRole::TokenEmbedding;
+        tensor.logical_type = ScalarType::F32;
+        tensor.dimensions = {{DimensionKind::Constant, 1}};
+        tensor.layout.rank = 1;
+        tensor.layout.axis_order[0] = 0;
+        tensor.layout.strides[0] = 1;
+        tensor.planes = {{PlaneKind::Values, ScalarType::F32, ArtifactId{0},
+                          0, 4, 4, 0}};
+        tensor.flags = kSemanticTensorFlagInactiveProgram;
+        model.tensors = {tensor};
+        return model;
+    };
+
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_semantic_model(model_with_flag(5))));
+    auto encoded = encode_semantic_model(model_with_flag(6));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(encoded));
+    if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&encoded)) {
+        auto decoded = decode_semantic_model(*bytes);
+        CHECK(std::holds_alternative<SemanticModel>(decoded));
+        if (const auto* model = std::get_if<SemanticModel>(&decoded)) {
+            CHECK(model->tensors.size() == 1);
+            if (model->tensors.size() == 1)
+                CHECK(model->tensors[0].flags == kSemanticTensorFlagInactiveProgram);
+        }
+    }
+}
+
 void test_operator_vectors() {
     auto embedding = semantic_embedding_lookup({1, 2, 3, 4, 5, 6}, 3, 2, {2, 0}, 0.5f);
     CHECK(is_ok(embedding));
@@ -38,6 +266,13 @@ void test_operator_vectors() {
     if (is_ok(rms)) {
         CHECK(almost_equal(values(rms)[0], 1.5f));
         CHECK(almost_equal(values(rms)[1], 0.5f));
+    }
+
+    auto no_scale_rms = semantic_rms_norm({3, 4}, {}, 0.0f);
+    CHECK(is_ok(no_scale_rms));
+    if (is_ok(no_scale_rms)) {
+        CHECK(almost_equal(values(no_scale_rms)[0], 0.84852814f));
+        CHECK(almost_equal(values(no_scale_rms)[1], 1.13137085f));
     }
 
     std::vector<float> reduced_rms_input(32, 0.0f);
@@ -85,7 +320,7 @@ void test_operator_vectors() {
     }
 
     auto interleaved_rope = semantic_rope_interleaved({1, 2, 3, 4}, {-1, 1, 2, -2},
-                                                      1, 4, 1.0f, 1.5707963267948966f);
+                                                       1, 4, 1.0f, 1.5707963267948966f);
     CHECK(is_ok(interleaved_rope));
     if (is_ok(interleaved_rope)) {
         const auto& rotated = values(interleaved_rope);
@@ -97,6 +332,15 @@ void test_operator_vectors() {
         CHECK(almost_equal(rotated[5], -1.0f, 1e-5f, 1e-5f));
         CHECK(almost_equal(rotated[6], 2.0f, 1e-5f, 1e-5f));
         CHECK(almost_equal(rotated[7], 2.0f, 1e-5f, 1e-5f));
+    }
+
+    auto partial_frequency_rope = semantic_rope_half_split(
+        {1, 2, 3, 4}, {-1, 1, 2, -2}, 1, 4, 16.0f, 1.0f, 8);
+    CHECK(is_ok(partial_frequency_rope));
+    if (is_ok(partial_frequency_rope)) {
+        const auto& rotated = values(partial_frequency_rope);
+        CHECK(almost_equal(rotated[1], -0.1625370f, 1e-5f, 1e-5f));
+        CHECK(almost_equal(rotated[3], 4.4691813f, 1e-5f, 1e-5f));
     }
 
     auto multi_section_rope = semantic_rope_multi_section_half_split(
@@ -135,6 +379,26 @@ void test_operator_vectors() {
         CHECK(almost_equal(values(conv)[0], 1.7615942f, 1e-5f, 1e-5f));
         CHECK(almost_equal(values(conv)[1], 2.3103545f, 1e-5f, 1e-5f));
         CHECK(conv_state.history == std::vector<float>({2, 5, 4, 6}));
+    }
+
+    SemanticConvState pointwise_state;
+    const auto pointwise_history = pointwise_state.history;
+    auto unsupported_pointwise = semantic_depthwise_conv1d_silu_step(
+        {2, -1}, {0.5f, 2.0f}, 2, 1, pointwise_state);
+    CHECK(std::holds_alternative<CompatibilityReport>(unsupported_pointwise));
+    if (auto* report = std::get_if<CompatibilityReport>(&unsupported_pointwise)) {
+        CHECK(report->code == CompatibilityError::IR_SHAPE_MISMATCH);
+    }
+    CHECK(pointwise_state.history == pointwise_history);
+
+    SemanticConvState one_history_state;
+    one_history_state.history = {3};
+    auto one_history = semantic_depthwise_conv1d_silu_step(
+        {5}, {0.25f, 0.5f}, 1, 2, one_history_state);
+    CHECK(is_ok(one_history));
+    if (is_ok(one_history)) {
+        CHECK(almost_equal(values(one_history)[0], 3.1286869f, 1e-5f, 1e-5f));
+        CHECK(one_history_state.history == std::vector<float>({5}));
     }
 
     SemanticGatedDeltaState delta_state;
@@ -324,6 +588,16 @@ void test_operator_errors() {
     CHECK(std::holds_alternative<CompatibilityReport>(bad_attention));
     if (auto* report = std::get_if<CompatibilityReport>(&bad_attention)) {
         CHECK(report->code == CompatibilityError::IR_CONSTRAINT_FAILED);
+    }
+    for (float scale : {0.0f, -1.0f, std::numeric_limits<float>::infinity(),
+                        std::numeric_limits<float>::quiet_NaN()}) {
+        SemanticKvState invalid_scale_state;
+        auto invalid_scale = semantic_causal_attention({0}, {0}, {1}, 1, 1, 1, 1,
+                                                        scale, invalid_scale_state);
+        CHECK(std::holds_alternative<CompatibilityReport>(invalid_scale));
+        CHECK(invalid_scale_state.tokens == 0);
+        CHECK(invalid_scale_state.key.empty());
+        CHECK(invalid_scale_state.value.empty());
     }
 
     auto bad_swiglu = semantic_swiglu({1}, {1, 2});
@@ -542,6 +816,19 @@ void test_semantic_wire_v2_recurrent() {
     auto bad_mapping = model;
     std::get<GatedDeltaNetPayload>(bad_mapping.operators[3].payload).qk_mapping = static_cast<QkHeadMapping>(2);
     CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(bad_mapping)));
+    auto bad_state_version = model;
+    bad_state_version.states[0].semantic_version = 3;
+    CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(bad_state_version)));
+    for (uint32_t bits : {float_bits(-1.0f),
+                          float_bits(std::numeric_limits<float>::infinity()),
+                          float_bits(std::numeric_limits<float>::quiet_NaN())}) {
+        auto bad_l2 = model;
+        std::get<L2NormalizePayload>(bad_l2.operators[1].payload).epsilon_f32_bits = bits;
+        CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(bad_l2)));
+        auto bad_gated_rms = model;
+        std::get<GatedRmsNormPayload>(bad_gated_rms.operators[5].payload).epsilon_f32_bits = bits;
+        CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(bad_gated_rms)));
+    }
 
     auto v3 = model;
     v3.schema_major = 3;
@@ -821,6 +1108,7 @@ void test_semantic_wire_v7_generic_moe() {
          RopePayload{RopePairing::HalfSplit, true, 4, float_bits(10000.0f), float_bits(1.0f)}},
         {9, OperatorKind::CausalAttention, 7, {13, 14}, {15}, {}, {0, 1}, attention},
     };
+    std::get<RopePayload>(model.operators[8].payload).frequency_dimension = 8;
 
     StateFormat key_format;
     key_format.encoded_domain = TransformDomain::RopeApplied;
@@ -848,10 +1136,39 @@ void test_semantic_wire_v7_generic_moe() {
         CHECK(std::get<GatedActivationPayload>(roundtrip->operators[3].payload).activation == ActivationKind::GeluTanh);
         CHECK(std::get<WeightedExpertReducePayload>(roundtrip->operators[5].payload).association ==
               ExpertReduceAssociation::SelectedOrderLeftToRight);
+        CHECK(std::get<RopePayload>(roundtrip->operators[8].payload).frequency_dimension == 8);
         const auto& decoded_attention = std::get<CausalAttentionPayload>(roundtrip->operators[9].payload);
         CHECK(decoded_attention.window == AttentionWindowKind::Sliding);
         CHECK(decoded_attention.value_source == ValueSource::KeyPreRope);
     }
+
+    auto no_scale_rms = model;
+    no_scale_rms.values.push_back(
+        {16, ScalarType::F32,
+         dimensions({{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 4}}), 0});
+    no_scale_rms.operators.push_back(
+        {10, OperatorKind::RmsNorm, 7, {0}, {16}, {}, {},
+         RmsNormPayload{float_bits(1.0e-6f), -1, 0}});
+    auto no_scale_encoded = encode_semantic_model(no_scale_rms);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(no_scale_encoded));
+    if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&no_scale_encoded)) {
+        auto no_scale_decoded = decode_semantic_model(*bytes);
+        CHECK(std::holds_alternative<SemanticModel>(no_scale_decoded));
+        if (const auto* roundtrip = std::get_if<SemanticModel>(&no_scale_decoded)) {
+            const auto* rms = std::get_if<RmsNormPayload>(&roundtrip->operators.back().payload);
+            CHECK(rms != nullptr);
+            if (rms) CHECK(rms->weight_mode == 0);
+            CHECK(roundtrip->operators.back().tensors.empty());
+        }
+    }
+    auto no_scale_with_weight = no_scale_rms;
+    no_scale_with_weight.operators.back().tensors = {3};
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_semantic_model(no_scale_with_weight)));
+    auto invalid_weight_mode = no_scale_rms;
+    std::get<RmsNormPayload>(invalid_weight_mode.operators.back().payload).weight_mode = 2;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_semantic_model(invalid_weight_mode)));
 
     auto bad_top_k = model;
     std::get<RouterTopKPayload>(bad_top_k.operators[0].payload).selected_count = 5;
@@ -869,6 +1186,12 @@ void test_semantic_wire_v7_generic_moe() {
     std::get<WeightedExpertReducePayload>(bad_reduce.operators[5].payload).association =
         static_cast<ExpertReduceAssociation>(2);
     CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(bad_reduce)));
+    auto zero_attention_scale = model;
+    std::get<CausalAttentionPayload>(zero_attention_scale.operators[9].payload).scale_f32_bits = 0;
+    CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(zero_attention_scale)));
+    auto nan_attention_scale = model;
+    std::get<CausalAttentionPayload>(nan_attention_scale.operators[9].payload).scale_f32_bits = 0x7fc00000u;
+    CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(nan_attention_scale)));
     auto ambiguous_value_source = model;
     SemanticOperator duplicate_rope = ambiguous_value_source.operators[8];
     duplicate_rope.id = static_cast<uint32_t>(ambiguous_value_source.operators.size());
@@ -882,6 +1205,20 @@ void test_semantic_wire_v7_generic_moe() {
         CHECK(almost_equal(selected->weights[0], 0.5f));
         CHECK(almost_equal(selected->weights[1], 0.5f));
     }
+    RouterTopKPayload full_softmax_router = router;
+    full_softmax_router.normalization_order = RouterNormalizationOrder::NormalizeThenSelect;
+    full_softmax_router.selected_weight_normalization =
+        SelectedWeightNormalization::RenormalizeSelectedProbabilities;
+    auto full_softmax_top_k = semantic_router_top_k({4.0f, 3.0f, 2.0f, 1.0f}, full_softmax_router);
+    CHECK(std::holds_alternative<SemanticRouterResult>(full_softmax_top_k));
+    if (const auto* selected = std::get_if<SemanticRouterResult>(&full_softmax_top_k)) {
+        CHECK(selected->ids == std::vector<uint32_t>({0, 1}));
+        CHECK(almost_equal(selected->weights[0] + selected->weights[1], 1.0f));
+        CHECK(selected->weights[0] > selected->weights[1]);
+    }
+    auto full_softmax_model = model;
+    std::get<RouterTopKPayload>(full_softmax_model.operators[0].payload) = full_softmax_router;
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(encode_semantic_model(full_softmax_model)));
     auto gated = semantic_gated_activation({1.0f}, {2.0f}, ActivationKind::GeluTanh);
     CHECK(is_ok(gated));
     if (is_ok(gated)) CHECK(almost_equal(values(gated)[0], 1.682384f, 1e-5f, 1e-5f));
@@ -927,7 +1264,7 @@ void test_complete_semantic_wire() {
     model.stop_ids = {2};
     model.input_values_first = 0;
     model.input_values_count = 1;
-    model.output_values_first = 7;
+    model.output_values_first = 8;
     model.output_values_count = 1;
 
     SemanticTensor tensor;
@@ -959,7 +1296,7 @@ void test_complete_semantic_wire() {
     }
     model.tensors.push_back(tensor);
 
-    for (uint32_t id = 0; id != 8; ++id) {
+    for (uint32_t id = 0; id != 9; ++id) {
         model.values.push_back({id, ScalarType::F32, {{DimensionKind::Constant, 2}}, 0});
     }
 
@@ -969,13 +1306,13 @@ void test_complete_semantic_wire() {
         {1, OperatorKind::RmsNorm, 1, {1}, {2}, {0}, {},
          RmsNormPayload{0x358637bdu, -1, 1}},
         {2, OperatorKind::Linear, 1, {2}, {3}, {0}, {},
-         LinearPayload{false, true, ScalarType::F32}},
-        {3, OperatorKind::Rope, 1, {3}, {4}, {0}, {},
+         LinearPayload{false, false, ScalarType::F32}},
+        {3, OperatorKind::Rope, 1, {3, 3}, {4, 5}, {}, {},
          RopePayload{RopePairing::HalfSplit, true, 2, 0x49742400u, 0x3f800000u}},
-        {4, OperatorKind::CausalAttention, 1, {4}, {5}, {0}, {0, 1},
+        {4, OperatorKind::CausalAttention, 1, {4, 5, 5}, {6}, {}, {0, 1},
          CausalAttentionPayload{2, 1, 1, 0x3f800000u, AttentionMask::Causal, CachePolicy::Global}},
-        {5, OperatorKind::SwiGlu, 1, {5}, {6}, {0}, {}, SwiGluPayload{ActivationKind::Silu}},
-        {6, OperatorKind::Add, 1, {5, 6}, {7}, {}, {}, AddPayload{}},
+        {5, OperatorKind::SwiGlu, 1, {6, 6}, {7}, {}, {}, SwiGluPayload{ActivationKind::Silu}},
+        {6, OperatorKind::Add, 1, {6, 7}, {8}, {}, {}, AddPayload{}},
     };
     model.layers.push_back({0, 0, 7, 0});
 
@@ -1017,13 +1354,56 @@ void test_complete_semantic_wire() {
         CHECK(roundtrip->capabilities.size() == 1);
         CHECK(roundtrip->fallbacks.size() == 1);
         CHECK(roundtrip->input_values_first == 0);
-        CHECK(roundtrip->output_values_first == 7);
+        CHECK(roundtrip->output_values_first == 8);
     }
+
+    for (uint32_t scale_bits : {0u, float_bits(-1.0f),
+                                float_bits(std::numeric_limits<float>::infinity()),
+                                float_bits(std::numeric_limits<float>::quiet_NaN())}) {
+        auto invalid_embedding_scale = model;
+        std::get<EmbeddingLookupPayload>(
+            invalid_embedding_scale.operators[0].payload).scale_f32_bits = scale_bits;
+        CHECK(std::holds_alternative<CompatibilityReport>(
+            encode_semantic_model(invalid_embedding_scale)));
+    }
+    for (uint32_t scale_bits : {0u, float_bits(-1.0f),
+                                float_bits(std::numeric_limits<float>::infinity()),
+                                float_bits(std::numeric_limits<float>::quiet_NaN())}) {
+        auto invalid_scale = model;
+        std::get<CausalAttentionPayload>(invalid_scale.operators[4].payload).scale_f32_bits = scale_bits;
+        CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(invalid_scale)));
+    }
+    for (uint32_t bits : {0u, float_bits(-1.0f),
+                          float_bits(std::numeric_limits<float>::infinity()),
+                          float_bits(std::numeric_limits<float>::quiet_NaN())}) {
+        auto invalid_rope_base = model;
+        std::get<RopePayload>(invalid_rope_base.operators[3].payload).base_f32_bits = bits;
+        CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(invalid_rope_base)));
+        auto invalid_rope_scale = model;
+        std::get<RopePayload>(invalid_rope_scale.operators[3].payload).scale_f32_bits = bits;
+        CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(invalid_rope_scale)));
+    }
+    auto invalid_rms = model;
+    std::get<RmsNormPayload>(invalid_rms.operators[1].payload).epsilon_f32_bits = float_bits(-1.0f);
+    CHECK(std::holds_alternative<CompatibilityReport>(encode_semantic_model(invalid_rms)));
+    auto invalid_attention_extension = model;
+    auto& extension = std::get<CausalAttentionPayload>(
+        invalid_attention_extension.operators[4].payload);
+    extension.window = AttentionWindowKind::Sliding;
+    extension.window_tokens = 32;
+    extension.value_source = ValueSource::KeyPreRope;
+    extension.value_source_value = 4;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_semantic_model(invalid_attention_extension)));
 }
 
 } // namespace
 
 int main() {
+    test_semantic_operator_arity();
+    test_operator_signature_contract();
+    test_semantic_layer_table_decode_validation();
+    test_inactive_program_tensor_flag_is_schema_bounded();
     test_operator_vectors();
     test_operator_errors();
     test_semantic_wire();

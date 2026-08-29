@@ -1,4 +1,3 @@
-#define LAPLACE_CANONICAL_INTERNAL 1
 #include "canonical_metal.h"
 
 #include <CommonCrypto/CommonDigest.h>
@@ -9,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "execution_plan.h"
+#include "column_grouped_u2_atlas.h"
 #include "fp16.h"
 #include "kernels.h"
 #include "matmul.h"
@@ -158,6 +159,7 @@ bool gguf_block_type(const SemanticTensor& semantic, const TensorPlane& plane, G
     struct BlockFormat { uint32_t elements; uint32_t bytes; GGMLType type; };
     static constexpr BlockFormat formats[] = {
         {256, 66, GGMLType::IQ2_XXS},
+        {32, 18, GGMLType::Q4_0},
         {256, 84, GGMLType::Q2_K},
         {256, 144, GGMLType::Q4_K},
         {32, 22, GGMLType::Q5_0},
@@ -173,7 +175,179 @@ bool gguf_block_type(const SemanticTensor& semantic, const TensorPlane& plane, G
     return false;
 }
 
+bool affine_u2_256_tensor_view(const RuntimePackage& package, const SemanticTensor& semantic,
+                               Tensor& tensor) {
+    if (semantic.logical_type != ScalarType::F32 || semantic.dimensions.size() != 2 ||
+        semantic.layout.kind != PhysicalLayoutKind::GroupedAffine ||
+        semantic.layout.version != 1 ||
+        semantic.layout.packing != PackingKind::LsbBitPacked ||
+        semantic.layout.rank != 2 || semantic.layout.block_rank != 1 ||
+        semantic.layout.axis_order[0] != 1 || semantic.layout.axis_order[1] != 0 ||
+        semantic.layout.strides[0] != 1 ||
+        semantic.layout.strides[1] != semantic.dimensions[1].constant_or_symbol ||
+        semantic.layout.flags != 0 || semantic.flags != 0 || semantic.expert_axis != ExpertAxis{} ||
+        semantic.layout.block_elements != 256 || semantic.layout.block_bytes != 64 ||
+        semantic.quantization.kind != QuantizationKind::BlockedAffine ||
+        semantic.quantization.version != 1 ||
+        semantic.quantization.accumulation_type != ScalarType::F32 ||
+        semantic.quantization.scale_type != ScalarType::F16 ||
+        semantic.quantization.zero_type != static_cast<ScalarType>(0) ||
+        semantic.quantization.bias_type != ScalarType::F16 ||
+        semantic.quantization.block_elements != 256 ||
+        semantic.quantization.block_bytes != 64 || semantic.quantization.group_size != 256 ||
+        semantic.quantization.required_plane_mask != 7 || semantic.quantization.flags != 0 ||
+        semantic.planes.size() != 3) return false;
+    uint64_t n = 0;
+    uint64_t k = 0;
+    if (!constant_dimension(semantic.dimensions[0], n) ||
+        !constant_dimension(semantic.dimensions[1], k) || n % 8 != 0 || k % 512 != 0 ||
+        k % 256 != 0 || n > UINT64_MAX / k) return false;
+    const uint64_t blocks = n * (k / 256);
+    if (!blocks || blocks > UINT64_MAX / 2) return false;
+    const uint64_t values_length = n * (k / 4);
+    const uint64_t plane_length = blocks * 2;
+    const TensorPlane* values = nullptr;
+    const TensorPlane* scales = nullptr;
+    const TensorPlane* biases = nullptr;
+    for (const TensorPlane& plane : semantic.planes) {
+        if (plane.alignment != 128 || plane.offset % 128 != 0 || plane.flags != 0) return false;
+        if (plane.kind == PlaneKind::Values && plane.storage_type == ScalarType::U32) {
+            if (values) return false;
+            values = &plane;
+        } else if (plane.kind == PlaneKind::Scales && plane.storage_type == ScalarType::F16) {
+            if (scales) return false;
+            scales = &plane;
+        } else if (plane.kind == PlaneKind::Biases && plane.storage_type == ScalarType::F16) {
+            if (biases) return false;
+            biases = &plane;
+        }
+        else
+            return false;
+    }
+    if (!values || !scales || !biases || values->length != values_length ||
+        scales->length != plane_length || biases->length != plane_length) return false;
+    const auto pointer_for = [&](const TensorPlane& plane) -> const uint8_t* {
+        const std::span<const uint8_t> artifact = package.artifact_bytes(plane.artifact_id);
+        if (artifact.empty() || plane.offset > artifact.size() ||
+            plane.length > artifact.size() - plane.offset) return nullptr;
+        return artifact.data() + plane.offset;
+    };
+    const uint8_t* values_pointer = pointer_for(*values);
+    const uint8_t* scales_pointer = pointer_for(*scales);
+    const uint8_t* biases_pointer = pointer_for(*biases);
+    if (!values_pointer || !scales_pointer || !biases_pointer) return false;
+    tensor = {};
+    tensor.type = GGMLType::GROUPED_AFFINE_U2_256;
+    tensor.n_dims = 2;
+    tensor.dims[0] = k;
+    tensor.dims[1] = n;
+    tensor.data = values_pointer;
+    tensor.scales = scales_pointer;
+    tensor.biases = biases_pointer;
+    tensor.data_bytes = values_length;
+    tensor.scale_bytes = plane_length;
+    tensor.bias_bytes = plane_length;
+    tensor.mlx_bits = 2;
+    tensor.mlx_group_size = 256;
+    return true;
+}
+
+bool column_grouped_affine_u2_skip_256_tensor_view(
+    const RuntimePackage& package, const SemanticTensor& semantic, Tensor& tensor) {
+    if (semantic.logical_type != ScalarType::F32 || semantic.dimensions.size() != 2 ||
+        semantic.layout.kind != PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip ||
+        semantic.layout.version != 1 ||
+        semantic.layout.packing != PackingKind::LsbBitPacked ||
+        semantic.layout.rank != 2 || semantic.layout.block_rank != 1 ||
+        semantic.layout.axis_order[0] != 1 || semantic.layout.axis_order[1] != 0 ||
+        semantic.layout.strides[0] != 1 ||
+        semantic.layout.strides[1] != semantic.dimensions[1].constant_or_symbol ||
+        semantic.layout.flags != 0 || semantic.flags != 0 ||
+        semantic.expert_axis != ExpertAxis{} ||
+        semantic.layout.block_elements != 256 || semantic.layout.block_bytes != 64 ||
+        semantic.quantization.kind != QuantizationKind::BlockedAffine ||
+        semantic.quantization.version != 1 ||
+        semantic.quantization.accumulation_type != ScalarType::F32 ||
+        semantic.quantization.scale_type != ScalarType::F16 ||
+        semantic.quantization.zero_type != static_cast<ScalarType>(0) ||
+        semantic.quantization.bias_type != ScalarType::F16 ||
+        semantic.quantization.block_elements != 256 ||
+        semantic.quantization.block_bytes != 64 ||
+        semantic.quantization.group_size != 256 ||
+        semantic.quantization.required_plane_mask != 7 ||
+        semantic.quantization.flags != 0 || semantic.planes.size() != 3)
+        return false;
+
+    uint64_t n = 0;
+    uint64_t k = 0;
+    if (!constant_dimension(semantic.dimensions[0], n) ||
+        !constant_dimension(semantic.dimensions[1], k) || n % 256 != 0 ||
+        n > UINT64_MAX / k)
+        return false;
+    const uint64_t elements = n * k;
+    const uint64_t groups = elements / 256;
+    if (groups == 0 || groups > UINT64_MAX / 2) return false;
+    const uint64_t values_length = elements / 4;
+    const uint64_t metadata_length = groups * 2;
+
+    const TensorPlane* values = nullptr;
+    const TensorPlane* scales = nullptr;
+    const TensorPlane* biases = nullptr;
+    for (const TensorPlane& plane : semantic.planes) {
+        if (plane.alignment != 128 || plane.offset % 128 != 0 || plane.flags != 0)
+            return false;
+        if (plane.kind == PlaneKind::Values && plane.storage_type == ScalarType::U8) {
+            if (values) return false;
+            values = &plane;
+        } else if (plane.kind == PlaneKind::Scales &&
+                   plane.storage_type == ScalarType::F16) {
+            if (scales) return false;
+            scales = &plane;
+        } else if (plane.kind == PlaneKind::Biases &&
+                   plane.storage_type == ScalarType::F16) {
+            if (biases) return false;
+            biases = &plane;
+        } else {
+            return false;
+        }
+    }
+    if (!values || !scales || !biases || values->length != values_length ||
+        scales->length != metadata_length || biases->length != metadata_length)
+        return false;
+
+    const auto pointer_for = [&](const TensorPlane& plane) -> const uint8_t* {
+        const std::span<const uint8_t> artifact = package.artifact_bytes(plane.artifact_id);
+        if (artifact.empty() || plane.offset > artifact.size() ||
+            plane.length > artifact.size() - plane.offset)
+            return nullptr;
+        return artifact.data() + plane.offset;
+    };
+    const uint8_t* values_pointer = pointer_for(*values);
+    const uint8_t* scales_pointer = pointer_for(*scales);
+    const uint8_t* biases_pointer = pointer_for(*biases);
+    if (!values_pointer || !scales_pointer || !biases_pointer) return false;
+
+    tensor = {};
+    tensor.type = GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256;
+    tensor.n_dims = 2;
+    tensor.dims[0] = k;
+    tensor.dims[1] = n;
+    tensor.data = values_pointer;
+    tensor.scales = scales_pointer;
+    tensor.biases = biases_pointer;
+    tensor.data_bytes = values_length;
+    tensor.scale_bytes = metadata_length;
+    tensor.bias_bytes = metadata_length;
+    tensor.mlx_bits = 2;
+    tensor.mlx_group_size = 256;
+    return true;
+}
+
 bool tensor_view(const RuntimePackage& package, const SemanticTensor& semantic, Tensor& tensor) {
+    if (semantic.planes.size() == 3 &&
+        column_grouped_affine_u2_skip_256_tensor_view(package, semantic, tensor))
+        return true;
+    if (semantic.planes.size() == 3 && affine_u2_256_tensor_view(package, semantic, tensor)) return true;
     if (semantic.planes.size() != 1 ||
         semantic.planes[0].kind != PlaneKind::Values || semantic.dimensions.empty() || semantic.dimensions.size() > 4) return false;
     const TensorPlane& plane = semantic.planes[0];
@@ -202,6 +376,10 @@ bool tensor_view(const RuntimePackage& package, const SemanticTensor& semantic, 
             elements / semantic.layout.block_elements * semantic.layout.block_bytes != plane.length) return false;
     }
     tensor.data = artifact.data() + plane.offset;
+    // Keep the exact source span with the non-owning view.  Canonical Metal
+    // registration is allowed to cover a larger artifact range, but a
+    // binder must never infer permission to read past this tensor plane.
+    tensor.data_bytes = plane.length;
     return true;
 }
 
@@ -240,6 +418,35 @@ bool output_width(const SemanticModel& model, const SemanticOperator& op, uint32
     return true;
 }
 
+bool value_width(const SemanticModel& model, uint32_t value_id, uint32_t& width) {
+    if (value_id >= model.values.size()) return false;
+    const SemanticValue& value = model.values[value_id];
+    if (value.dimensions.empty() || value.dimensions.size() > 4) return false;
+    uint64_t resolved = 0;
+    if (!constant_dimension(value.dimensions.back(), resolved) || resolved == 0 || resolved > UINT32_MAX)
+        return false;
+    width = static_cast<uint32_t>(resolved);
+    return true;
+}
+
+bool validate_linear_tensor_shape(const SemanticModel& model, const SemanticOperator& op,
+                                  const Tensor& tensor, TensorRole role, bool expert,
+                                  std::string& error) {
+    if (expert || op.kind != OperatorKind::Linear) return true;
+    const auto* payload = std::get_if<LinearPayload>(&op.payload);
+    uint32_t input_width = 0;
+    uint32_t output_width_value = 0;
+    if (!payload || payload->transpose_weight || op.inputs.size() != 1 || op.outputs.size() != 1 ||
+        !value_width(model, op.inputs.front(), input_width) ||
+        !value_width(model, op.outputs.front(), output_width_value) || tensor.n_dims != 2 ||
+        tensor.dims[0] != input_width || tensor.dims[1] != output_width_value) {
+        error = "canonical Metal linear tensor shape does not match semantic input/output widths for role " +
+                std::to_string(static_cast<unsigned>(role));
+        return false;
+    }
+    return true;
+}
+
 bool fp32_global_state_format(const StateFormat& format, TransformDomain encoded_domain) {
     return format.kind == StateFormatKind::GlobalContiguous && format.version == 1 &&
            format.logical_type == ScalarType::F32 && format.encoded_type == ScalarType::F32 &&
@@ -268,7 +475,9 @@ const SemanticState* state_by_id(const SemanticModel& model, uint32_t id) {
 }
 
 bool owns_fp32_global_kv(const SemanticModel& model, const SemanticOperator& attention,
-                         uint32_t kv_heads, uint32_t head_dimension) {
+                         uint32_t kv_heads, uint32_t head_dimension,
+                         uint32_t* key_state_id = nullptr,
+                         uint32_t* value_state_id = nullptr) {
     if (attention.states.size() != 2) return false;
     const SemanticState* key = nullptr;
     const SemanticState* value = nullptr;
@@ -278,7 +487,8 @@ bool owns_fp32_global_kv(const SemanticModel& model, const SemanticOperator& att
         if (state->kind == StateKind::KeyCache) key = key ? nullptr : state;
         if (state->kind == StateKind::ValueCache) value = value ? nullptr : state;
     }
-    return key && value && key->id != value->id && key->semantic_version == value->semantic_version &&
+    const bool valid = key && value && key->id != value->id &&
+           key->semantic_version == value->semantic_version &&
            (key->semantic_version == 1 || key->semantic_version == 4 ||
             key->semantic_version == 5 || key->semantic_version == 6 || key->semantic_version == 7) &&
            key->update_kind == StateUpdateKind::AppendKey && value->update_kind == StateUpdateKind::AppendValue &&
@@ -287,6 +497,11 @@ bool owns_fp32_global_kv(const SemanticModel& model, const SemanticOperator& att
            fp32_global_state_format(key->formats[0], TransformDomain::RopeApplied) &&
            fp32_global_state_format(value->formats[0], TransformDomain::Untransformed) &&
            kv_state_shape(*key, kv_heads, head_dimension) && kv_state_shape(*value, kv_heads, head_dimension);
+    if (valid) {
+        if (key_state_id) *key_state_id = key->id;
+        if (value_state_id) *value_state_id = value->id;
+    }
+    return valid;
 }
 
 struct DenseLayer {
@@ -304,6 +519,16 @@ struct DenseLayer {
     Tensor ffn_gate;
     Tensor ffn_up;
     Tensor ffn_down;
+    Tensor moe_gate;
+    Tensor moe_gate_scale;
+    Tensor moe_pre_norm;
+    Tensor moe_up;
+    Tensor moe_down;
+    Tensor moe_down_scale;
+    Tensor post_ffw_1;
+    Tensor post_ffw_2;
+    Tensor post_ffw;
+    Tensor out_scale;
     MetalTokLayer metal;
     uint32_t operator_id = 0;
 };
@@ -377,6 +602,174 @@ bool policy_selects(const CanonicalDerivedQ2KPolicy& policy, TensorRole role) {
 
 bool policy_selects(const CanonicalDerivedIQ2XXSPolicy& policy, TensorRole role) {
     return std::find(policy.tensor_roles.begin(), policy.tensor_roles.end(), role) != policy.tensor_roles.end();
+}
+
+bool policy_selects(const CanonicalDerivedColumnGroupedU2Policy& policy, TensorRole role) {
+    return std::find(policy.tensor_roles.begin(), policy.tensor_roles.end(), role) !=
+           policy.tensor_roles.end();
+}
+
+bool build_derived_column_grouped_u2_atlas(
+    const RuntimePackage& package, const SemanticModel& model,
+    const CanonicalDerivedColumnGroupedU2Policy& policy,
+    std::optional<ColumnGroupedU2Atlas>& atlas, std::string& error) {
+    if (policy.tensor_roles.empty()) return true;
+    for (size_t index = 0; index != policy.tensor_roles.size(); ++index) {
+        if (std::find(policy.tensor_roles.begin(), policy.tensor_roles.begin() + index,
+                      policy.tensor_roles[index]) != policy.tensor_roles.begin() + index) {
+            error = "derived column-grouped UInt2 policy repeats a tensor role";
+            return false;
+        }
+    }
+    bool uniform_importance = false;
+#if defined(LAPLACE_METAL_TESTING)
+    uniform_importance = policy.uniform_importance_for_testing;
+#endif
+    if (!uniform_importance && !policy.calibration_cache) {
+        error = "derived column-grouped UInt2 conversion requires a validated calibration cache";
+        return false;
+    }
+
+    std::vector<bool> executable_operator(model.operators.size(), true);
+    for (const SemanticLayer& layer : model.layers) {
+        if ((layer.flags & kSemanticLayerFlagSpeculative) == 0) continue;
+        if (layer.first_operator > model.operators.size() ||
+            layer.operator_count > model.operators.size() - layer.first_operator) {
+            error = "derived column-grouped UInt2 found an invalid speculative layer range";
+            return false;
+        }
+        for (uint32_t offset = 0; offset != layer.operator_count; ++offset)
+            executable_operator[layer.first_operator + offset] = false;
+    }
+
+    struct Candidate {
+        uint32_t tensor_id = UINT32_MAX;
+        Tensor source;
+        std::vector<float> importance;
+    };
+    std::vector<Candidate> candidates;
+    try {
+        candidates.reserve(model.tensors.size());
+    } catch (const std::bad_alloc&) {
+        error = "derived column-grouped UInt2 candidate allocation failed";
+        return false;
+    }
+    for (const SemanticTensor& semantic : model.tensors) {
+        if ((semantic.flags & kSemanticTensorFlagInactiveProgram) != 0 ||
+            !policy_selects(policy, semantic.role)) continue;
+        const SemanticOperator* linear = nullptr;
+        for (size_t operator_index = 0; operator_index != model.operators.size();
+             ++operator_index) {
+            if (!executable_operator[operator_index]) continue;
+            const SemanticOperator& candidate = model.operators[operator_index];
+            if (candidate.kind != OperatorKind::Linear ||
+                std::count(candidate.tensors.begin(), candidate.tensors.end(), semantic.id) != 1)
+                continue;
+            if (linear) {
+                error = "derived column-grouped UInt2 tensor " +
+                        std::to_string(semantic.id) + " has ambiguous Linear ownership";
+                return false;
+            }
+            linear = &candidate;
+        }
+        if (!linear || linear->inputs.size() != 1 || linear->outputs.size() != 1) {
+            error = "derived column-grouped UInt2 tensor " +
+                    std::to_string(semantic.id) + " is not one executable Linear weight";
+            return false;
+        }
+        Candidate candidate;
+        candidate.tensor_id = semantic.id;
+        if (!tensor_view(package, semantic, candidate.source) ||
+            candidate.source.n_dims != 2 ||
+            (candidate.source.type != GGMLType::Q4_K &&
+             candidate.source.type != GGMLType::Q6_K) ||
+            candidate.source.data_bytes == 0 || candidate.source.data_bytes > SIZE_MAX ||
+            !candidate.source.data ||
+            linear->inputs.front() >= model.values.size() ||
+            model.values[linear->inputs.front()].dimensions.size() != 2 ||
+            semantic.layout.axis_order[0] >= semantic.dimensions.size()) {
+            error = "derived column-grouped UInt2 rejected tensor " +
+                    std::to_string(semantic.id) + " physical or Linear input contract";
+            return false;
+        }
+        CalibrationKMapping mapping;
+        mapping.input_axis = 1;
+        mapping.weight_physical_axis = 0;
+        mapping.weight_logical_axis = semantic.layout.axis_order[0];
+        mapping.width = static_cast<uint32_t>(candidate.source.dims[0]);
+        mapping.block_elements = semantic.layout.block_elements;
+        mapping.block_bytes = semantic.layout.block_bytes;
+        if (uniform_importance) {
+            try {
+                candidate.importance.assign(mapping.width, 1.0f);
+            } catch (const std::bad_alloc&) {
+                error = "derived column-grouped UInt2 importance allocation failed";
+                return false;
+            }
+        } else if (!calibration_importance_for_tensor(
+                       *policy.calibration_cache, package.artifact_digest(),
+                       package.fingerprint(), semantic.id, mapping,
+                       candidate.importance)) {
+            error = "derived column-grouped UInt2 calibration rejected tensor " +
+                    std::to_string(semantic.id);
+            return false;
+        }
+        candidates.push_back(std::move(candidate));
+    }
+    if (candidates.empty()) {
+        error = "derived column-grouped UInt2 policy selected no eligible tensors";
+        return false;
+    }
+
+    std::vector<ColumnGroupedU2AtlasSource> sources;
+    try {
+        sources.reserve(candidates.size());
+    } catch (const std::bad_alloc&) {
+        error = "derived column-grouped UInt2 source allocation failed";
+        return false;
+    }
+    for (const Candidate& candidate : candidates) {
+        sources.push_back({candidate.tensor_id, candidate.source.type,
+                           std::span<const uint8_t>(candidate.source.data,
+                                                    static_cast<size_t>(candidate.source.data_bytes)),
+                           candidate.source.dims[0], candidate.source.dims[1],
+                           candidate.importance});
+    }
+    ColumnGroupedU2AtlasResult built = build_column_grouped_u2_atlas(sources);
+    if (const auto* atlas_error = std::get_if<ColumnGroupedU2AtlasError>(&built)) {
+        error = "derived column-grouped UInt2 atlas failed with code " +
+                std::to_string(static_cast<uint16_t>(*atlas_error));
+        return false;
+    }
+    atlas.emplace(std::get<ColumnGroupedU2Atlas>(std::move(built)));
+    return true;
+}
+
+const ColumnGroupedU2AtlasEntry* derived_column_grouped_u2_entry(
+    const std::optional<ColumnGroupedU2Atlas>& atlas, uint32_t tensor_id) {
+    if (!atlas) return nullptr;
+    const auto& entries = atlas->entries();
+    const auto found = std::find_if(entries.begin(), entries.end(), [&](const auto& entry) {
+        return entry.binding_id == tensor_id;
+    });
+    return found == entries.end() ? nullptr : &*found;
+}
+
+Tensor derived_column_grouped_u2_tensor(const ColumnGroupedU2AtlasEntry& entry) {
+    Tensor tensor;
+    tensor.type = GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256;
+    tensor.n_dims = 2;
+    tensor.dims[0] = entry.storage.contract.logical_k;
+    tensor.dims[1] = entry.storage.contract.logical_n;
+    tensor.data = entry.storage.planes.values;
+    tensor.scales = reinterpret_cast<const uint8_t*>(entry.storage.planes.scales);
+    tensor.biases = reinterpret_cast<const uint8_t*>(entry.storage.planes.biases);
+    tensor.data_bytes = entry.storage.contract.values_bytes;
+    tensor.scale_bytes = entry.storage.contract.scale_bytes;
+    tensor.bias_bytes = entry.storage.contract.bias_bytes;
+    tensor.mlx_bits = 2;
+    tensor.mlx_group_size = 256;
+    return tensor;
 }
 
 bool build_derived_iq2_xxs_atlas(const RuntimePackage& package, const SemanticModel& model,
@@ -492,6 +885,7 @@ bool build_derived_iq2_xxs_atlas(const RuntimePackage& package, const SemanticMo
         if (policy.zero_fill_for_testing) {
             entry.tensor.type = GGMLType::IQ2_XXS;
             entry.tensor.data = destination.data();
+            entry.tensor.data_bytes = entry.logical_length;
             continue;
         }
 #endif
@@ -508,6 +902,7 @@ bool build_derived_iq2_xxs_atlas(const RuntimePackage& package, const SemanticMo
         }
         entry.tensor.type = GGMLType::IQ2_XXS;
         entry.tensor.data = destination.data();
+        entry.tensor.data_bytes = entry.logical_length;
     }
     if (mprotect(atlas.mapping.get(), atlas.mapped_length, PROT_READ) != 0) {
         error = "derived IQ2_XXS atlas could not be sealed read-only";
@@ -519,13 +914,30 @@ bool build_derived_iq2_xxs_atlas(const RuntimePackage& package, const SemanticMo
 bool materialize_derived_q2(const RuntimePackage& package, const SemanticTensor& semantic,
                             const CanonicalDerivedQ2KPolicy& policy,
                             const DerivedIQ2XXSAtlas& iq2_xxs_atlas,
+                            const std::optional<ColumnGroupedU2Atlas>& column_u2_atlas,
                             std::vector<DerivedTensorOwner>& owners, Tensor& output,
                             std::string& error) {
     if (!tensor_view(package, semantic, output)) return false;
+    // The native affine UInt2 leaf consumes its three checked planes directly;
+    // it is not a source for the derived Q2_K/Codebook policies.
+    if (output.type == GGMLType::GROUPED_AFFINE_U2_256 ||
+        output.type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256)
+        return true;
+    const ColumnGroupedU2AtlasEntry* column_u2 =
+        derived_column_grouped_u2_entry(column_u2_atlas, semantic.id);
     const auto iq2_xxs = std::find_if(iq2_xxs_atlas.entries.begin(), iq2_xxs_atlas.entries.end(),
                                       [&](const DerivedIQ2XXSEntry& entry) {
                                           return entry.tensor_id == semantic.id;
                                       });
+    if (column_u2) {
+        if (policy_selects(policy, semantic.role) || iq2_xxs != iq2_xxs_atlas.entries.end()) {
+            error = "semantic tensor " + std::to_string(semantic.id) +
+                    " is selected by multiple derived quantization policies";
+            return false;
+        }
+        output = derived_column_grouped_u2_tensor(*column_u2);
+        return true;
+    }
     if (iq2_xxs != iq2_xxs_atlas.entries.end()) {
         if (policy_selects(policy, semantic.role)) {
             error = "semantic tensor " + std::to_string(semantic.id) +
@@ -595,6 +1007,7 @@ bool materialize_derived_q2(const RuntimePackage& package, const SemanticTensor&
     owner.tensor = output;
     owner.tensor.type = GGMLType::Q2_K;
     owner.tensor.data = owner.mapping.get();
+    owner.tensor.data_bytes = owner.logical_length;
     owners.push_back(std::move(owner));
     output = owners.back().tensor;
     return true;
@@ -644,6 +1057,48 @@ bool rewrite_derived_semantics(SemanticModel& model, const DerivedIQ2XXSAtlas& a
         tensor.quantization.required_plane_mask = 1;
         tensor.planes[0] = {PlaneKind::Values, ScalarType::U8, atlas.artifact_id, entry.offset,
                             entry.logical_length, entry.record.contract.alignment, 0};
+    }
+    return true;
+}
+
+bool rewrite_derived_semantics(SemanticModel& model,
+                               const std::optional<ColumnGroupedU2Atlas>& atlas) {
+    if (!atlas) return true;
+    constexpr ArtifactId kAtlasArtifact{0xa0000000u};
+    for (const ColumnGroupedU2AtlasEntry& entry : atlas->entries()) {
+        if (entry.binding_id >= model.tensors.size()) return false;
+        SemanticTensor& tensor = model.tensors[entry.binding_id];
+        if (tensor.planes.size() != 1 || tensor.dimensions.size() != 2) return false;
+        const auto& contract = entry.storage.contract;
+        tensor.layout.kind = PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip;
+        tensor.layout.version = 1;
+        tensor.layout.packing = PackingKind::LsbBitPacked;
+        tensor.layout.rank = 2;
+        tensor.layout.block_rank = 1;
+        tensor.layout.axis_order = {1, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        tensor.layout.strides = {1, contract.logical_k, 0, 0, 0, 0, 0, 0};
+        tensor.layout.block_elements = contract.group_elements;
+        tensor.layout.block_bytes = contract.packed_bytes_per_group;
+        tensor.layout.flags = 0;
+        tensor.quantization.kind = QuantizationKind::BlockedAffine;
+        tensor.quantization.version = 1;
+        tensor.quantization.accumulation_type = ScalarType::F32;
+        tensor.quantization.scale_type = ScalarType::F16;
+        tensor.quantization.zero_type = static_cast<ScalarType>(0);
+        tensor.quantization.bias_type = ScalarType::F16;
+        tensor.quantization.block_elements = contract.group_elements;
+        tensor.quantization.block_bytes = contract.packed_bytes_per_group;
+        tensor.quantization.group_size = contract.group_elements;
+        tensor.quantization.required_plane_mask = 7;
+        tensor.quantization.flags = 0;
+        tensor.planes = {
+            {PlaneKind::Values, ScalarType::U8, kAtlasArtifact,
+             entry.values_offset, contract.values_bytes, contract.plane_alignment, 0},
+            {PlaneKind::Scales, ScalarType::F16, kAtlasArtifact,
+             entry.scales_offset, contract.scale_bytes, contract.plane_alignment, 0},
+            {PlaneKind::Biases, ScalarType::F16, kAtlasArtifact,
+             entry.biases_offset, contract.bias_bytes, contract.plane_alignment, 0},
+        };
     }
     return true;
 }
@@ -749,10 +1204,14 @@ bool assign_tensor(const RuntimePackage& package, const SemanticModel& model, co
                    TensorRole role, Tensor& output, bool required,
                    const CanonicalDerivedQ2KPolicy& policy,
                    const DerivedIQ2XXSAtlas& iq2_xxs_atlas,
+                   const std::optional<ColumnGroupedU2Atlas>& column_u2_atlas,
                    std::vector<DerivedTensorOwner>& owners, std::string& error, bool expert = false) {
     const SemanticTensor* semantic = tensor_with_role(model, op, role, expert);
     if (!semantic) return !required;
-    return materialize_derived_q2(package, *semantic, policy, iq2_xxs_atlas, owners, output, error);
+    if (!materialize_derived_q2(package, *semantic, policy, iq2_xxs_atlas,
+                                column_u2_atlas, owners, output, error))
+        return false;
+    return validate_linear_tensor_shape(model, op, output, role, expert, error);
 }
 
 struct ArtifactSpan {
@@ -881,6 +1340,7 @@ bool collect_referenced_artifacts(const RuntimePackage& package, const SemanticM
                                   std::vector<ArtifactSpan>& spans, CompatibilityReport& error) {
     std::vector<uint32_t> ids;
     for (const SemanticTensor& tensor : model.tensors) {
+        if ((tensor.flags & kSemanticTensorFlagInactiveProgram) != 0) continue;
         for (const TensorPlane& plane : tensor.planes) {
             if (plane.artifact_id.value == UINT32_MAX) {
                 error = metal_error(CompatibilityError::IR_REFERENCE_INVALID,
@@ -1486,11 +1946,20 @@ struct CanonicalMetalProgram::Impl {
     uint32_t hidden = 0;
     uint32_t vocabulary = 0;
     uint32_t maximum_context = 0;
+    uint32_t maximum_batch_rows = 0;
+    float embedding_scale = 1.0f;
+    bool enable_prefill = false;
+    bool enable_decode = false;
     uint32_t token_intermediate = 0;
-    uint32_t attention_query_heads = 0;
-    uint32_t attention_kv_heads = 0;
-    uint32_t attention_head_dimension = 0;
+    uint32_t attention_query_capacity = 0;
+    uint32_t attention_key_value_capacity = 0;
+    uint64_t attention_key_value_width_sum = 0;
+    uint32_t moe_exp_intermediate = 0;
+    uint32_t moe_selected_experts = 0;
+    uint32_t moe_experts = 0;
     bool has_recurrent = false;
+    bool has_attention = false;
+    bool has_moe = false;
     bool prefill_batch = false;
     uint32_t position = 0;
     float final_epsilon = 0.0f;
@@ -1501,6 +1970,7 @@ struct CanonicalMetalProgram::Impl {
     ExecutionPlan token_plan;
     std::vector<DerivedTensorOwner> derived_q2;
     DerivedIQ2XXSAtlas derived_iq2_xxs;
+    std::optional<ColumnGroupedU2Atlas> derived_column_grouped_u2;
     std::vector<MetalSparseBlockRun> sparse_ffn_runs;
     std::vector<uint32_t> sparse_ffn_block_ids;
     std::vector<uint32_t> sparse_ffn_block_offsets;
@@ -1514,6 +1984,7 @@ struct CanonicalMetalProgram::Impl {
     uint64_t original_source_registered = 0;
     uint64_t derived_q2_registered = 0;
     uint64_t derived_iq2_xxs_registered = 0;
+    uint64_t derived_column_grouped_u2_registered = 0;
     uint64_t retained_boundary = 0;
     CanonicalMetalResourceDiagnostics resource_diagnostics;
     std::vector<const uint8_t*> registered_artifact_bases;
@@ -1538,6 +2009,15 @@ uint32_t CanonicalMetalProgram::layer_count() const noexcept {
 
 uint32_t CanonicalMetalProgram::position() const noexcept {
     return impl_ ? impl_->position : 0;
+}
+
+const ExecutionPlan& CanonicalMetalProgram::plan() const noexcept {
+    static const ExecutionPlan empty;
+    return impl_ ? impl_->plan : empty;
+}
+
+bool CanonicalMetalProgram::has_recurrent_layers() const noexcept {
+    return impl_ && impl_->has_recurrent;
 }
 
 bool CanonicalMetalProgram::read_calibration(std::vector<CalibrationRecord>& records) const {
@@ -1605,6 +2085,21 @@ uint64_t CanonicalMetalProgram::derived_iq2_xxs_registered_bytes() const noexcep
     return impl_ ? impl_->derived_iq2_xxs_registered : 0;
 }
 
+uint32_t CanonicalMetalProgram::derived_column_grouped_u2_tensor_count() const noexcept {
+    return impl_ && impl_->derived_column_grouped_u2
+        ? static_cast<uint32_t>(impl_->derived_column_grouped_u2->entries().size()) : 0;
+}
+
+uint64_t CanonicalMetalProgram::derived_column_grouped_u2_source_bytes() const noexcept {
+    return impl_ && impl_->derived_column_grouped_u2
+        ? impl_->derived_column_grouped_u2->source_bytes() : 0;
+}
+
+uint64_t CanonicalMetalProgram::derived_column_grouped_u2_storage_bytes() const noexcept {
+    return impl_ && impl_->derived_column_grouped_u2
+        ? impl_->derived_column_grouped_u2->mapped_bytes() : 0;
+}
+
 CanonicalMetalResourceDiagnostics CanonicalMetalProgram::resource_diagnostics() const noexcept {
     if (!impl_) return {};
     CanonicalMetalResourceDiagnostics diagnostics = impl_->resource_diagnostics;
@@ -1664,33 +2159,50 @@ bool CanonicalMetalProgram::commit(CanonicalMetalCursor cursor) noexcept {
 }
 
 bool CanonicalMetalProgram::rollback(CanonicalMetalCursor cursor) noexcept {
-    if (!impl_ || cursor.session_id != impl_->session_id || cursor.generation != impl_->generation ||
+    if (!impl_ || impl_->has_recurrent || cursor.session_id != impl_->session_id || cursor.generation != impl_->generation ||
         cursor.position > impl_->position) return false;
     impl_->position = cursor.position;
     ++impl_->generation;
     return true;
 }
 
-CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const RuntimePackage> package,
-                                                            uint32_t maximum_context,
-                                                            const CanonicalDerivedQ2KPolicy& derived_q2,
-                                                            const CanonicalSparseFfnPolicy& sparse_ffn,
-                                                            const CanonicalDerivedIQ2XXSPolicy& derived_iq2_xxs,
-                                                            const CanonicalCalibrationPolicy& calibration) {
-    if (!package || maximum_context == 0 || maximum_context > package->semantics().maximum_context) {
+bool CanonicalMetalProgram::rollback_to_position(uint32_t position) noexcept {
+    if (!impl_ || impl_->has_recurrent || position > impl_->position) return false;
+    impl_->position = position;
+    ++impl_->generation;
+    return true;
+}
+
+CanonicalMetalCreateResult create_canonical_metal_program_internal(
+    std::shared_ptr<const RuntimePackage> package, SessionRequest request,
+    const CanonicalDerivedQ2KPolicy& derived_q2,
+    const CanonicalSparseFfnPolicy& sparse_ffn,
+    const CanonicalDerivedIQ2XXSPolicy& derived_iq2_xxs,
+    const CanonicalCalibrationPolicy& calibration,
+    const CanonicalDerivedColumnGroupedU2Policy& derived_column_u2) {
+    if (!package || request.max_context == 0 || request.max_context > UINT32_MAX ||
+        request.max_context > package->semantics().maximum_context) {
         return metal_error(CompatibilityError::PLAN_CONTEXT_EXCEEDED);
     }
+    if (request.enable_streaming) return metal_error(CompatibilityError::STREAMING_UNSUPPORTED);
+    if (request.enable_speculation) return metal_error(CompatibilityError::FALLBACK_FORBIDDEN);
+    if ((!request.enable_prefill && !request.enable_decode) || request.max_batch == 0 ||
+        request.minimum_class != NumericalClass::ExactFp32 ||
+        (request.objective != RuntimeObjective::Latency && request.objective != RuntimeObjective::Throughput)) {
+        return metal_error(CompatibilityError::RUNTIME_INPUT_INVALID);
+    }
+    if (request.memory_limit == 0) return metal_error(CompatibilityError::PLAN_MEMORY_EXCEEDED);
+    const uint32_t maximum_context = static_cast<uint32_t>(request.max_context);
     const SemanticModel& model = package->semantics();
     if (model.layers.empty() || model.vocabulary_size == 0 || model.layers.size() > INT_MAX) {
         return metal_error(CompatibilityError::IR_REFERENCE_INVALID);
     }
-    for (const SemanticOperator& op : model.operators) {
-        if (op.kind != OperatorKind::RouterTopK && op.kind != OperatorKind::RoutedLinear &&
-            op.kind != OperatorKind::WeightedExpertReduce) continue;
-        CompatibilityReport report = metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
-                                                 "canonical Metal MoE operators are not admitted");
-        report.operator_id = op.id;
-        return report;
+    CanonicalProgramWitness lowering_program;
+    std::string lowering_program_detail;
+    if (!canonical_program_witness(model, lowering_program,
+                                   lowering_program_detail)) {
+        return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
+                           lowering_program_detail);
     }
     if (!calibration.targets.empty() &&
         (!sparse_ffn.runs.empty() || !sparse_ffn.layer_masks.empty() ||
@@ -1731,6 +2243,9 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
     impl->package = std::move(package);
     impl->session_id = g_next_metal_session_id.fetch_add(1, std::memory_order_relaxed);
     impl->maximum_context = maximum_context;
+    impl->maximum_batch_rows = request.max_batch;
+    impl->enable_prefill = request.enable_prefill;
+    impl->enable_decode = request.enable_decode;
     impl->vocabulary = model.vocabulary_size;
     impl->calibration.reserve(calibration.targets.size());
     for (const CalibrationTarget& target : calibration.targets) {
@@ -1765,6 +2280,11 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
     if (!collect_referenced_artifacts(*impl->package, model, artifacts, artifact_error)) return artifact_error;
     std::vector<uint32_t> used_tensor_ids;
     std::string derived_error;
+    if (!build_derived_column_grouped_u2_atlas(
+            *impl->package, model, derived_column_u2,
+            impl->derived_column_grouped_u2, derived_error)) {
+        return metal_error(CompatibilityError::KERNEL_UNAVAILABLE, derived_error);
+    }
     if (!build_derived_iq2_xxs_atlas(*impl->package, model, derived_iq2_xxs,
                                      impl->derived_iq2_xxs, derived_error)) {
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE, derived_error);
@@ -1774,6 +2294,7 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         const SemanticTensor* semantic = tensor_with_role(model, op, role, expert);
         const bool assigned = assign_tensor(*impl->package, model, op, role, tensor, required,
                                             derived_q2, impl->derived_iq2_xxs,
+                                            impl->derived_column_grouped_u2,
                                             impl->derived_q2, derived_error, expert);
         if (!assigned && required && derived_error.empty()) {
             derived_error = "canonical Metal could not materialize tensor role " +
@@ -1782,6 +2303,23 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         }
         if (assigned && semantic && std::find(used_tensor_ids.begin(), used_tensor_ids.end(), semantic->id) == used_tensor_ids.end())
             used_tensor_ids.push_back(semantic->id);
+        return assigned;
+    };
+    const auto assign_single = [&](const SemanticOperator& op, Tensor& tensor) {
+        if (op.tensors.size() != 1 || op.tensors[0] >= model.tensors.size()) {
+            derived_error = "canonical Metal expected exactly one materialized tensor";
+            return false;
+        }
+        const SemanticTensor& semantic = model.tensors[op.tensors[0]];
+        const bool assigned = materialize_derived_q2(*impl->package, semantic, derived_q2,
+                                                      impl->derived_iq2_xxs,
+                                                      impl->derived_column_grouped_u2,
+                                                      impl->derived_q2,
+                                                      tensor, derived_error);
+        if (!assigned && derived_error.empty())
+            derived_error = "canonical Metal could not materialize a single-tensor operator";
+        if (assigned && std::find(used_tensor_ids.begin(), used_tensor_ids.end(), semantic.id) == used_tensor_ids.end())
+            used_tensor_ids.push_back(semantic.id);
         return assigned;
     };
     const auto assignment_error = [&]() {
@@ -1834,10 +2372,12 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         return true;
     };
 
-    const SemanticOperator& embedding_op = model.operators.front();
+    const SemanticOperator& embedding_op = model.operators[lowering_program.embedding_operator_id];
     const auto* embedding_payload = std::get_if<EmbeddingLookupPayload>(&embedding_op.payload);
     if (embedding_op.kind != OperatorKind::EmbeddingLookup || !embedding_payload ||
         embedding_payload->width == 0 || embedding_payload->vocabulary != model.vocabulary_size ||
+        !f32_bits(embedding_payload->scale_f32_bits, impl->embedding_scale) ||
+        impl->embedding_scale <= 0.0f ||
         !assign(embedding_op, TensorRole::TokenEmbedding, impl->embedding, true)) {
         return assignment_error();
     }
@@ -1845,6 +2385,7 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
 
     impl->layers.reserve(model.layers.size());
     uint32_t recurrent_state_slot = 0;
+    std::vector<uint32_t> claimed_attention_states;
     for (const SemanticLayer& layer : model.layers) {
         if ((layer.flags & kSemanticLayerFlagSpeculative) != 0) continue;
         const SemanticOperator* delta = operator_with_role(model, layer, OperatorKind::GatedDeltaNet,
@@ -1897,8 +2438,10 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
                 !ffn_norm || !ffn_gate || !ffn_up || !ffn_down || !ffn_swiglu ||
                 ffn_norm->outputs.size() != 1 || ffn_swiglu->outputs.size() != 1 ||
                 !delta_payload || !conv_payload ||
-                !input_norm_payload || !l2_payload || !f32_bits(input_norm_payload->epsilon_f32_bits, rms_epsilon) ||
-                !f32_bits(l2_payload->epsilon_f32_bits, l2_epsilon) || !output_width(model, *ffn_gate, ffn_intermediate) ||
+                !input_norm_payload || !l2_payload ||
+                !f32_bits(input_norm_payload->epsilon_f32_bits, rms_epsilon) || rms_epsilon < 0.0f ||
+                !f32_bits(l2_payload->epsilon_f32_bits, l2_epsilon) || l2_epsilon < 0.0f ||
+                !output_width(model, *ffn_gate, ffn_intermediate) ||
                 delta_payload->qk_heads == 0 || delta_payload->value_heads == 0 || delta_payload->head_dimension == 0 ||
                 delta_payload->qk_heads > INT_MAX || delta_payload->value_heads > INT_MAX ||
                 delta_payload->head_dimension > INT_MAX || conv_payload->kernel == 0 ||
@@ -2040,6 +2583,59 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         const SemanticOperator* ffn_gate = operator_with_role(model, layer, OperatorKind::Linear, TensorRole::FfnGateWeight);
         const SemanticOperator* ffn_up = operator_with_role(model, layer, OperatorKind::Linear, TensorRole::FfnUpWeight);
         const SemanticOperator* ffn_down = operator_with_role(model, layer, OperatorKind::Linear, TensorRole::FfnDownWeight);
+        CanonicalMoeOperatorEdges moe_edges;
+        bool has_moe_operator = false;
+        if (layer.first_operator <= model.operators.size() &&
+            layer.operator_count <= model.operators.size() - layer.first_operator) {
+            for (uint32_t index = 0; index != layer.operator_count; ++index) {
+                const OperatorKind kind = model.operators[layer.first_operator + index].kind;
+                if (kind == OperatorKind::RouterTopK || kind == OperatorKind::RoutedLinear ||
+                    kind == OperatorKind::GatedActivation || kind == OperatorKind::WeightedExpertReduce) {
+                    has_moe_operator = true;
+                    break;
+                }
+            }
+        }
+        const bool is_moe = has_moe_operator &&
+                            match_canonical_moe_operator_edges(model, layer, moe_edges);
+        const SemanticOperator* moe_router = nullptr;
+        const SemanticOperator* moe_norm = nullptr;
+        const SemanticOperator* moe_up = nullptr;
+        const SemanticOperator* moe_down = nullptr;
+        const RouterTopKPayload* moe_payload = nullptr;
+        uint32_t moe_intermediate = 0;
+        if (has_moe_operator && !is_moe) {
+            return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
+                               "canonical Metal MoE layer has an unsupported or ambiguous semantic edge set");
+        }
+        if (is_moe) {
+            // The matcher returned one complete typed witness.  Use its
+            // dense nodes as well as its routed nodes so lowering cannot
+            // select a different operator after admission.
+            attn_norm = moe_edges.dense_attn_norm;
+            query = moe_edges.dense_query;
+            query_gate = moe_edges.dense_query_gate;
+            key = moe_edges.dense_key;
+            value = moe_edges.dense_value;
+            attention_output = moe_edges.dense_output;
+            query_norm = moe_edges.dense_query_norm;
+            key_norm = moe_edges.dense_key_norm;
+            ffn_norm = moe_edges.dense_ffn_norm;
+            ffn_gate = moe_edges.dense_gate;
+            ffn_up = moe_edges.dense_up;
+            ffn_down = moe_edges.dense_down;
+            moe_router = moe_edges.router_linear;
+            moe_norm = moe_edges.expert_norm;
+            moe_up = moe_edges.expert_up;
+            moe_down = moe_edges.expert_down;
+            moe_payload = std::get_if<RouterTopKPayload>(&moe_edges.router->payload);
+            if (!moe_payload || moe_payload->expert_count > INT_MAX ||
+                moe_payload->selected_count > INT_MAX || moe_edges.intermediate > INT_MAX) {
+                return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
+                                   "canonical Metal MoE layer has an unsupported router or expert geometry");
+            }
+            moe_intermediate = moe_edges.intermediate;
+        }
         const auto dense_role_error = [&](const char* role) {
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "canonical Metal dense layer " + std::to_string(layer.layer_index) +
@@ -2048,12 +2644,26 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         if (!attn_norm) return dense_role_error("AttentionNormWeight");
         if ((query == nullptr) == (query_gate == nullptr)) return dense_role_error("one query projection role");
         if (!key) return dense_role_error("KeyWeight");
-        if (!value) return dense_role_error("ValueWeight");
         if (!attention_output) return dense_role_error("AttentionOutputWeight");
         if (!ffn_norm) return dense_role_error("FfnNormWeight");
         if (!ffn_gate) return dense_role_error("FfnGateWeight");
         if (!ffn_up) return dense_role_error("FfnUpWeight");
         if (!ffn_down) return dense_role_error("FfnDownWeight");
+        if (is_moe) {
+            const auto witness_contains = [&](const SemanticOperator* op) {
+                return op && std::find(moe_edges.covered_operator_ids.begin(),
+                                       moe_edges.covered_operator_ids.end(), op->id) !=
+                                   moe_edges.covered_operator_ids.end();
+            };
+            if (!witness_contains(attn_norm) || !witness_contains(query_gate ? query_gate : query) ||
+                !witness_contains(key) || !witness_contains(value) ||
+                !witness_contains(attention_output) || !witness_contains(ffn_norm) ||
+                !witness_contains(ffn_gate) || !witness_contains(ffn_up) ||
+                !witness_contains(ffn_down)) {
+                return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
+                                   "canonical Metal lowerer received a dense edge outside the MoE witness");
+            }
+        }
         const bool fused_query_gate = query_gate != nullptr;
         const SemanticOperator* query_projection = fused_query_gate ? query_gate : query;
         const SemanticOperator* rope = nullptr;
@@ -2062,11 +2672,17 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         if (layer.first_operator > model.operators.size() || layer.operator_count > model.operators.size() - layer.first_operator) {
             return metal_error(CompatibilityError::IR_REFERENCE_INVALID);
         }
-        for (uint32_t index = 0; index != layer.operator_count; ++index) {
-            const SemanticOperator& op = model.operators[layer.first_operator + index];
-            if (op.kind == OperatorKind::Rope) rope = rope ? nullptr : &op;
-            if (op.kind == OperatorKind::CausalAttention) attention = attention ? nullptr : &op;
-            if (op.kind == OperatorKind::SwiGlu) swiglu = swiglu ? nullptr : &op;
+        if (is_moe) {
+            rope = moe_edges.rope;
+            attention = moe_edges.attention;
+            swiglu = moe_edges.swiglu;
+        } else {
+            for (uint32_t index = 0; index != layer.operator_count; ++index) {
+                const SemanticOperator& op = model.operators[layer.first_operator + index];
+                if (op.kind == OperatorKind::Rope) rope = rope ? nullptr : &op;
+                if (op.kind == OperatorKind::CausalAttention) attention = attention ? nullptr : &op;
+                if (op.kind == OperatorKind::SwiGlu) swiglu = swiglu ? nullptr : &op;
+            }
         }
         const auto* rope_payload = rope ? std::get_if<RopePayload>(&rope->payload) : nullptr;
         const auto* attention_payload = attention ? std::get_if<CausalAttentionPayload>(&attention->payload) : nullptr;
@@ -2081,18 +2697,33 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         float key_norm_epsilon = 0.0f;
         float rope_base = 0.0f;
         float rope_scale = 0.0f;
+        float attention_scale = 0.0f;
+        const uint32_t rope_frequency_dimension = rope_payload
+            ? (rope_payload->frequency_dimension == 0
+                ? rope_payload->rotary_dimension : rope_payload->frequency_dimension)
+            : 0;
         const bool multi_section_rope = rope_payload && rope_payload->pairing == RopePairing::MultiSectionHalfSplit;
         if (!swiglu_payload || swiglu_payload->activation != ActivationKind::Silu) {
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "canonical dense pattern requires SiLU SwiGLU");
         }
-        if (!attention_payload || attention_payload->mask != AttentionMask::Causal ||
+        if (!attention || !attention_payload || attention_payload->mask != AttentionMask::Causal ||
             attention_payload->cache_policy != CachePolicy::Global) {
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "canonical dense pattern requires global causal attention");
         }
-        const bool owns_kv = owns_fp32_global_kv(model, *attention, attention_payload->kv_heads,
-                                                  attention_payload->head_dimension);
+        if (attention_payload->value_source == ValueSource::SeparateProjection && !value) {
+            return dense_role_error("ValueWeight");
+        }
+        if (attention_payload->value_source != ValueSource::SeparateProjection) {
+            return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
+                               "canonical attention value source requires a separate projection");
+        }
+        uint32_t key_state_id = UINT32_MAX;
+        uint32_t value_state_id = UINT32_MAX;
+        const bool owns_kv = owns_fp32_global_kv(
+            model, *attention, attention_payload->kv_heads,
+            attention_payload->head_dimension, &key_state_id, &value_state_id);
         if (!owns_kv) {
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "canonical dense pattern requires one FP32 key/value state pair");
@@ -2103,11 +2734,21 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
             ((query_norm == nullptr) != (key_norm == nullptr)) ||
             (query_norm && (!query_norm_payload || !key_norm_payload ||
                             !f32_bits(query_norm_payload->epsilon_f32_bits, query_norm_epsilon) ||
-                            !f32_bits(key_norm_payload->epsilon_f32_bits, key_norm_epsilon))) ||
+                            query_norm_epsilon < 0.0f ||
+                            !f32_bits(key_norm_payload->epsilon_f32_bits, key_norm_epsilon) ||
+                            key_norm_epsilon < 0.0f)) ||
             attn_rms->epsilon_f32_bits != ffn_rms->epsilon_f32_bits ||
-            !output_width(model, *ffn_gate, inter) || !f32_bits(attn_rms->epsilon_f32_bits, epsilon) ||
-            !f32_bits(rope_payload->base_f32_bits, rope_base) || !f32_bits(rope_payload->scale_f32_bits, rope_scale) ||
+            !output_width(model, *ffn_gate, inter) ||
+            !f32_bits(attn_rms->epsilon_f32_bits, epsilon) || epsilon < 0.0f ||
+            !f32_bits(rope_payload->base_f32_bits, rope_base) || rope_base <= 0.0f ||
+            !f32_bits(rope_payload->scale_f32_bits, rope_scale) || rope_scale <= 0.0f ||
+            !f32_bits(attention_payload->scale_f32_bits, attention_scale) || attention_scale <= 0.0f ||
             rope_scale != 1.0f || attention_payload->head_dimension == 0 ||
+            rope_payload->rotary_dimension == 0 ||
+            rope_payload->rotary_dimension > attention_payload->head_dimension ||
+            (rope_payload->rotary_dimension % 2) != 0 ||
+            rope_frequency_dimension < rope_payload->rotary_dimension ||
+            (rope_frequency_dimension % 2) != 0 || rope_frequency_dimension > INT_MAX ||
             attention_payload->query_heads > INT_MAX || attention_payload->kv_heads > INT_MAX ||
             attention_payload->head_dimension > INT_MAX || inter > INT_MAX || impl->hidden > INT_MAX) {
             return metal_error(CompatibilityError::IR_REFERENCE_INVALID);
@@ -2135,13 +2776,36 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
                                     TensorRole::AttentionQueryNormWeight, dense.query_norm, true) ||
                             !assign(*key_norm,
                                     TensorRole::AttentionKeyNormWeight, dense.key_norm, true))) ||
-            !assign(*value, TensorRole::ValueWeight, dense.value, true) ||
-            !assign(*value, TensorRole::ValueBias, dense.value_bias, false) ||
+            (value && !assign(*value, TensorRole::ValueWeight, dense.value, true)) ||
+            (value && !assign(*value, TensorRole::ValueBias, dense.value_bias, false)) ||
             !assign(*attention_output, TensorRole::AttentionOutputWeight, dense.attention_output, true) ||
             !assign(*ffn_norm, TensorRole::FfnNormWeight, dense.ffn_norm, true) ||
             !assign(*ffn_gate, TensorRole::FfnGateWeight, dense.ffn_gate, true) ||
             !assign(*ffn_up, TensorRole::FfnUpWeight, dense.ffn_up, true) ||
             !assign(*ffn_down, TensorRole::FfnDownWeight, dense.ffn_down, true)) {
+            return assignment_error();
+        }
+        if (is_moe &&
+            (!assign_single(*moe_router, dense.moe_gate) ||
+             !assign(*moe_edges.router_scale, TensorRole::NextnEmbeddingNormWeight,
+                     dense.moe_gate_scale, true, false) ||
+             !assign(*moe_norm, TensorRole::NextnEmbeddingNormWeight, dense.moe_pre_norm, true, false) ||
+             !assign(*moe_up, TensorRole::FfnUpWeight, dense.moe_up, true, true) ||
+             !assign(*moe_down, TensorRole::FfnDownWeight, dense.moe_down, true, true) ||
+             !assign(*moe_edges.expert_reduce, TensorRole::NextnEmbeddingNormWeight,
+                     dense.moe_down_scale, true, false) ||
+             (moe_edges.dense_post_norm &&
+              !assign(*moe_edges.dense_post_norm, TensorRole::NextnEmbeddingNormWeight,
+                      dense.post_ffw_1, true, false)) ||
+             (moe_edges.moe_post_norm &&
+              !assign(*moe_edges.moe_post_norm, TensorRole::NextnEmbeddingNormWeight,
+                      dense.post_ffw_2, true, false)) ||
+             (moe_edges.output_post_norm &&
+              !assign(*moe_edges.output_post_norm, TensorRole::NextnEmbeddingNormWeight,
+                      dense.post_ffw, true, false)) ||
+             (moe_edges.output_scale &&
+              !assign(*moe_edges.output_scale, TensorRole::NextnEmbeddingNormWeight,
+                      dense.out_scale, true, false)))) {
             return assignment_error();
         }
         CanonicalSparseFfnPolicy layer_sparse_ffn;
@@ -2192,13 +2856,34 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         dense.metal.attn_k_bias = dense.key_bias.data ? &dense.key_bias : nullptr;
         dense.metal.q_norm = dense.query_norm.data ? &dense.query_norm : nullptr;
         dense.metal.k_norm = dense.key_norm.data ? &dense.key_norm : nullptr;
-        dense.metal.attn_v = &dense.value;
+        dense.metal.attn_v = dense.value.data ? &dense.value : nullptr;
         dense.metal.attn_v_bias = dense.value_bias.data ? &dense.value_bias : nullptr;
         dense.metal.attn_o = &dense.attention_output;
         dense.metal.ffn_norm = &dense.ffn_norm;
         dense.metal.ffn_gate = &dense.ffn_gate;
         dense.metal.ffn_up = &dense.ffn_up;
         dense.metal.ffn_down = &dense.ffn_down;
+        if (is_moe) {
+            dense.metal.moe_gate = &dense.moe_gate;
+            dense.metal.moe_gate_scale = &dense.moe_gate_scale;
+            dense.metal.moe_up = &dense.moe_up;
+            dense.metal.moe_dn = &dense.moe_down;
+            dense.metal.moe_dn_scale = &dense.moe_down_scale;
+            dense.metal.pre_ffw_2 = &dense.moe_pre_norm;
+            dense.metal.post_ffw_1 = dense.post_ffw_1.data ? &dense.post_ffw_1 : nullptr;
+            dense.metal.post_ffw_2 = dense.post_ffw_2.data ? &dense.post_ffw_2 : nullptr;
+            dense.metal.post_ffw = dense.post_ffw.data ? &dense.post_ffw : nullptr;
+            dense.metal.out_scale = dense.out_scale.data ? &dense.out_scale : nullptr;
+            dense.metal.exp_inter = static_cast<int>(moe_intermediate);
+            dense.metal.n_used = static_cast<int>(moe_payload->selected_count);
+            dense.metal.n_experts = static_cast<int>(moe_payload->expert_count);
+            dense.metal.moe_router_normalization_scale_bits =
+                moe_edges.router_normalization_scale_bits;
+            impl->moe_exp_intermediate = std::max(impl->moe_exp_intermediate, moe_intermediate);
+            impl->moe_selected_experts = std::max(impl->moe_selected_experts, moe_payload->selected_count);
+            impl->moe_experts = std::max(impl->moe_experts, moe_payload->expert_count);
+            impl->has_moe = true;
+        }
         if (ffn_norm->outputs.size() != 1 || !swiglu || swiglu->outputs.size() != 1) {
             return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
                                "canonical dense FFN calibration edges are invalid");
@@ -2234,7 +2919,9 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         dense.metal.Hk = static_cast<int>(attention_payload->kv_heads);
         dense.metal.Dh = static_cast<int>(attention_payload->head_dimension);
         dense.metal.rope_dim = static_cast<int>(rope_payload->rotary_dimension);
+        dense.metal.rope_frequency_dimension = static_cast<int>(rope_frequency_dimension);
         dense.metal.rope_base = rope_base;
+        dense.metal.attention_scale = attention_scale;
         dense.metal.rope_interleaved = rope_payload->pairing == RopePairing::Interleaved;
         dense.metal.rope_multi_section = multi_section_rope;
         std::copy(rope_payload->position_sections.begin(), rope_payload->position_sections.end(),
@@ -2243,24 +2930,44 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         dense.metal.rms_eps = epsilon;
         dense.metal.q_norm_eps = query_norm_epsilon;
         dense.metal.k_norm_eps = key_norm_epsilon;
-        dense.metal.cache_id = static_cast<int>(layer.layer_index);
         dense.metal.window = kMetalUnboundedAttentionWindow;
         dense.metal.swiglu = swiglu_payload->activation == ActivationKind::Silu;
+        dense.metal.key_state_alias = false;
+        dense.metal.moe_gelu_tanh = is_moe && moe_edges.activation == ActivationKind::GeluTanh;
+        dense.metal.moe_reduce_left_to_right =
+            is_moe && moe_edges.expert_reduce != nullptr;
         dense.metal.owns_kv = owns_kv;
         dense.metal.is_global = attention_payload->cache_policy == CachePolicy::Global;
         dense.operator_id = attention->id;
-        if (impl->attention_head_dimension == 0) {
-            impl->attention_query_heads = attention_payload->query_heads;
-            impl->attention_kv_heads = attention_payload->kv_heads;
-            impl->attention_head_dimension = attention_payload->head_dimension;
-        }
         const uint64_t query_width = static_cast<uint64_t>(attention_payload->query_heads) *
                                      attention_payload->head_dimension;
+        const uint64_t key_value_width = static_cast<uint64_t>(attention_payload->kv_heads) *
+                                         attention_payload->head_dimension;
         const uint64_t query_workspace = fused_query_gate ? 2 * query_width : query_width;
-        if (query_workspace > INT_MAX) {
+        if (query_workspace > INT_MAX || key_value_width > INT_MAX) {
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
-                               "canonical Metal query workspace exceeds the admitted token buffer");
+                               "canonical Metal attention geometry exceeds the admitted token buffer");
         }
+        if (std::find(claimed_attention_states.begin(), claimed_attention_states.end(),
+                      key_state_id) != claimed_attention_states.end() ||
+            std::find(claimed_attention_states.begin(), claimed_attention_states.end(),
+                      value_state_id) != claimed_attention_states.end()) {
+            return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
+                               "canonical Metal attention state is owned by more than one layer");
+        }
+        if (impl->attention_key_value_width_sum > UINT64_MAX - key_value_width) {
+            return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
+                               "canonical Metal attention cache geometry overflows");
+        }
+        dense.metal.cache_width_offset = impl->attention_key_value_width_sum;
+        impl->attention_key_value_width_sum += key_value_width;
+        claimed_attention_states.push_back(key_state_id);
+        claimed_attention_states.push_back(value_state_id);
+        impl->has_attention = true;
+        impl->attention_query_capacity = std::max(
+            impl->attention_query_capacity, static_cast<uint32_t>(query_width));
+        impl->attention_key_value_capacity = std::max(
+            impl->attention_key_value_capacity, static_cast<uint32_t>(key_value_width));
         impl->token_intermediate = std::max(impl->token_intermediate,
                                              std::max(dense.metal.sparse_ffn_dense_oracle
                                                           ? inter
@@ -2272,28 +2979,18 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
                            "canonical Metal sparse FFN layer mask is not executable");
     }
-    if (impl->attention_head_dimension == 0 || impl->token_intermediate == 0) {
+    if ((!impl->has_attention && !impl->has_recurrent) || impl->token_intermediate == 0) {
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
-                           "canonical Metal requires an admitted attention geometry");
+                           "canonical Metal requires an admitted token workspace geometry");
     }
 
-    const SemanticOperator* final_norm = nullptr;
-    const SemanticOperator* output = nullptr;
-    auto is_speculative_operator = [&](uint32_t operator_id) {
-        for (const SemanticLayer& layer : model.layers) {
-            if ((layer.flags & kSemanticLayerFlagSpeculative) == 0) continue;
-            if (operator_id >= layer.first_operator && operator_id < layer.first_operator + layer.operator_count) return true;
-        }
-        return false;
-    };
-    for (const SemanticOperator& op : model.operators) {
-        if (is_speculative_operator(op.id)) continue;
-        if (op.kind == OperatorKind::RmsNorm && tensor_with_role(model, op, TensorRole::FinalNormWeight)) final_norm = final_norm ? nullptr : &op;
-        if (op.kind == OperatorKind::Linear && tensor_with_role(model, op, TensorRole::OutputWeight)) output = output ? nullptr : &op;
-    }
+    const SemanticOperator* final_norm =
+        &model.operators[lowering_program.final_norm_operator_id];
+    const SemanticOperator* output = &model.operators[lowering_program.output_operator_id];
     const auto* final_payload = final_norm ? std::get_if<RmsNormPayload>(&final_norm->payload) : nullptr;
     float final_epsilon = 0.0f;
-    if (!final_norm || !output || !final_payload || !f32_bits(final_payload->epsilon_f32_bits, final_epsilon) ||
+    if (!final_norm || !output || !final_payload ||
+        !f32_bits(final_payload->epsilon_f32_bits, final_epsilon) || final_epsilon < 0.0f ||
         !assign(*final_norm, TensorRole::FinalNormWeight, impl->final_norm, true) ||
         !assign(*output, TensorRole::OutputWeight, impl->output, true)) {
         return assignment_error();
@@ -2312,6 +3009,41 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
     }
     metal_tok_session_enable_error_diagnostics(*impl->metal_session,
                                                derived_iq2_xxs.enable_metal_error_diagnostics);
+    uint32_t column_grouped_affine_u2_resources = 0;
+    for (uint32_t tensor_id : used_tensor_ids) {
+        if (tensor_id >= model.tensors.size()) {
+            return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
+                               "canonical Metal referenced tensor ID is invalid");
+        }
+        const SemanticTensor& semantic = model.tensors[tensor_id];
+        if (semantic.layout.kind != PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip)
+            continue;
+        Tensor resource;
+        if (!column_grouped_affine_u2_skip_256_tensor_view(*impl->package, semantic,
+                                                           resource) ||
+            !metal_tok_session_register_column_grouped_affine_u2_skip_256(
+                *impl->metal_session, resource)) {
+            return metal_error(
+                CompatibilityError::SESSION_CONSTRUCTION_FAILED,
+                "canonical Metal column-grouped UInt2 resource construction failed for tensor " +
+                    std::to_string(tensor_id));
+        }
+        ++column_grouped_affine_u2_resources;
+    }
+    if (impl->derived_column_grouped_u2) {
+        for (const ColumnGroupedU2AtlasEntry& entry :
+             impl->derived_column_grouped_u2->entries()) {
+            const Tensor resource = derived_column_grouped_u2_tensor(entry);
+            if (!metal_tok_session_register_column_grouped_affine_u2_skip_256(
+                    *impl->metal_session, resource)) {
+                return metal_error(
+                    CompatibilityError::SESSION_CONSTRUCTION_FAILED,
+                    "canonical Metal derived column-grouped UInt2 resource construction failed for tensor " +
+                        std::to_string(entry.binding_id));
+            }
+            ++column_grouped_affine_u2_resources;
+        }
+    }
     if (!impl->calibration_widths.empty() &&
         !metal_tok_session_set_importance_slots(*impl->metal_session,
                                                 impl->calibration_widths.data(),
@@ -2365,28 +3097,42 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
     capabilities.metal_device = true;
     capabilities.metal_library = true;
     capabilities.metal_pipeline = true;
-    SessionRequest request;
-    request.max_context = maximum_context;
-    request.max_batch = 2;
-    request.memory_limit = UINT64_MAX;
-    request.enable_prefill = true;
-    request.enable_decode = true;
-    request.minimum_class = NumericalClass::ExactFp32;
+    capabilities.metal_affine_u2_256 = metal_tok_session_affine_u2_256_ready(*impl->metal_session);
+    capabilities.metal_column_grouped_affine_u2_skip_256 =
+        metal_tok_session_column_grouped_affine_u2_skip_256_ready(*impl->metal_session);
+    if (column_grouped_affine_u2_resources != 0 &&
+        !capabilities.metal_column_grouped_affine_u2_skip_256) {
+        return metal_error(CompatibilityError::CAPABILITY_MISSING,
+                           "canonical Metal column-grouped UInt2 pipelines are unavailable");
+    }
+    const MetalTokMoeCapabilities moe_capabilities =
+        metal_tok_session_moe_capabilities(*impl->metal_session);
+    capabilities.metal_moe_router_topk = moe_capabilities.router_topk;
+    capabilities.metal_moe_gate_up = moe_capabilities.gate_up_q4_k;
+    capabilities.metal_moe_down_q5_0 = moe_capabilities.down_q5_0;
+    capabilities.metal_moe_down_q8_0 = moe_capabilities.down_q8_0;
+    capabilities.metal_moe_reduce = moe_capabilities.reduce;
     SemanticModel execution_model = model;
     if (!rewrite_derived_semantics(execution_model, impl->derived_q2) ||
-        !rewrite_derived_semantics(execution_model, impl->derived_iq2_xxs)) {
+        !rewrite_derived_semantics(execution_model, impl->derived_iq2_xxs) ||
+        !rewrite_derived_semantics(execution_model,
+                                   impl->derived_column_grouped_u2)) {
         return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
                            "canonical Metal could not bind derived quantization semantics");
     }
     PlanResult planned = plan_canonical_metal(execution_model, request, capabilities,
                                               builtin_canonical_metal_registry());
-    if (const auto* plan = std::get_if<ExecutionPlan>(&planned)) {
-        impl->prefill_batch = impl->sparse_ffn_layers == 0 && !plan->entries.empty() && std::all_of(
-            plan->entries.begin(), plan->entries.end(), [](const PlanEntry& entry) {
-                return entry.phase != ExecutionPhase::Prefill ||
-                       entry.descriptor.implementation == KernelImplementation::MetalDensePrefillBatch;
-            });
+    if (const auto* report = std::get_if<CompatibilityReport>(&planned)) return *report;
+    const auto& selected_plan = std::get<ExecutionPlan>(planned);
+    if (selected_plan.program != lowering_program) {
+        return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
+                           "canonical Metal plan and lowerer program witnesses differ");
     }
+    impl->prefill_batch = impl->sparse_ffn_layers == 0 && !selected_plan.entries.empty() && std::all_of(
+        selected_plan.entries.begin(), selected_plan.entries.end(), [](const PlanEntry& entry) {
+            return entry.phase != ExecutionPhase::Prefill ||
+                   entry.descriptor.implementation == KernelImplementation::MetalDensePrefillBatch;
+        });
     if (impl->prefill_batch) {
         SessionRequest token_request = request;
         token_request.max_batch = 1;
@@ -2396,11 +3142,7 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         impl->plan = std::get<ExecutionPlan>(planned);
         impl->token_plan = std::get<ExecutionPlan>(token_planned);
     } else {
-        request.max_batch = 1;
-        planned = plan_canonical_metal(execution_model, request, capabilities,
-                                      builtin_canonical_metal_registry());
-        if (const auto* report = std::get_if<CompatibilityReport>(&planned)) return *report;
-        impl->plan = std::get<ExecutionPlan>(planned);
+        impl->plan = selected_plan;
         impl->token_plan = impl->plan;
     }
     const MetalResourceSnapshot before_source =
@@ -2415,6 +3157,11 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
     }
     for (const DerivedIQ2XXSEntry& entry : impl->derived_iq2_xxs.entries)
         replaced_tensor_ids.push_back(entry.tensor_id);
+    if (impl->derived_column_grouped_u2) {
+        for (const ColumnGroupedU2AtlasEntry& entry :
+             impl->derived_column_grouped_u2->entries())
+            replaced_tensor_ids.push_back(entry.binding_id);
+    }
     if (!replaced_tensor_ids.empty()) {
         std::vector<RetainedArtifactRange> retained;
         if (!collect_retained_artifact_ranges(*impl->package, model, used_tensor_ids, replaced_tensor_ids,
@@ -2472,6 +3219,19 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
         impl->registered_artifact_bases.push_back(impl->derived_iq2_xxs.mapping.get());
         impl->derived_iq2_xxs_registered = impl->derived_iq2_xxs.mapped_length;
     }
+    if (impl->derived_column_grouped_u2) {
+        if (!metal_tok_session_register_weights(
+                *impl->metal_session, impl->derived_column_grouped_u2->data(),
+                impl->derived_column_grouped_u2->mapped_bytes())) {
+            return metal_error(
+                CompatibilityError::SESSION_CONSTRUCTION_FAILED,
+                "canonical Metal could not register the derived column-grouped UInt2 atlas");
+        }
+        impl->registered_artifact_bases.push_back(
+            impl->derived_column_grouped_u2->data());
+        impl->derived_column_grouped_u2_registered =
+            impl->derived_column_grouped_u2->mapped_bytes();
+    }
     const MetalResourceSnapshot after_atlas =
         metal_tok_session_resource_snapshot(*impl->metal_session);
     impl->resource_diagnostics.after_atlas_registration = after_atlas.current_allocated_size;
@@ -2515,18 +3275,58 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
                                    std::to_string(entry.tensor_id) + " is not covered exactly once");
             }
         }
-        metal_tok_session_require_registered_weights(*impl->metal_session, true);
+        if (impl->derived_column_grouped_u2) {
+            for (const ColumnGroupedU2AtlasEntry& entry :
+                 impl->derived_column_grouped_u2->entries()) {
+                const Tensor tensor = derived_column_grouped_u2_tensor(entry);
+                const struct {
+                    const uint8_t* data;
+                    uint64_t bytes;
+                    const char* name;
+                } planes[] = {
+                    {tensor.data, tensor.data_bytes, "values"},
+                    {tensor.scales, tensor.scale_bytes, "scales"},
+                    {tensor.biases, tensor.bias_bytes, "biases"},
+                };
+                for (const auto& plane : planes) {
+                    if (plane.bytes > SIZE_MAX ||
+                        metal_tok_session_weight_span_coverage(
+                            *impl->metal_session, plane.data,
+                            static_cast<size_t>(plane.bytes)) != 1) {
+                        return metal_error(
+                            CompatibilityError::SESSION_CONSTRUCTION_FAILED,
+                            "canonical Metal derived column-grouped UInt2 tensor " +
+                                std::to_string(entry.binding_id) + " " + plane.name +
+                                " plane is not covered exactly once");
+                    }
+                }
+            }
+        }
     }
-    if (impl->prefill_batch)
-        metal_tok_session_require_registered_weights(*impl->metal_session, true);
+    // Every externally constructible canonical session is strict about weight
+    // residency.  Product execution must fail at construction or binding if a
+    // tensor is not covered; it must never create an implicit per-dispatch copy.
+    metal_tok_session_require_registered_weights(*impl->metal_session, true);
     impl->resource_diagnostics.after_session_construction =
         metal_tok_session_resource_snapshot(*impl->metal_session).current_allocated_size;
     impl->resource_diagnostics.registered_source_bytes = impl->original_source_registered;
-    impl->resource_diagnostics.excluded_replaced_bytes = impl->derived_iq2_xxs.source_bytes;
+    const uint64_t column_u2_source_bytes = impl->derived_column_grouped_u2
+        ? impl->derived_column_grouped_u2->source_bytes() : 0;
+    if (impl->derived_iq2_xxs.source_bytes > UINT64_MAX - column_u2_source_bytes ||
+        impl->derived_iq2_xxs_registered > UINT64_MAX -
+            impl->derived_column_grouped_u2_registered) {
+        return metal_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED,
+                           "canonical Metal derived atlas diagnostics overflow");
+    }
+    impl->resource_diagnostics.excluded_replaced_bytes =
+        impl->derived_iq2_xxs.source_bytes + column_u2_source_bytes;
     impl->resource_diagnostics.retained_boundary_bytes = impl->retained_boundary;
-    impl->resource_diagnostics.atlas_bytes = impl->derived_iq2_xxs_registered;
-    const uint64_t unique_registered = impl->original_source_registered + impl->derived_q2_registered +
-                                       impl->derived_iq2_xxs_registered;
+    impl->resource_diagnostics.atlas_bytes =
+        impl->derived_iq2_xxs_registered +
+        impl->derived_column_grouped_u2_registered;
+    const uint64_t unique_registered = impl->original_source_registered +
+        impl->derived_q2_registered + impl->derived_iq2_xxs_registered +
+        impl->derived_column_grouped_u2_registered;
     impl->resource_diagnostics.registration_overlap_bytes =
         after_atlas.registered_weight_bytes > unique_registered
             ? after_atlas.registered_weight_bytes - unique_registered : 0;
@@ -2534,46 +3334,116 @@ CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const 
 }
 
 CanonicalMetalCreateResult create_canonical_metal_program(
-    std::shared_ptr<const RuntimePackage> package, uint32_t maximum_context) {
-    return create_canonical_metal_program(std::move(package), maximum_context, {}, {}, {}, {});
+    std::shared_ptr<const RuntimePackage> package, const SessionRequest& request,
+    const CanonicalDerivedQ2KPolicy& derived_q2,
+    const CanonicalSparseFfnPolicy& sparse_ffn,
+    const CanonicalDerivedIQ2XXSPolicy& derived_iq2_xxs,
+    const CanonicalCalibrationPolicy& calibration,
+    const CanonicalDerivedColumnGroupedU2Policy& derived_column_u2) {
+    if (!package || !package->product_authoritative()) {
+        return metal_error(CompatibilityError::PACKAGE_AUTHORITY_REQUIRED,
+                           "canonical Metal product construction requires a closed authoritative package");
+    }
+    bool unqualified_transform =
+        !derived_q2.tensor_roles.empty() ||
+        derived_q2.register_retained_source_ranges_for_testing ||
+        !sparse_ffn.runs.empty() || !sparse_ffn.layer_masks.empty() ||
+        sparse_ffn.proxy_selected_blocks != 0 ||
+        sparse_ffn.dense_oracle_selected_blocks != 0 ||
+        !derived_iq2_xxs.tensor_roles.empty() ||
+        derived_iq2_xxs.calibration_cache != nullptr ||
+        derived_iq2_xxs.enable_metal_error_diagnostics ||
+        !calibration.targets.empty() ||
+        !derived_column_u2.tensor_roles.empty() ||
+        derived_column_u2.calibration_cache != nullptr;
+#if defined(LAPLACE_METAL_TESTING)
+    unqualified_transform = unqualified_transform ||
+                            derived_iq2_xxs.zero_fill_for_testing ||
+                            derived_column_u2.uniform_importance_for_testing;
+#endif
+    if (unqualified_transform) {
+        return metal_error(
+            CompatibilityError::PACKAGE_AUTHORITY_REQUIRED,
+            "runtime transform or calibration policy requires an authoritative transform certificate");
+    }
+    return create_canonical_metal_program_internal(std::move(package), request, derived_q2,
+                                                   sparse_ffn, derived_iq2_xxs, calibration,
+                                                   derived_column_u2);
 }
+
+#if defined(LAPLACE_QUALIFICATION_RUNTIME) || defined(LAPLACE_METAL_TESTING)
+CanonicalMetalCreateResult create_qualification_canonical_metal_program(
+    std::shared_ptr<const RuntimePackage> package, uint32_t maximum_context,
+    const CanonicalDerivedQ2KPolicy& derived_q2,
+    const CanonicalSparseFfnPolicy& sparse_ffn,
+    const CanonicalDerivedIQ2XXSPolicy& derived_iq2_xxs,
+    const CanonicalCalibrationPolicy& calibration,
+    uint32_t maximum_batch_rows,
+    const CanonicalDerivedColumnGroupedU2Policy& derived_column_u2) {
+    SessionRequest request;
+    request.max_context = maximum_context;
+    request.max_batch = maximum_batch_rows;
+    request.memory_limit = UINT64_MAX;
+    request.enable_prefill = true;
+    request.enable_decode = true;
+    request.minimum_class = NumericalClass::ExactFp32;
+    request.objective = RuntimeObjective::Latency;
+    return create_canonical_metal_program_internal(std::move(package), request, derived_q2,
+                                                   sparse_ffn, derived_iq2_xxs, calibration,
+                                                   derived_column_u2);
+}
+#endif
 
 CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> token_ids,
                                                    ExecutionPhase phase,
-                                                   bool produce_logits) {
-    if (!impl_ || token_ids.empty() || token_ids.size() > impl_->maximum_context - impl_->position) {
+                                                   OutputMode output_mode) {
+    const bool produce_logits = output_mode == OutputMode::Logits;
+    const bool produce_sample = output_mode == OutputMode::GreedySample;
+    if (!impl_ || token_ids.empty() ||
+        token_ids.size() > impl_->maximum_context - impl_->position) {
         return metal_error(CompatibilityError::PLAN_CONTEXT_EXCEEDED);
     }
-    if (!produce_logits && (token_ids.size() != 1 || impl_->calibration.empty())) {
+    if ((phase == ExecutionPhase::Prefill && !impl_->enable_prefill) ||
+        (phase == ExecutionPhase::Decode && !impl_->enable_decode)) {
+        return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
+                           "canonical Metal execution phase was not admitted by the session request");
+    }
+    if (output_mode == OutputMode::None &&
+        (token_ids.size() != 1 ||
+         (phase != ExecutionPhase::Prefill && impl_->calibration.empty()))) {
         return metal_error(CompatibilityError::RUNTIME_INPUT_INVALID,
-                           "canonical calibration requires one token and configured targets");
+                           "canonical state-only execution requires one prefill token or configured calibration");
     }
     if (impl_->has_recurrent && token_ids.size() > 1) {
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                            "canonical Metal recurrent prefill requires explicit candidate-state chaining");
     }
     if (impl_->prefill_batch && phase == ExecutionPhase::Prefill &&
-        (token_ids.size() > 2 || (token_ids.size() == 2 && impl_->position != 0))) {
+        (token_ids.size() > impl_->maximum_batch_rows || token_ids.size() > 2 ||
+         (token_ids.size() == 2 && impl_->position != 0))) {
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                            "canonical Metal F16 prefill batch is exactly two initial tokens");
     }
     CanonicalMetalOutput output;
     if (produce_logits) output.logits.resize(impl_->vocabulary);
+    MetalSamplerResult sampled_result;
     uint32_t next_position = impl_->position;
     if (impl_->prefill_batch && phase == ExecutionPhase::Prefill && token_ids.size() == 2) {
         if (token_ids[0] >= impl_->vocabulary || token_ids[1] >= impl_->vocabulary ||
-            !metal_tok_session_begin_prefill_batch(
+            !metal_tok_session_begin_prefill_batch_with_attention_capacity(
                 *impl_->metal_session, static_cast<int>(impl_->hidden),
                 static_cast<int>(impl_->token_intermediate), 0, 0, 0,
-                static_cast<int>(impl_->attention_query_heads),
-                static_cast<int>(impl_->attention_kv_heads),
-                static_cast<int>(impl_->attention_head_dimension),
+                MetalTokAttentionCapacity{
+                    static_cast<int>(impl_->attention_query_capacity),
+                    static_cast<int>(impl_->attention_key_value_capacity),
+                    impl_->attention_key_value_width_sum},
                 static_cast<int>(impl_->maximum_context), static_cast<int>(impl_->layers.size()),
                 static_cast<int>(next_position), 2) ||
             !metal_tok_session_upload_embeddings_batch(*impl_->metal_session, impl_->embedding,
                                                        token_ids.data(), 2,
                                                        static_cast<int>(impl_->hidden),
-                                                       static_cast<int>(impl_->vocabulary))) {
+                                                       static_cast<int>(impl_->vocabulary),
+                                                       impl_->embedding_scale)) {
             metal_tok_session_abort(*impl_->metal_session);
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "canonical Metal F16 prefill batch submission failed");
@@ -2598,10 +3468,22 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
                 return report;
             }
         }
-        if (!metal_tok_session_select_prefill_batch_row(*impl_->metal_session, 1) ||
-            !metal_tok_session_final(*impl_->metal_session, impl_->final_norm, impl_->output,
-                                     output.logits.data(), static_cast<int>(impl_->hidden),
-                                     static_cast<int>(impl_->vocabulary), impl_->final_epsilon)) {
+        const bool row_selected = metal_tok_session_select_prefill_batch_row(
+            *impl_->metal_session, 1);
+        const bool finalized = row_selected &&
+            (produce_sample
+                 ? metal_tok_session_final_sampled(
+                       *impl_->metal_session, impl_->final_norm, impl_->output,
+                       MetalSamplerDescriptor{}, &sampled_result,
+                       static_cast<int>(impl_->hidden),
+                       static_cast<int>(impl_->vocabulary), impl_->final_epsilon)
+                 : produce_logits
+                       ? metal_tok_session_final(
+                             *impl_->metal_session, impl_->final_norm, impl_->output,
+                             output.logits.data(), static_cast<int>(impl_->hidden),
+                             static_cast<int>(impl_->vocabulary), impl_->final_epsilon)
+                       : metal_tok_session_commit_token(*impl_->metal_session));
+        if (!finalized) {
             const char* failure = metal_tok_session_last_failure(*impl_->metal_session);
             metal_tok_session_abort(*impl_->metal_session);
             std::string detail = "canonical Metal F16 prefill batch final output did not complete";
@@ -2612,26 +3494,60 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
     } else {
     const ExecutionPlan& active_plan =
         impl_->prefill_batch && phase == ExecutionPhase::Prefill ? impl_->token_plan : impl_->plan;
+    const MetalTokAttentionCapacity attention_capacity{
+        static_cast<int>(impl_->attention_query_capacity),
+        static_cast<int>(impl_->attention_key_value_capacity),
+        impl_->attention_key_value_width_sum};
+    const auto begin_first_token = [&]() {
+        if (impl_->has_attention) {
+            return metal_tok_session_begin_with_attention_capacity(
+                *impl_->metal_session, static_cast<int>(impl_->hidden),
+                static_cast<int>(impl_->token_intermediate),
+                static_cast<int>(impl_->moe_exp_intermediate),
+                static_cast<int>(impl_->moe_selected_experts),
+                static_cast<int>(impl_->moe_experts), attention_capacity,
+                static_cast<int>(impl_->maximum_context),
+                static_cast<int>(impl_->layers.size()), static_cast<int>(next_position),
+                static_cast<uint32_t>(token_ids.size()));
+        }
+        return metal_tok_session_begin(
+            *impl_->metal_session, static_cast<int>(impl_->hidden),
+            static_cast<int>(impl_->token_intermediate),
+            static_cast<int>(impl_->moe_exp_intermediate),
+            static_cast<int>(impl_->moe_selected_experts),
+            static_cast<int>(impl_->moe_experts), 0, 0, 0,
+            static_cast<int>(impl_->maximum_context),
+            static_cast<int>(impl_->layers.size()), static_cast<int>(next_position),
+            static_cast<uint32_t>(token_ids.size()));
+    };
+    const auto begin_continuing_token = [&]() {
+        if (impl_->has_attention) {
+            return metal_tok_session_begin_continuing_with_attention_capacity(
+                *impl_->metal_session, static_cast<int>(impl_->hidden),
+                static_cast<int>(impl_->token_intermediate),
+                static_cast<int>(impl_->moe_exp_intermediate),
+                static_cast<int>(impl_->moe_selected_experts),
+                static_cast<int>(impl_->moe_experts), attention_capacity,
+                static_cast<int>(impl_->maximum_context),
+                static_cast<int>(impl_->layers.size()), static_cast<int>(next_position));
+        }
+        return metal_tok_session_begin_continuing(
+            *impl_->metal_session, static_cast<int>(impl_->hidden),
+            static_cast<int>(impl_->token_intermediate),
+            static_cast<int>(impl_->moe_exp_intermediate),
+            static_cast<int>(impl_->moe_selected_experts),
+            static_cast<int>(impl_->moe_experts), 0, 0, 0,
+            static_cast<int>(impl_->maximum_context),
+            static_cast<int>(impl_->layers.size()), static_cast<int>(next_position));
+    };
     for (size_t index = 0; index != token_ids.size(); ++index) {
         const uint32_t token = token_ids[index];
         const bool final_token = index + 1 == token_ids.size();
         if (token >= impl_->vocabulary ||
-            !(index == 0
-                  ? metal_tok_session_begin(*impl_->metal_session, static_cast<int>(impl_->hidden), static_cast<int>(impl_->token_intermediate),
-                                            0, 0, 0,
-                                            static_cast<int>(impl_->attention_query_heads), static_cast<int>(impl_->attention_kv_heads),
-                                            static_cast<int>(impl_->attention_head_dimension),
-                                            static_cast<int>(impl_->maximum_context), static_cast<int>(impl_->layers.size()),
-                                            static_cast<int>(next_position),
-                                            static_cast<uint32_t>(token_ids.size()))
-                  : metal_tok_session_begin_continuing(*impl_->metal_session, static_cast<int>(impl_->hidden), static_cast<int>(impl_->token_intermediate),
-                                                       0, 0, 0,
-                                                       static_cast<int>(impl_->attention_query_heads), static_cast<int>(impl_->attention_kv_heads),
-                                                       static_cast<int>(impl_->attention_head_dimension),
-                                                       static_cast<int>(impl_->maximum_context), static_cast<int>(impl_->layers.size()),
-                                                       static_cast<int>(next_position))) ||
+            !(index == 0 ? begin_first_token() : begin_continuing_token()) ||
             !metal_tok_session_upload_embedding(*impl_->metal_session, impl_->embedding, token,
-                                                static_cast<int>(impl_->hidden), static_cast<int>(impl_->vocabulary))) {
+                                                static_cast<int>(impl_->hidden), static_cast<int>(impl_->vocabulary),
+                                                impl_->embedding_scale)) {
             metal_tok_session_abort(*impl_->metal_session);
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE, "canonical Metal begin or embedding submission failed");
         }
@@ -2679,7 +3595,7 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "canonical Metal could not continue a prompt transaction");
         }
-        if (final_token && !produce_logits &&
+        if (final_token && output_mode == OutputMode::None &&
             !metal_tok_session_commit_token(*impl_->metal_session)) {
             const char* failure = metal_tok_session_last_failure(*impl_->metal_session);
             metal_tok_session_abort(*impl_->metal_session);
@@ -2698,6 +3614,22 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
             if (failure) detail += ": " + std::string(failure);
             return metal_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE, std::move(detail));
         }
+        if (final_token && produce_sample &&
+            !metal_tok_session_final_sampled(
+                *impl_->metal_session, impl_->final_norm, impl_->output,
+                MetalSamplerDescriptor{}, &sampled_result,
+                static_cast<int>(impl_->hidden),
+                static_cast<int>(impl_->vocabulary), impl_->final_epsilon)) {
+            const char* failure = metal_tok_session_last_failure(*impl_->metal_session);
+            metal_tok_session_abort(*impl_->metal_session);
+            std::string detail = "canonical Metal sampled final OutputWeight K=" +
+                                 std::to_string(impl_->hidden) + " N=" +
+                                 std::to_string(impl_->vocabulary) + " format=" +
+                                 type_name(impl_->output.type) + " did not complete";
+            if (failure) detail += ": " + std::string(failure);
+            return metal_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE,
+                               std::move(detail));
+        }
         ++next_position;
     }
     }
@@ -2708,11 +3640,16 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
     output.cpu_wait_ms = metrics.cpu_wait_ms;
     output.gpu_time_ms = metrics.gpu_time_ms;
     output.peak_session_bytes = metrics.peak_session_bytes;
-    output.projection_weight_bytes = metrics.projection_weight_bytes;
+    output.kv_cache_bytes = metrics.kv_cache_bytes;
+    output.requested_projection_source_bytes = metrics.requested_projection_source_bytes;
     output.projection_dispatches = metrics.projection_dispatches;
     output.batched_projection_dispatches = metrics.batched_projection_dispatches;
     output.q4k_projection_dispatches = metrics.q4k_projection_dispatches;
     output.q6k_projection_dispatches = metrics.q6k_projection_dispatches;
+    output.grouped_affine_u2_projection_dispatches =
+        metrics.grouped_affine_u2_projection_dispatches;
+    output.column_grouped_affine_u2_skip_projection_dispatches =
+        metrics.column_grouped_affine_u2_skip_projection_dispatches;
     output.counter_sample_count = metrics.counter_sample_count;
     output.profiled = metrics.profiled;
     output.counter_samples = metrics.counter_samples;
@@ -2721,20 +3658,45 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
     output.attention_gpu_ms = metrics.attention_gpu_ms;
     output.ffn_gpu_ms = metrics.ffn_gpu_ms;
     output.final_gpu_ms = metrics.final_gpu_ms;
+    if (produce_logits) {
+        output.host_result_bytes = static_cast<uint64_t>(impl_->vocabulary) * sizeof(float);
+    } else if (produce_sample) {
+        output.sampled = true;
+        output.sampled_token_id = sampled_result.token_id;
+        output.sampled_logit = sampled_result.logit;
+        output.host_result_bytes = sizeof(MetalSamplerResult);
+    }
     output.completed = true;
     return output;
 }
 
 CanonicalMetalRunResult CanonicalMetalProgram::prefill(std::span<const uint32_t> token_ids) {
-    return run(token_ids, ExecutionPhase::Prefill, true);
+    return run(token_ids, ExecutionPhase::Prefill, OutputMode::Logits);
 }
 
 CanonicalMetalRunResult CanonicalMetalProgram::decode(uint32_t token_id) {
-    return run(std::span<const uint32_t>(&token_id, 1), ExecutionPhase::Decode, true);
+    return run(std::span<const uint32_t>(&token_id, 1), ExecutionPhase::Decode,
+               OutputMode::Logits);
+}
+
+CanonicalMetalRunResult CanonicalMetalProgram::prefill_sampled(
+    std::span<const uint32_t> token_ids) {
+    return run(token_ids, ExecutionPhase::Prefill, OutputMode::GreedySample);
+}
+
+CanonicalMetalRunResult CanonicalMetalProgram::decode_sampled(uint32_t token_id) {
+    return run(std::span<const uint32_t>(&token_id, 1), ExecutionPhase::Decode,
+               OutputMode::GreedySample);
+}
+
+CanonicalMetalRunResult CanonicalMetalProgram::advance_prefill(uint32_t token_id) {
+    return run(std::span<const uint32_t>(&token_id, 1), ExecutionPhase::Prefill,
+               OutputMode::None);
 }
 
 CanonicalMetalRunResult CanonicalMetalProgram::accumulate_calibration(uint32_t token_id) {
-    return run(std::span<const uint32_t>(&token_id, 1), ExecutionPhase::Decode, false);
+    return run(std::span<const uint32_t>(&token_id, 1), ExecutionPhase::Decode,
+               OutputMode::None);
 }
 
 #if defined(LAPLACE_METAL_TESTING)
@@ -2756,7 +3718,7 @@ const char* canonical_metal_first_recurrent_preflight_for_testing(const Canonica
             return metal_tok_recurrent_layer_preflight_for_testing(recurrent->metal,
                                                                     static_cast<int>(program.impl_->hidden),
                                                                     static_cast<int>(program.impl_->token_intermediate),
-                                                                    static_cast<int>(program.impl_->attention_head_dimension));
+                                                                    static_cast<int>(program.impl_->hidden));
         }
     }
     return "canonical Metal program has no recurrent layer";

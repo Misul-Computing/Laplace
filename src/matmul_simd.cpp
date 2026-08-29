@@ -173,6 +173,32 @@ float dot_row_q8_0_int_neon(const ActQ8* xa, const uint8_t* row, int K) {
     return hsum_f32x4(vaddq_f32(acc0, acc1));
 }
 
+void dot2_row_q8_0_int_neon(const ActQ8* xa, const uint8_t* row0,
+                            size_t rb, int K, float out[2]) {
+    const block_q8_0* w0 = reinterpret_cast<const block_q8_0*>(row0);
+    const block_q8_0* w1 = reinterpret_cast<const block_q8_0*>(row0 + rb);
+    float32x4_t a00 = vdupq_n_f32(0), a01 = vdupq_n_f32(0);
+    float32x4_t a10 = vdupq_n_f32(0), a11 = vdupq_n_f32(0);
+    const int n_blocks = K / 32;
+    for (int b = 0; b < n_blocks; b++) {
+        int8x16_t xv0 = vld1q_s8(xa[b].qs);
+        int8x16_t xv1 = vld1q_s8(xa[b].qs + 16);
+        float xd = xa[b].d;
+        float s0 = fp16_scale(w0[b].d) * xd;
+        float s1 = fp16_scale(w1[b].d) * xd;
+        a00 = vfmaq_f32(a00, vdupq_n_f32(s0),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w0[b].qs), xv0)));
+        a01 = vfmaq_f32(a01, vdupq_n_f32(s0),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w0[b].qs + 16), xv1)));
+        a10 = vfmaq_f32(a10, vdupq_n_f32(s1),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w1[b].qs), xv0)));
+        a11 = vfmaq_f32(a11, vdupq_n_f32(s1),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w1[b].qs + 16), xv1)));
+    }
+    out[0] = hsum_f32x4(vaddq_f32(a00, a01));
+    out[1] = hsum_f32x4(vaddq_f32(a10, a11));
+}
+
 float dot_row_q4_0_int_neon(const ActQ8* xa, const uint8_t* row, int K) {
     const block_q4_0* w = reinterpret_cast<const block_q4_0*>(row);
     const int n_blocks = K / 32;
@@ -513,6 +539,7 @@ void gemm_f(const float* x, const uint8_t* data, float* y,
 
 bool gemm_simd(const float* x, const uint8_t* w, GGMLType type,
                float* y, int M, int K, int N) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
     switch (type) {
         case GGMLType::Q8_0: gemm_int<dot_row_q8_0_int_neon>(x, w, y, M, K, N, rb); return true;
@@ -535,6 +562,315 @@ gemm_fn get_simd_gemm() {
     return gemm_simd;
 }
 
+// Fused MoE GEMV with shared activation (gate_up case): all experts see
+// the same input x. Quantizes x once, then one parallel_for.
+template <dot_int_fn DOT>
+bool moe_gemv_int(const float* x, const uint8_t* w, GGMLType type,
+                  const int* expert_idx, int n_experts,
+                  float* y, int K, int N) {
+    const ActQ8* xa = quantize_all(x, 1, K);
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int idx) {
+        int k = idx / N;
+        int j = idx % N;
+        const uint8_t* row = w + static_cast<size_t>(expert_idx[k]) * per_expert
+                              + static_cast<size_t>(j) * rb;
+        y[static_cast<size_t>(k) * N + j] = DOT(xa, row, K);
+    };
+    ThreadPool::get().parallel_for(n_experts * N, body);
+    return true;
+}
+
+// Fused MoE GEMV with per-expert activations (down case): each expert k
+// has its own input at x[k * K]. Quantizes all n_experts rows once,
+// then one parallel_for with the correct activation per expert.
+template <dot_int_fn DOT>
+bool moe_gemv_multi_int(const float* x, const uint8_t* w, GGMLType type,
+                        const int* expert_idx, int n_experts,
+                        float* y, int K, int N) {
+    const ActQ8* xa = quantize_all(x, n_experts, K);
+    const int bpr = K / 32;
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int idx) {
+        int k = idx / N;
+        int j = idx % N;
+        const uint8_t* row = w + static_cast<size_t>(expert_idx[k]) * per_expert
+                              + static_cast<size_t>(j) * rb;
+        y[static_cast<size_t>(k) * N + j] = DOT(xa + k * bpr, row, K);
+    };
+    ThreadPool::get().parallel_for(n_experts * N, body);
+    return true;
+}
+
+template <dot_f_fn DOT>
+bool moe_gemv_f(const float* x, const uint8_t* w, GGMLType type,
+                const int* expert_idx, int n_experts,
+                float* y, int K, int N) {
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int idx) {
+        int k = idx / N;
+        int j = idx % N;
+        const uint8_t* row = w + static_cast<size_t>(expert_idx[k]) * per_expert
+                              + static_cast<size_t>(j) * rb;
+        y[static_cast<size_t>(k) * N + j] = DOT(x, row, K);
+    };
+    ThreadPool::get().parallel_for(n_experts * N, body);
+    return true;
+}
+
+template <dot_f_fn DOT>
+bool moe_gemv_multi_f(const float* x, const uint8_t* w, GGMLType type,
+                      const int* expert_idx, int n_experts,
+                      float* y, int K, int N) {
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int idx) {
+        int k = idx / N;
+        int j = idx % N;
+        const uint8_t* row = w + static_cast<size_t>(expert_idx[k]) * per_expert
+                              + static_cast<size_t>(j) * rb;
+        y[static_cast<size_t>(k) * N + j] = DOT(x + k * K, row, K);
+    };
+    ThreadPool::get().parallel_for(n_experts * N, body);
+    return true;
+}
+
+bool moe_gemv_simd(const float* x, const uint8_t* w, GGMLType type,
+                   const int* expert_idx, int n_experts,
+                   float* y, int K, int N) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
+    switch (type) {
+        case GGMLType::Q8_0: return moe_gemv_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q4_0: return moe_gemv_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q5_0: return moe_gemv_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q4_K: return moe_gemv_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q6_K: return moe_gemv_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::F32:  return moe_gemv_f<dot_row_f32_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        case GGMLType::F16:  return moe_gemv_f<dot_row_f16_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+#endif
+        case GGMLType::BF16: return moe_gemv_f<dot_row_bf16_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        default: return false;
+    }
+}
+
+bool moe_gemv_multi_simd(const float* x, const uint8_t* w, GGMLType type,
+                         const int* expert_idx, int n_experts,
+                         float* y, int K, int N) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
+    switch (type) {
+        case GGMLType::Q8_0: return moe_gemv_multi_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q4_0: return moe_gemv_multi_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q5_0: return moe_gemv_multi_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q4_K: return moe_gemv_multi_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::Q6_K: return moe_gemv_multi_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        case GGMLType::F32:  return moe_gemv_multi_f<dot_row_f32_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        case GGMLType::F16:  return moe_gemv_multi_f<dot_row_f16_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+#endif
+        case GGMLType::BF16: return moe_gemv_multi_f<dot_row_bf16_neon>(x, w, type, expert_idx, n_experts, y, K, N);
+        default: return false;
+    }
+}
+
+inline float geglu_product(float gate, float up) {
+    constexpr float c = 0.7978845608028654f;
+    constexpr float c2 = 0.044715f;
+    float gate3 = gate * gate * gate;
+    return 0.5f * gate * (1.0f + std::tanh(c * (gate + c2 * gate3))) * up;
+}
+
+inline const uint8_t* exp_ptr(const uint8_t* w, const uint8_t* const* bases,
+                              const int* expert_idx, int k, size_t per_expert) {
+    return bases ? bases[k]
+                 : w + static_cast<size_t>(expert_idx[k]) * per_expert;
+}
+
+template <dot_int_fn DOT>
+bool moe_gate_up_int(const float* x, const uint8_t* w, GGMLType type,
+                     const int* expert_idx, int n_experts,
+                     float* hidden, int K, int hidden_dim,
+                     const uint8_t* const* bases) {
+    const ActQ8* xa = quantize_all(x, 1, K);
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
+                      bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(2 * hidden_dim) * rb;
+    auto body = [&](int idx) {
+        int k = idx / hidden_dim;
+        int j = idx % hidden_dim;
+        const uint8_t* base = exp_ptr(w, bases, expert_idx, k, per_expert);
+        if (j + 1 < hidden_dim) {
+            __builtin_prefetch(base + static_cast<size_t>(j + 1) * rb, 0, 3);
+            __builtin_prefetch(base + static_cast<size_t>(hidden_dim + j + 1) * rb, 0, 3);
+        }
+        float gate = DOT(xa, base + static_cast<size_t>(j) * rb, K);
+        float up = DOT(xa, base + static_cast<size_t>(hidden_dim + j) * rb, K);
+        hidden[static_cast<size_t>(k) * hidden_dim + j] =
+            geglu_product(gate, up);
+    };
+    ThreadPool::get().parallel_for(n_experts * hidden_dim, body);
+    return true;
+}
+
+template <dot_f_fn DOT>
+bool moe_gate_up_f(const float* x, const uint8_t* w, GGMLType type,
+                   const int* expert_idx, int n_experts,
+                   float* hidden, int K, int hidden_dim,
+                   const uint8_t* const* bases) {
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
+                      bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(2 * hidden_dim) * rb;
+    auto body = [&](int idx) {
+        int k = idx / hidden_dim;
+        int j = idx % hidden_dim;
+        const uint8_t* base = exp_ptr(w, bases, expert_idx, k, per_expert);
+        float gate = DOT(x, base + static_cast<size_t>(j) * rb, K);
+        float up = DOT(x, base + static_cast<size_t>(hidden_dim + j) * rb, K);
+        hidden[static_cast<size_t>(k) * hidden_dim + j] =
+            geglu_product(gate, up);
+    };
+    ThreadPool::get().parallel_for(n_experts * hidden_dim, body);
+    return true;
+}
+
+template <dot_int_fn DOT>
+bool moe_down_int(const float* x, const uint8_t* w, GGMLType type,
+                  const int* expert_idx, const float* route_weight,
+                  int n_experts, float* output, int K, int N,
+                  const uint8_t* const* bases) {
+    const ActQ8* xa = quantize_all(x, n_experts, K);
+    const int blocks_per_row = K / 32;
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
+                      bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int j) {
+        float sum = 0.0f;
+        for (int k = 0; k < n_experts; k++) {
+            const uint8_t* row =
+                exp_ptr(w, bases, expert_idx, k, per_expert) +
+                static_cast<size_t>(j) * rb;
+            sum += route_weight[k] * DOT(xa + k * blocks_per_row, row, K);
+        }
+        output[j] += sum;
+    };
+    ThreadPool::get().parallel_for(N, body);
+    return true;
+}
+
+bool moe_down_q8_0_int2(const float* x, const uint8_t* w,
+                        const int* expert_idx, const float* route_weight,
+                        int n_experts, float* output, int K, int N,
+                        const uint8_t* const* bases) {
+    if (N < 2 || (N & 1) != 0)
+        return moe_down_int<dot_row_q8_0_int_neon>(
+            x, w, GGMLType::Q8_0, expert_idx, route_weight, n_experts,
+            output, K, N, bases);
+    const ActQ8* xa = quantize_all(x, n_experts, K);
+    const int blocks_per_row = K / 32;
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(GGMLType::Q8_0) *
+                      bytes_per_block(GGMLType::Q8_0);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int t) {
+        const int j = t * 2;
+        float sum0 = 0, sum1 = 0;
+        for (int k = 0; k < n_experts; k++) {
+            const uint8_t* row =
+                exp_ptr(w, bases, expert_idx, k, per_expert) +
+                static_cast<size_t>(j) * rb;
+            float tmp[2];
+            dot2_row_q8_0_int_neon(xa + k * blocks_per_row, row, rb, K, tmp);
+            sum0 += route_weight[k] * tmp[0];
+            sum1 += route_weight[k] * tmp[1];
+        }
+        output[j] += sum0;
+        output[j + 1] += sum1;
+    };
+    ThreadPool::get().parallel_for(N / 2, body);
+    return true;
+}
+
+template <dot_f_fn DOT>
+bool moe_down_f(const float* x, const uint8_t* w, GGMLType type,
+                const int* expert_idx, const float* route_weight,
+                int n_experts, float* output, int K, int N,
+                const uint8_t* const* bases) {
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
+                      bytes_per_block(type);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int j) {
+        float sum = 0.0f;
+        for (int k = 0; k < n_experts; k++) {
+            const uint8_t* row =
+                exp_ptr(w, bases, expert_idx, k, per_expert) +
+                static_cast<size_t>(j) * rb;
+            sum += route_weight[k] *
+                DOT(x + static_cast<size_t>(k) * K, row, K);
+        }
+        output[j] += sum;
+    };
+    ThreadPool::get().parallel_for(N, body);
+    return true;
+}
+
+bool moe_gate_up_simd(const float* x, const uint8_t* w, GGMLType type,
+                      const int* expert_idx, int n_experts,
+                      float* hidden, int K, int hidden_dim,
+                      const uint8_t* const* bases) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
+    switch (type) {
+        case GGMLType::Q8_0: return moe_gate_up_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q4_0: return moe_gate_up_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q5_0: return moe_gate_up_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q4_K: return moe_gate_up_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q6_K: return moe_gate_up_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::F32: return moe_gate_up_f<dot_row_f32_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        case GGMLType::F16: return moe_gate_up_f<dot_row_f16_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+#endif
+        case GGMLType::BF16: return moe_gate_up_f<dot_row_bf16_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        default: return false;
+    }
+}
+
+bool moe_down_simd(const float* x, const uint8_t* w, GGMLType type,
+                   const int* expert_idx, const float* route_weight,
+                   int n_experts, float* output, int K, int N,
+                   const uint8_t* const* bases) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
+    switch (type) {
+        case GGMLType::Q8_0: return moe_down_q8_0_int2(x, w, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q4_0: return moe_down_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q5_0: return moe_down_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q4_K: return moe_down_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q6_K: return moe_down_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::F32: return moe_down_f<dot_row_f32_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+        case GGMLType::F16: return moe_down_f<dot_row_f16_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+#endif
+        case GGMLType::BF16: return moe_down_f<dot_row_bf16_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        default: return false;
+    }
+}
+
+moe_gemv_fn get_simd_moe_gemv() {
+    return moe_gemv_simd;
+}
+
+moe_gemv_multi_fn get_simd_moe_gemv_multi() {
+    return moe_gemv_multi_simd;
+}
+
+moe_gate_up_fn get_simd_moe_gate_up() {
+    return moe_gate_up_simd;
+}
+
+moe_down_fn get_simd_moe_down() {
+    return moe_down_simd;
+}
+
 } // namespace kernels
 } // namespace Laplace
 
@@ -545,6 +881,10 @@ namespace kernels {
 
 void set_gcd_gemm(bool) {}
 gemm_fn get_simd_gemm() { return nullptr; }
+moe_gemv_fn get_simd_moe_gemv() { return nullptr; }
+moe_gemv_multi_fn get_simd_moe_gemv_multi() { return nullptr; }
+moe_gate_up_fn get_simd_moe_gate_up() { return nullptr; }
+moe_down_fn get_simd_moe_down() { return nullptr; }
 
 } // namespace kernels
 } // namespace Laplace

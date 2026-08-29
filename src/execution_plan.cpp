@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
 #include <limits>
 #include <optional>
 
@@ -52,6 +54,8 @@ KernelImplementation scalar_implementation(OperatorKind operation) {
 }
 
 KernelQuery query_for(const SemanticModel& model, const SemanticOperator& op, ExecutionPhase phase);
+bool match_dense_graph_impl(const SemanticModel& model, const SemanticLayer& layer,
+                            DenseGraphWitness& witness);
 
 bool implementation_matches(OperatorKind operation, KernelImplementation implementation) {
     const KernelImplementation scalar = scalar_implementation(operation);
@@ -126,6 +130,7 @@ struct MetalBlockedFormat {
 
 constexpr std::array kMetalBlockedFormats = {
     MetalBlockedFormat{MetalWeightFormatIQ2XXS, 256, 66, QuantizationKind::Codebook},
+    MetalBlockedFormat{MetalWeightFormatQ4_0, 32, 18},
     MetalBlockedFormat{MetalWeightFormatQ4K, 256, 144},
     MetalBlockedFormat{MetalWeightFormatQ5_0, 32, 22},
     MetalBlockedFormat{MetalWeightFormatQ6K, 256, 210},
@@ -144,7 +149,71 @@ bool metal_dense_matrix_format(const SemanticModel& model, const SemanticOperato
                                uint32_t& format) {
     const SemanticTensor* tensor = role_tensor(model, op, role);
     if (!tensor || tensor->logical_type != ScalarType::F32 || tensor->dimensions.size() != 2 ||
-        tensor->planes.size() != 1 || tensor->planes[0].kind != PlaneKind::Values ||
+        tensor->planes.empty()) return false;
+    // The affine capability is a complete physical contract, not a hint from
+    // an importer or a tensor/role name.  Semantic dimensions are [N,K] and
+    // the canonical physical view exposes [K,N] to the GEMV leaf.
+    const bool grouped_affine_layout =
+        tensor->layout.kind == PhysicalLayoutKind::GroupedAffine ||
+        tensor->layout.kind == PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip;
+    if (tensor->planes.size() == 3 && grouped_affine_layout &&
+        tensor->layout.packing == PackingKind::LsbBitPacked && tensor->layout.rank == 2 &&
+        tensor->layout.block_rank == 1 && tensor->layout.axis_order[0] == 1 &&
+        tensor->layout.axis_order[1] == 0 && tensor->layout.strides[0] == 1 &&
+        tensor->layout.strides[1] == tensor->dimensions[1].constant_or_symbol &&
+        tensor->layout.flags == 0 && tensor->flags == 0 &&
+        tensor->expert_axis == ExpertAxis{} &&
+        tensor->layout.block_elements == 256 && tensor->layout.block_bytes == 64 &&
+        tensor->quantization.kind == QuantizationKind::BlockedAffine &&
+        tensor->quantization.accumulation_type == ScalarType::F32 &&
+        tensor->quantization.scale_type == ScalarType::F16 &&
+        tensor->quantization.zero_type == static_cast<ScalarType>(0) &&
+        tensor->quantization.bias_type == ScalarType::F16 &&
+        tensor->quantization.block_elements == 256 && tensor->quantization.block_bytes == 64 &&
+        tensor->quantization.group_size == 256 && tensor->quantization.required_plane_mask == 7 &&
+        tensor->quantization.flags == 0 &&
+        tensor->dimensions[0].kind == DimensionKind::Constant &&
+        tensor->dimensions[1].kind == DimensionKind::Constant &&
+        tensor->dimensions[0].constant_or_symbol != 0 &&
+        tensor->dimensions[1].constant_or_symbol != 0) {
+        const uint64_t n = tensor->dimensions[0].constant_or_symbol;
+        const uint64_t k = tensor->dimensions[1].constant_or_symbol;
+        const bool column_grouped =
+            tensor->layout.kind == PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip;
+        const bool shape_supported = column_grouped
+            ? n % 256 == 0
+            : (k % 256 == 0 && k % 512 == 0 && n % 8 == 0);
+        uint64_t elements = 0;
+        uint64_t blocks = 0;
+        if (shape_supported && n <= std::numeric_limits<uint64_t>::max() / k &&
+            (elements = n * k) != 0 && (blocks = elements / 256) != 0 &&
+            blocks <= UINT64_MAX / 2) {
+            const TensorPlane* values = nullptr;
+            const TensorPlane* scales = nullptr;
+            const TensorPlane* biases = nullptr;
+            const ScalarType expected_value_type = column_grouped
+                ? ScalarType::U8
+                : ScalarType::U32;
+            for (const TensorPlane& candidate : tensor->planes) {
+                if (candidate.alignment != 128 || candidate.offset % 128 != 0 || candidate.flags != 0) return false;
+                if (candidate.kind == PlaneKind::Values && candidate.storage_type == expected_value_type)
+                    values = values ? nullptr : &candidate;
+                else if (candidate.kind == PlaneKind::Scales && candidate.storage_type == ScalarType::F16)
+                    scales = scales ? nullptr : &candidate;
+                else if (candidate.kind == PlaneKind::Biases && candidate.storage_type == ScalarType::F16)
+                    biases = biases ? nullptr : &candidate;
+                else return false;
+            }
+            if (values && scales && biases && values->length == elements / 4 &&
+                scales->length == blocks * 2 && biases->length == blocks * 2) {
+                format = tensor->layout.kind == PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip
+                    ? MetalWeightFormatColumnGroupedAffineUInt2Skip256
+                    : MetalWeightFormatAffineUInt2_256;
+                return true;
+            }
+        }
+    }
+    if (tensor->planes.size() != 1 || tensor->planes[0].kind != PlaneKind::Values ||
         tensor->planes[0].alignment == 0) return false;
     const TensorPlane& plane = tensor->planes[0];
     if (tensor->layout.kind == PhysicalLayoutKind::ContiguousRowMajor &&
@@ -209,8 +278,28 @@ bool dense_kv_states(const SemanticModel& model, const SemanticOperator& attenti
            key->formats[0].alignment == 64 && value->formats[0].alignment == 64;
 }
 
+bool canonical_attention_window_is_global(const SemanticModel& model, std::string& detail) {
+    for (const SemanticOperator& op : model.operators) {
+        if (op.kind != OperatorKind::CausalAttention) continue;
+        const auto* payload = std::get_if<CausalAttentionPayload>(&op.payload);
+        if (!payload) {
+            detail = "canonical Metal attention window payload is invalid at operator " +
+                     std::to_string(op.id);
+            return false;
+        }
+        if (payload->window != AttentionWindowKind::Global || payload->window_tokens != 0) {
+            detail = "canonical Metal attention requires a global window: operator " +
+                     std::to_string(op.id) + " declares " +
+                     (payload->window == AttentionWindowKind::Sliding ? "sliding" : "invalid") +
+                     " window of " + std::to_string(payload->window_tokens) + " tokens";
+            return false;
+        }
+    }
+    return true;
+}
+
 bool dense_metal_layer(const SemanticModel& model, const SemanticLayer& layer, const SemanticOperator*& attention,
-                       uint32_t* weight_format = nullptr) {
+                       uint32_t* weight_format = nullptr, bool allow_moe_tail = false) {
     if (layer.first_operator > model.operators.size() || layer.operator_count > model.operators.size() - layer.first_operator) return false;
     const SemanticOperator* attn_norm = layer_operator(model, layer, OperatorKind::RmsNorm, TensorRole::AttentionNormWeight);
     const SemanticOperator* query = layer_operator(model, layer, OperatorKind::Linear, TensorRole::QueryWeight);
@@ -226,18 +315,18 @@ bool dense_metal_layer(const SemanticModel& model, const SemanticLayer& layer, c
     const SemanticOperator* down = layer_operator(model, layer, OperatorKind::Linear, TensorRole::FfnDownWeight);
     const SemanticOperator* rope = nullptr;
     const SemanticOperator* swiglu = nullptr;
-    const SemanticOperator* split = nullptr;
+    std::vector<const SemanticOperator*> splits;
     const SemanticOperator* gated_attention = nullptr;
-    uint32_t split_count = 0;
     uint32_t gated_attention_count = 0;
     attention = nullptr;
     for (uint32_t index = 0; index != layer.operator_count; ++index) {
         const SemanticOperator& op = model.operators[layer.first_operator + index];
         if (op.kind == OperatorKind::Rope) rope = rope ? nullptr : &op;
         if (op.kind == OperatorKind::SwiGlu) swiglu = swiglu ? nullptr : &op;
-        if (op.kind == OperatorKind::AxisSplit) {
-            split = split_count++ == 0 ? &op : nullptr;
-        }
+        // Classify splits from their typed producer edge below.  Operator
+        // order is deliberately irrelevant: a routed expert split may appear
+        // before the attention split in a valid serialized graph.
+        if (op.kind == OperatorKind::AxisSplit) splits.push_back(&op);
         if (op.kind == OperatorKind::GatedAttention) {
             gated_attention = gated_attention_count++ == 0 ? &op : nullptr;
         }
@@ -246,24 +335,53 @@ bool dense_metal_layer(const SemanticModel& model, const SemanticLayer& layer, c
         }
     }
     const bool fused_query_gate = query_gate != nullptr;
+    const SemanticOperator* split = nullptr;
+    uint32_t split_count = 0;
+    if (fused_query_gate) {
+        for (const SemanticOperator* candidate : splits) {
+            if (candidate->inputs != query_gate->outputs) continue;
+            if (split) {
+                split_count = 2;
+                break;
+            }
+            split = candidate;
+            split_count = 1;
+        }
+    } else if (!allow_moe_tail) {
+        split_count = splits.size() > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(splits.size());
+    }
     const SemanticOperator* query_projection = fused_query_gate ? query_gate : query;
     const auto* rope_payload = rope ? std::get_if<RopePayload>(&rope->payload) : nullptr;
     const auto* attention_payload = attention ? std::get_if<CausalAttentionPayload>(&attention->payload) : nullptr;
     const auto* swiglu_payload = swiglu ? std::get_if<SwiGluPayload>(&swiglu->payload) : nullptr;
+    const float rope_base = rope_payload ? std::bit_cast<float>(rope_payload->base_f32_bits) : 0.0f;
+    const float rope_scale = rope_payload ? std::bit_cast<float>(rope_payload->scale_f32_bits) : 0.0f;
     const bool multi_section_rope = rope_payload && rope_payload->pairing == RopePairing::MultiSectionHalfSplit;
-    if (!attn_norm || !query_projection || !key || !value || !output || !ffn_norm || !gate || !up || !down || !rope_payload ||
-        !attention_payload || !swiglu_payload || swiglu_payload->activation != ActivationKind::Silu ||
+    if (!attn_norm || !query_projection || !key || !value || !output || !ffn_norm ||
+        !gate || !up || !down || !rope_payload || !attention_payload || !swiglu_payload ||
+        (swiglu_payload->activation != ActivationKind::Silu &&
+         !(allow_moe_tail && swiglu_payload->activation == ActivationKind::GeluTanh)) ||
         (rope_payload->pairing != RopePairing::HalfSplit && rope_payload->pairing != RopePairing::Interleaved &&
          rope_payload->pairing != RopePairing::MultiSectionHalfSplit) ||
         !rope_payload->position_from_cursor ||
+        !std::isfinite(rope_base) || rope_base <= 0.0f ||
+        !std::isfinite(rope_scale) || rope_scale <= 0.0f ||
+        rope_payload->rotary_dimension == 0 ||
+        rope_payload->rotary_dimension > attention_payload->head_dimension ||
+        (rope_payload->rotary_dimension % 2) != 0 ||
         attention_payload->mask != AttentionMask::Causal || attention_payload->cache_policy != CachePolicy::Global ||
+        attention_payload->window != AttentionWindowKind::Global || attention_payload->window_tokens != 0 ||
         attention_payload->head_dimension < 32 || attention_payload->head_dimension > 512 ||
-        attention_payload->head_dimension % 16 != 0 || !dense_kv_states(model, *attention) ||
+        attention_payload->head_dimension % 16 != 0 ||
+        attention_payload->value_source != ValueSource::SeparateProjection ||
+        !dense_kv_states(model, *attention) ||
         !exact_dense_tensor(model, *attn_norm, TensorRole::AttentionNormWeight, ScalarType::F32) ||
         (!fused_query_gate && !exact_dense_tensor(model, *query, TensorRole::QueryBias, ScalarType::F32, true)) ||
         !exact_dense_tensor(model, *key, TensorRole::KeyBias, ScalarType::F32, true) ||
         !exact_dense_tensor(model, *value, TensorRole::ValueBias, ScalarType::F32, true) ||
-        !exact_dense_tensor(model, *ffn_norm, TensorRole::FfnNormWeight, ScalarType::F32)) return false;
+        !exact_dense_tensor(model, *ffn_norm, TensorRole::FfnNormWeight, ScalarType::F32)) {
+        return false;
+    }
     if (multi_section_rope) {
         uint64_t total_sections = 0;
         for (uint32_t section : rope_payload->position_sections) total_sections += section;
@@ -302,16 +420,1156 @@ bool dense_metal_layer(const SemanticModel& model, const SemanticLayer& layer, c
         return false;
     }
     uint32_t format = 0;
-    for (const auto [op, role] : std::array<std::pair<const SemanticOperator*, TensorRole>, 7>{{
-             {query_projection, fused_query_gate ? TensorRole::AttentionQueryGateWeight : TensorRole::QueryWeight},
-             {key, TensorRole::KeyWeight}, {value, TensorRole::ValueWeight},
-             {output, TensorRole::AttentionOutputWeight}, {gate, TensorRole::FfnGateWeight},
-             {up, TensorRole::FfnUpWeight}, {down, TensorRole::FfnDownWeight}}}) {
+    const auto append_format = [&](const SemanticOperator* op, TensorRole role) {
         uint32_t candidate = 0;
-        if (!metal_dense_matrix_format(model, *op, role, candidate)) return false;
+        if (!op || !metal_dense_matrix_format(model, *op, role, candidate)) return false;
         format |= candidate;
+        return true;
+    };
+    if (!append_format(query_projection, fused_query_gate ? TensorRole::AttentionQueryGateWeight : TensorRole::QueryWeight) ||
+        !append_format(key, TensorRole::KeyWeight) ||
+        !append_format(value, TensorRole::ValueWeight) ||
+        !append_format(output, TensorRole::AttentionOutputWeight) || !append_format(gate, TensorRole::FfnGateWeight) ||
+        !append_format(up, TensorRole::FfnUpWeight) || !append_format(down, TensorRole::FfnDownWeight)) return false;
+    if (!allow_moe_tail) {
+        DenseGraphWitness witness;
+        if (!match_dense_graph_impl(model, layer, witness)) return false;
     }
     if (weight_format) *weight_format = format;
+    return true;
+}
+
+bool exact_expert_format(const SemanticModel& model, const SemanticOperator& op, TensorRole role,
+                         uint32_t experts, uint32_t input, uint32_t output, uint32_t format) {
+    const MetalBlockedFormat* blocked = metal_blocked_format(format);
+    const SemanticTensor* tensor = role_tensor(model, op, role, true);
+    if (!blocked || op.tensors.size() != 1 || !tensor || tensor->logical_type != ScalarType::F32 || tensor->dimensions.size() != 3 ||
+        tensor->dimensions[0] != Dimension{DimensionKind::Constant, experts} ||
+        tensor->dimensions[1] != Dimension{DimensionKind::Constant, input} ||
+        tensor->dimensions[2] != Dimension{DimensionKind::Constant, output} ||
+        tensor->layout.kind != PhysicalLayoutKind::GgufBlocked || tensor->layout.packing != PackingKind::Gguf ||
+        tensor->layout.rank != 3 || tensor->layout.axis_order[0] != 1 || tensor->layout.axis_order[1] != 2 ||
+        tensor->layout.axis_order[2] != 0 || tensor->layout.block_rank != 1 ||
+        tensor->layout.block_elements != blocked->elements || tensor->layout.block_bytes != blocked->bytes ||
+        tensor->quantization.kind != blocked->quantization ||
+        tensor->quantization.block_elements != blocked->elements || tensor->quantization.block_bytes != blocked->bytes ||
+        tensor->quantization.group_size != blocked->elements || tensor->quantization.required_plane_mask != 1 ||
+        tensor->planes.size() != 1 || tensor->planes[0].kind != PlaneKind::Values ||
+        tensor->planes[0].storage_type != ScalarType::U8 || tensor->planes[0].alignment < 32 ||
+        tensor->expert_axis.kind != ExpertAxisKind::ExpertBank || tensor->expert_axis.expert_axis != 0 ||
+        tensor->expert_axis.member_axis != 0xff || tensor->expert_axis.input_axis != 1 ||
+        tensor->expert_axis.output_axis != 2 || tensor->expert_axis.expert_count != experts ||
+        input == 0 || output == 0 || input % blocked->elements != 0 ||
+        static_cast<uint64_t>(input) > UINT64_MAX / output ||
+        static_cast<uint64_t>(input) * output / blocked->elements > UINT64_MAX / blocked->bytes ||
+        tensor->expert_axis.per_expert_byte_stride !=
+            static_cast<uint64_t>(input) * output / blocked->elements * blocked->bytes ||
+        tensor->planes[0].length != static_cast<uint64_t>(experts) * tensor->expert_axis.per_expert_byte_stride ||
+        tensor->layout.strides[0] != 1 || tensor->layout.strides[1] != input ||
+        tensor->layout.strides[2] != static_cast<uint64_t>(input) * output) return false;
+    return true;
+}
+
+struct MoeDescriptorFacts {
+    std::vector<uint32_t> covered_operator_ids;
+    const SemanticOperator* dense_attn_norm = nullptr;
+    const SemanticOperator* dense_query = nullptr;
+    const SemanticOperator* dense_query_gate = nullptr;
+    const SemanticOperator* dense_key = nullptr;
+    const SemanticOperator* dense_value = nullptr;
+    const SemanticOperator* dense_output = nullptr;
+    const SemanticOperator* dense_query_norm = nullptr;
+    const SemanticOperator* dense_key_norm = nullptr;
+    const SemanticOperator* dense_ffn_norm = nullptr;
+    const SemanticOperator* dense_gate = nullptr;
+    const SemanticOperator* dense_up = nullptr;
+    const SemanticOperator* dense_down = nullptr;
+    const SemanticOperator* rope = nullptr;
+    const SemanticOperator* swiglu = nullptr;
+    const SemanticOperator* attention = nullptr;
+    const SemanticOperator* router = nullptr;
+    const SemanticOperator* router_linear = nullptr;
+    const SemanticOperator* router_scale = nullptr;
+    const SemanticOperator* router_normalization_scale = nullptr;
+    const SemanticOperator* router_norm = nullptr;
+    const SemanticOperator* expert_norm = nullptr;
+    const SemanticOperator* expert_up = nullptr;
+    const SemanticOperator* expert_split = nullptr;
+    const SemanticOperator* expert_activation = nullptr;
+    const SemanticOperator* expert_down = nullptr;
+    const SemanticOperator* expert_reduce = nullptr;
+    const SemanticOperator* attention_residual = nullptr;
+    const SemanticOperator* residual = nullptr;
+    const SemanticOperator* final_add = nullptr;
+    const SemanticOperator* dense_post_norm = nullptr;
+    const SemanticOperator* moe_post_norm = nullptr;
+    const SemanticOperator* output_post_norm = nullptr;
+    const SemanticOperator* output_scale = nullptr;
+    const SemanticTensor* gate_up_tensor = nullptr;
+    const SemanticTensor* down_tensor = nullptr;
+    uint32_t hidden = 0;
+    uint32_t intermediate = 0;
+    uint32_t experts = 0;
+    uint32_t selected = 0;
+    uint32_t gate_up_format = 0;
+    uint32_t down_format = 0;
+    PhysicalLayoutKind gate_up_layout = static_cast<PhysicalLayoutKind>(0);
+    PhysicalLayoutKind down_layout = static_cast<PhysicalLayoutKind>(0);
+    QuantizationKind gate_up_quantization = static_cast<QuantizationKind>(0);
+    QuantizationKind down_quantization = static_cast<QuantizationKind>(0);
+    uint32_t gate_up_plane_mask = 0;
+    uint32_t down_plane_mask = 0;
+    uint32_t gate_up_block_elements = 0;
+    uint32_t gate_up_block_bytes = 0;
+    uint32_t down_block_elements = 0;
+    uint32_t down_block_bytes = 0;
+    uint32_t gate_up_input = 0;
+    uint32_t gate_up_output = 0;
+    uint32_t down_input = 0;
+    uint32_t down_output = 0;
+    uint64_t gate_up_expert_stride = 0;
+    uint64_t down_expert_stride = 0;
+    ActivationKind activation = ActivationKind::Silu;
+    ExpertScaleSource scale_source = ExpertScaleSource::None;
+    ValueSource value_source = ValueSource::SeparateProjection;
+    uint32_t router_normalization_scale_bits = 0;
+};
+
+const SemanticValue* value_with_id(const SemanticModel& model, uint32_t id) {
+    return id < model.values.size() && model.values[id].id == id ? &model.values[id] : nullptr;
+}
+
+bool value_last_width(const SemanticModel& model, uint32_t id, ScalarType type, uint32_t width) {
+    const SemanticValue* value = value_with_id(model, id);
+    return value && value->logical_type == type && !value->dimensions.empty() &&
+           value->dimensions.back() == Dimension{DimensionKind::Constant, width};
+}
+
+bool value_flat_width(const SemanticModel& model, uint32_t id, ScalarType type, uint32_t width) {
+    const SemanticValue* value = value_with_id(model, id);
+    if (!value || value->logical_type != type || value->dimensions.size() < 2) return false;
+    uint64_t product = 1;
+    for (size_t index = 1; index != value->dimensions.size(); ++index) {
+        const Dimension& dimension = value->dimensions[index];
+        if (dimension.kind != DimensionKind::Constant || !dimension.constant_or_symbol ||
+            product > UINT64_MAX / dimension.constant_or_symbol) return false;
+        product *= dimension.constant_or_symbol;
+    }
+    return product == width;
+}
+
+bool same_value_prefix(const SemanticModel& model, uint32_t left_id, uint32_t right_id) {
+    const SemanticValue* left = value_with_id(model, left_id);
+    const SemanticValue* right = value_with_id(model, right_id);
+    if (!left || !right || left->dimensions.size() != right->dimensions.size()) return false;
+    if (left->dimensions.empty()) return true;
+    for (size_t index = 0; index + 1 < left->dimensions.size(); ++index) {
+        if (left->dimensions[index] != right->dimensions[index]) return false;
+    }
+    return true;
+}
+
+bool value_matches_routed(const SemanticModel& model, uint32_t id, uint32_t route_id,
+                          ScalarType type, uint32_t width) {
+    const SemanticValue* value = value_with_id(model, id);
+    const SemanticValue* route = value_with_id(model, route_id);
+    return value && route && value->logical_type == type &&
+           value->dimensions.size() == route->dimensions.size() + 1 &&
+           value_last_width(model, id, type, width) &&
+           std::equal(route->dimensions.begin(), route->dimensions.end(), value->dimensions.begin());
+}
+
+bool exact_f32_vector(const SemanticModel& model, const SemanticOperator& op, uint32_t tensor_id, uint32_t width);
+
+bool exact_norm_binding(const SemanticModel& model, const SemanticOperator& op, uint32_t width,
+                        bool allow_no_scale) {
+    const auto* payload = std::get_if<RmsNormPayload>(&op.payload);
+    const float epsilon = payload ? std::bit_cast<float>(payload->epsilon_f32_bits) : 0.0f;
+    if (!payload || !std::isfinite(epsilon) || epsilon < 0.0f || payload->axis != -1 ||
+        op.inputs.size() != 1 || op.outputs.size() != 1 ||
+        !value_last_width(model, op.inputs[0], ScalarType::F32, width) ||
+        !value_last_width(model, op.outputs[0], ScalarType::F32, width)) return false;
+    if (payload->weight_mode == 0) return allow_no_scale && op.tensors.empty();
+    if (payload->weight_mode != 1 || op.tensors.size() != 1) return false;
+    return exact_f32_vector(model, op, op.tensors[0], width);
+}
+
+bool exact_f32_vector(const SemanticModel& model, const SemanticOperator& op, uint32_t tensor_id, uint32_t width) {
+    if (tensor_id >= model.tensors.size()) return false;
+    const SemanticTensor& tensor = model.tensors[tensor_id];
+    return tensor.logical_type == ScalarType::F32 && tensor.dimensions ==
+               std::vector<Dimension>{{DimensionKind::Constant, width}} &&
+           tensor.layout.kind == PhysicalLayoutKind::ContiguousRowMajor && tensor.layout.rank == 1 &&
+           tensor.layout.strides[0] == 1 && tensor.quantization.kind == QuantizationKind::None &&
+           tensor.planes.size() == 1 && tensor.planes[0].kind == PlaneKind::Values &&
+           tensor.planes[0].storage_type == ScalarType::F32 && tensor.planes[0].length == uint64_t{width} * 4 &&
+           tensor.planes[0].alignment != 0 && op.tensors.size() == 1 && op.tensors[0] == tensor_id;
+}
+
+bool exact_f32_matrix(const SemanticModel& model, const SemanticOperator& op, uint32_t tensor_id,
+                      uint32_t rows, uint32_t columns) {
+    if (tensor_id >= model.tensors.size()) return false;
+    const SemanticTensor& tensor = model.tensors[tensor_id];
+    return tensor.logical_type == ScalarType::F32 && tensor.dimensions ==
+               std::vector<Dimension>{{DimensionKind::Constant, rows}, {DimensionKind::Constant, columns}} &&
+           tensor.layout.kind == PhysicalLayoutKind::ContiguousRowMajor && tensor.layout.rank == 2 &&
+           tensor.layout.axis_order[0] == 1 && tensor.layout.axis_order[1] == 0 &&
+           tensor.layout.strides[0] == 1 && tensor.layout.strides[1] == columns &&
+           tensor.quantization.kind == QuantizationKind::None && tensor.planes.size() == 1 &&
+           tensor.planes[0].kind == PlaneKind::Values && tensor.planes[0].storage_type == ScalarType::F32 &&
+           tensor.planes[0].length == uint64_t{rows} * columns * 4 && tensor.planes[0].alignment != 0 &&
+           op.tensors.size() == 1 && op.tensors[0] == tensor_id;
+}
+
+bool semantic_flat_width(const SemanticModel& model, uint32_t id, ScalarType type,
+                         uint32_t& width) {
+    const SemanticValue* value = value_with_id(model, id);
+    if (!value || value->logical_type != type || value->dimensions.size() < 2) return false;
+    uint64_t product = 1;
+    for (size_t index = 1; index != value->dimensions.size(); ++index) {
+        const Dimension& dimension = value->dimensions[index];
+        if (dimension.kind != DimensionKind::Constant || dimension.constant_or_symbol == 0 ||
+            product > UINT32_MAX / dimension.constant_or_symbol) return false;
+        product *= dimension.constant_or_symbol;
+    }
+    width = static_cast<uint32_t>(product);
+    return true;
+}
+
+bool exact_linear_binding(const SemanticModel& model, const SemanticOperator& op,
+                         uint32_t input_id, uint32_t output_id) {
+    const auto* payload = std::get_if<LinearPayload>(&op.payload);
+    if (op.kind != OperatorKind::Linear || !payload || payload->transpose_weight ||
+        op.tensors.size() != 1 ||
+        op.inputs.size() != 1 || op.outputs.size() != 1 || op.inputs[0] != input_id ||
+        op.outputs[0] != output_id || op.tensors[0] >= model.tensors.size()) return false;
+    uint32_t input_width = 0;
+    uint32_t output_width = 0;
+    if (!semantic_flat_width(model, input_id, ScalarType::F32, input_width) ||
+        !semantic_flat_width(model, output_id, ScalarType::F32, output_width)) return false;
+    const SemanticTensor& tensor = model.tensors[op.tensors[0]];
+    return tensor.dimensions == std::vector<Dimension>{
+               {DimensionKind::Constant, input_width},
+               {DimensionKind::Constant, output_width}};
+}
+
+bool match_dense_graph_impl(const SemanticModel& model, const SemanticLayer& layer,
+                            DenseGraphWitness& witness) {
+    witness = {};
+    if (layer.first_operator > model.operators.size() ||
+        layer.operator_count > model.operators.size() - layer.first_operator ||
+        layer.operator_count == 0) return false;
+
+    const auto unique_kind = [&](OperatorKind kind) -> const SemanticOperator* {
+        const SemanticOperator* found = nullptr;
+        for (uint32_t index = 0; index != layer.operator_count; ++index) {
+            const SemanticOperator& op = model.operators[layer.first_operator + index];
+            if (op.kind != kind) continue;
+            if (found) return nullptr;
+            found = &op;
+        }
+        return found;
+    };
+    const SemanticOperator* attention_norm = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                             TensorRole::AttentionNormWeight);
+    const SemanticOperator* query = layer_operator(model, layer, OperatorKind::Linear,
+                                                    TensorRole::QueryWeight);
+    const SemanticOperator* query_gate = layer_operator(model, layer, OperatorKind::Linear,
+                                                        TensorRole::AttentionQueryGateWeight);
+    const SemanticOperator* key = layer_operator(model, layer, OperatorKind::Linear,
+                                                 TensorRole::KeyWeight);
+    const SemanticOperator* value = layer_operator(model, layer, OperatorKind::Linear,
+                                                    TensorRole::ValueWeight);
+    const SemanticOperator* query_norm = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                        TensorRole::AttentionQueryNormWeight);
+    const SemanticOperator* key_norm = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                      TensorRole::AttentionKeyNormWeight);
+    const SemanticOperator* attention_output = layer_operator(model, layer, OperatorKind::Linear,
+                                                              TensorRole::AttentionOutputWeight);
+    const SemanticOperator* ffn_norm = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                      TensorRole::FfnNormWeight);
+    const SemanticOperator* gate = layer_operator(model, layer, OperatorKind::Linear,
+                                                  TensorRole::FfnGateWeight);
+    const SemanticOperator* up = layer_operator(model, layer, OperatorKind::Linear,
+                                                TensorRole::FfnUpWeight);
+    const SemanticOperator* down = layer_operator(model, layer, OperatorKind::Linear,
+                                                  TensorRole::FfnDownWeight);
+    const SemanticOperator* rope = unique_kind(OperatorKind::Rope);
+    const SemanticOperator* attention = unique_kind(OperatorKind::CausalAttention);
+    const SemanticOperator* swiglu = unique_kind(OperatorKind::SwiGlu);
+    const SemanticOperator* gated_attention = unique_kind(OperatorKind::GatedAttention);
+    const SemanticOperator* split = unique_kind(OperatorKind::AxisSplit);
+    if (!attention_norm || (!query && !query_gate) || (query && query_gate) || !key || !value ||
+        !attention_output || !ffn_norm || !gate || !up || !down || !rope || !attention ||
+        !swiglu || !std::get_if<CausalAttentionPayload>(&attention->payload) ||
+        !std::get_if<SwiGluPayload>(&swiglu->payload) || (query_gate ? (!gated_attention || !split) :
+                                                          (gated_attention || split)) ||
+        (query_norm == nullptr) != (key_norm == nullptr)) return false;
+
+    const auto one_input_one_output = [](const SemanticOperator* op) {
+        return op && op->inputs.size() == 1 && op->outputs.size() == 1;
+    };
+    const auto two_input_one_output = [](const SemanticOperator* op) {
+        return op && op->inputs.size() == 2 && op->outputs.size() == 1;
+    };
+    const auto two_input_two_output = [](const SemanticOperator* op) {
+        return op && op->inputs.size() == 2 && op->outputs.size() == 2;
+    };
+    const auto one_input_two_output = [](const SemanticOperator* op) {
+        return op && op->inputs.size() == 1 && op->outputs.size() == 2;
+    };
+    const auto three_input_one_output = [](const SemanticOperator* op) {
+        return op && op->inputs.size() == 3 && op->outputs.size() == 1;
+    };
+    if (!one_input_one_output(attention_norm) || !one_input_one_output(key) ||
+        !one_input_one_output(value) || !one_input_one_output(attention_output) ||
+        !one_input_one_output(ffn_norm) || !one_input_one_output(gate) ||
+        !one_input_one_output(up) || !one_input_one_output(down) ||
+        !two_input_two_output(rope) || !three_input_one_output(attention) ||
+        !two_input_one_output(swiglu)) return false;
+
+    const auto* rope_payload = std::get_if<RopePayload>(&rope->payload);
+    const auto* attention_payload = std::get_if<CausalAttentionPayload>(&attention->payload);
+    const auto* swiglu_payload = std::get_if<SwiGluPayload>(&swiglu->payload);
+    const float rope_base = rope_payload ? std::bit_cast<float>(rope_payload->base_f32_bits) : 0.0f;
+    const float rope_scale = rope_payload ? std::bit_cast<float>(rope_payload->scale_f32_bits) : 0.0f;
+    const float attention_scale = attention_payload
+        ? std::bit_cast<float>(attention_payload->scale_f32_bits) : 0.0f;
+    const auto* attention_norm_payload = std::get_if<RmsNormPayload>(&attention_norm->payload);
+    const auto* ffn_norm_payload = std::get_if<RmsNormPayload>(&ffn_norm->payload);
+    if (!rope_payload || !attention_payload || !swiglu_payload ||
+        !std::isfinite(rope_base) || rope_base <= 0.0f ||
+        !std::isfinite(rope_scale) || rope_scale != 1.0f ||
+        !std::isfinite(attention_scale) || attention_scale <= 0.0f ||
+        !attention_norm_payload || !ffn_norm_payload ||
+        attention_norm_payload->epsilon_f32_bits != ffn_norm_payload->epsilon_f32_bits ||
+        rope_payload->rotary_dimension == 0 ||
+        rope_payload->rotary_dimension > attention_payload->head_dimension ||
+        (rope_payload->rotary_dimension % 2) != 0 ||
+        swiglu_payload->activation != ActivationKind::Silu ||
+        attention->states.size() != 2 || attention_payload->value_source != ValueSource::SeparateProjection ||
+        attention_payload->window != AttentionWindowKind::Global || attention_payload->window_tokens != 0) return false;
+    const uint64_t query_width = static_cast<uint64_t>(attention_payload->query_heads) *
+                                 attention_payload->head_dimension;
+    const uint64_t kv_width = static_cast<uint64_t>(attention_payload->kv_heads) *
+                              attention_payload->head_dimension;
+    const uint64_t query_projection_width = query_gate ? query_width * 2 : query_width;
+    uint32_t residual_width = 0;
+    uint32_t normalized_width = 0;
+    if (!query_width || query_width > UINT32_MAX || !kv_width || kv_width > UINT32_MAX ||
+        query_projection_width > UINT32_MAX ||
+        (query_norm &&
+         (!exact_norm_binding(model, *query_norm, static_cast<uint32_t>(query_width), false) ||
+          !exact_norm_binding(model, *key_norm, static_cast<uint32_t>(kv_width), false))) ||
+        !semantic_flat_width(model, attention_norm->inputs[0], ScalarType::F32,
+                             residual_width) ||
+        !semantic_flat_width(model, attention_norm->outputs[0], ScalarType::F32,
+                             normalized_width) ||
+        residual_width != normalized_width ||
+        !value_last_width(model, query ? query->outputs[0] : query_gate->outputs[0], ScalarType::F32,
+                          static_cast<uint32_t>(query_projection_width)) ||
+        !value_last_width(model, key->outputs[0], ScalarType::F32, static_cast<uint32_t>(kv_width)) ||
+        !value_last_width(model, value->outputs[0], ScalarType::F32, static_cast<uint32_t>(kv_width)) ||
+        !exact_norm_binding(model, *attention_norm, residual_width, false) ||
+        !exact_norm_binding(model, *ffn_norm, residual_width, false)) return false;
+
+    const uint32_t norm_output = attention_norm->outputs[0];
+    if (query && (query->inputs != std::vector<uint32_t>{norm_output} ||
+                  !value_last_width(model, query->outputs[0], ScalarType::F32,
+                                    static_cast<uint32_t>(query_width)))) return false;
+    if (key->inputs != std::vector<uint32_t>{norm_output} || value->inputs != std::vector<uint32_t>{norm_output}) return false;
+
+    if (query_gate) {
+        const auto* split_payload = std::get_if<AxisSplitPayload>(&split->payload);
+        if (!one_input_one_output(query_gate) || query_gate->inputs != std::vector<uint32_t>{norm_output} ||
+            query_gate->outputs.size() != 1 || !one_input_two_output(split) || !split_payload ||
+            split->inputs != query_gate->outputs || split_payload->first_width != query_width ||
+            split_payload->second_width != query_width || role_tensor(model, *query_gate, TensorRole::QueryBias) != nullptr ||
+            gated_attention->inputs.size() != 2 || gated_attention->outputs.size() != 1) return false;
+        if (query_norm) {
+            if (!one_input_one_output(query_norm) || !one_input_one_output(key_norm) ||
+                query_norm->inputs != std::vector<uint32_t>{split->outputs[0]} || query_norm->outputs.size() != 1 ||
+                key_norm->inputs != key->outputs || key_norm->outputs.size() != 1 ||
+                rope->inputs != std::vector<uint32_t>{query_norm->outputs[0], key_norm->outputs[0]}) return false;
+        } else if (rope->inputs != std::vector<uint32_t>{split->outputs[0], key->outputs[0]}) return false;
+        if (gated_attention->inputs != std::vector<uint32_t>{attention->outputs[0], split->outputs[1]}) return false;
+    } else {
+        if (query_norm) {
+            if (!one_input_one_output(query_norm) || !one_input_one_output(key_norm) ||
+                query_norm->inputs != query->outputs || key_norm->inputs != key->outputs ||
+                rope->inputs != std::vector<uint32_t>{query_norm->outputs[0], key_norm->outputs[0]}) return false;
+        } else if (rope->inputs != std::vector<uint32_t>{query->outputs[0], key->outputs[0]}) return false;
+    }
+    if (attention->inputs != std::vector<uint32_t>{rope->outputs[0], rope->outputs[1], value->outputs[0]} ||
+        (query_gate ? attention_output->inputs != gated_attention->outputs
+                    : attention_output->inputs != attention->outputs) ||
+        !(value_last_width(model, attention->outputs[0], ScalarType::F32, static_cast<uint32_t>(query_width)) ||
+          value_flat_width(model, attention->outputs[0], ScalarType::F32, static_cast<uint32_t>(query_width)))) return false;
+
+    const uint32_t residual_input = attention_norm->inputs[0];
+    const uint32_t attention_output_value = attention_output->outputs[0];
+    const SemanticOperator* attention_residual = nullptr;
+    const SemanticOperator* final_residual = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Add || op.inputs.size() != 2 || op.outputs.size() != 1) continue;
+        if (op.inputs == std::vector<uint32_t>{residual_input, attention_output_value}) {
+            if (attention_residual) return false;
+            attention_residual = &op;
+        }
+    }
+    if (!attention_residual || !value_last_width(model, attention_residual->outputs[0], ScalarType::F32,
+                                                  residual_width) ||
+        ffn_norm->inputs != attention_residual->outputs || gate->inputs != ffn_norm->outputs ||
+        up->inputs != ffn_norm->outputs || !two_input_one_output(swiglu) ||
+        swiglu->inputs != std::vector<uint32_t>{gate->outputs[0], up->outputs[0]} ||
+        down->inputs != swiglu->outputs ||
+        !value_last_width(model, down->outputs[0], ScalarType::F32, residual_width)) return false;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Add || op.inputs.size() != 2 || op.outputs.size() != 1) continue;
+        if (op.inputs == std::vector<uint32_t>{attention_residual->outputs[0], down->outputs[0]}) {
+            if (final_residual) return false;
+            final_residual = &op;
+        }
+    }
+    if (!final_residual || !value_last_width(model, final_residual->outputs[0], ScalarType::F32,
+                                              residual_width)) return false;
+
+    // The Metal binder consumes a matrix as [input_width, output_width].
+    // Physical format validation alone is insufficient: a valid quantized
+    // plane with the wrong semantic shape must not be bound to a different
+    // graph edge.
+    if (!exact_linear_binding(model, query ? *query : *query_gate, norm_output,
+                              query ? query->outputs[0] : query_gate->outputs[0]) ||
+        !exact_linear_binding(model, *key, norm_output, key->outputs[0]) ||
+        !exact_linear_binding(model, *value, norm_output, value->outputs[0]) ||
+        !exact_linear_binding(model, *attention_output, attention_output->inputs[0],
+                              attention_output->outputs[0]) ||
+        !exact_linear_binding(model, *gate, ffn_norm->outputs[0], gate->outputs[0]) ||
+        !exact_linear_binding(model, *up, ffn_norm->outputs[0], up->outputs[0]) ||
+        !exact_linear_binding(model, *down, swiglu->outputs[0], down->outputs[0])) return false;
+
+    std::vector<const SemanticOperator*> covered = {
+        attention_norm, query ? query : query_gate, key, value, rope, attention,
+        attention_output, attention_residual, ffn_norm, gate, up, swiglu, down, final_residual,
+    };
+    if (query_gate) {
+        covered.push_back(split);
+        covered.push_back(gated_attention);
+    }
+    if (query_norm) {
+        covered.push_back(query_norm);
+        covered.push_back(key_norm);
+    }
+    std::sort(covered.begin(), covered.end());
+    if (std::adjacent_find(covered.begin(), covered.end()) != covered.end() ||
+        covered.size() != layer.operator_count) return false;
+    for (const SemanticOperator* op : covered) {
+        if (!op || op->outputs.empty()) return false;
+        if (std::find_if(model.operators.begin(), model.operators.end(), [&](const SemanticOperator& candidate) {
+                return &candidate != op && candidate.id == op->id;
+            }) != model.operators.end()) return false;
+    }
+    for (size_t i = 0; i != covered.size(); ++i) {
+        for (size_t j = i + 1; j != covered.size(); ++j) {
+            for (uint32_t output : covered[i]->outputs) {
+                if (std::find(covered[j]->outputs.begin(), covered[j]->outputs.end(), output) != covered[j]->outputs.end()) return false;
+            }
+        }
+    }
+
+    std::vector<uint32_t> indegree(covered.size(), 0);
+    std::vector<std::vector<size_t>> successors(covered.size());
+    for (size_t consumer = 0; consumer != covered.size(); ++consumer) {
+        for (uint32_t input : covered[consumer]->inputs) {
+            if (!value_with_id(model, input)) return false;
+            size_t producer = covered.size();
+            for (size_t candidate = 0; candidate != covered.size(); ++candidate) {
+                if (std::find(covered[candidate]->outputs.begin(), covered[candidate]->outputs.end(), input) ==
+                    covered[candidate]->outputs.end()) continue;
+                if (producer != covered.size()) return false;
+                producer = candidate;
+            }
+            if (producer == covered.size()) continue;
+            if (producer == consumer) return false;
+            successors[producer].push_back(consumer);
+            ++indegree[consumer];
+        }
+    }
+    std::vector<size_t> ready;
+    for (size_t index = 0; index != covered.size(); ++index) if (!indegree[index]) ready.push_back(index);
+    size_t processed = 0;
+    for (size_t cursor = 0; cursor != ready.size(); ++cursor) {
+        ++processed;
+        for (size_t successor : successors[ready[cursor]]) if (--indegree[successor] == 0) ready.push_back(successor);
+    }
+    if (processed != covered.size()) return false;
+
+    witness.covered_operator_ids.reserve(covered.size());
+    for (const SemanticOperator* op : covered) witness.covered_operator_ids.push_back(op->id);
+    witness.attention_norm = attention_norm;
+    witness.query = query;
+    witness.query_gate = query_gate;
+    witness.key = key;
+    witness.value = value;
+    witness.query_norm = query_norm;
+    witness.key_norm = key_norm;
+    witness.rope = rope;
+    witness.attention = attention;
+    witness.attention_output = attention_output;
+    witness.attention_residual = attention_residual;
+    witness.ffn_norm = ffn_norm;
+    witness.gate = gate;
+    witness.up = up;
+    witness.swiglu = swiglu;
+    witness.down = down;
+    witness.final_residual = final_residual;
+    witness.query_split = split;
+    witness.gated_attention = gated_attention;
+    return true;
+}
+
+bool dense_attention_geometry_is_valid(const SemanticModel& model,
+                                       std::string& detail) {
+    for (const SemanticLayer& layer : model.layers) {
+        if ((layer.flags & kSemanticLayerFlagSpeculative) != 0) continue;
+        if (layer.first_operator > model.operators.size() ||
+            layer.operator_count > model.operators.size() - layer.first_operator) {
+            detail = "canonical Metal attention layer range is invalid";
+            return false;
+        }
+        bool has_router = false;
+        for (uint32_t index = 0; index != layer.operator_count; ++index) {
+            if (model.operators[layer.first_operator + index].kind == OperatorKind::RouterTopK) {
+                has_router = true;
+                break;
+            }
+        }
+        if (has_router) continue;
+        const bool has_dense_attention =
+            layer_operator(model, layer, OperatorKind::RmsNorm, TensorRole::AttentionNormWeight) &&
+            (layer_operator(model, layer, OperatorKind::Linear, TensorRole::QueryWeight) ||
+             layer_operator(model, layer, OperatorKind::Linear, TensorRole::AttentionQueryGateWeight));
+        if (!has_dense_attention) continue;
+        DenseGraphWitness witness;
+        if (!match_dense_graph_impl(model, layer, witness) || !witness.attention) {
+            detail = "canonical Metal dense attention graph mismatch at layer " +
+                     std::to_string(layer.layer_index);
+            return false;
+        }
+        const auto* payload = std::get_if<CausalAttentionPayload>(&witness.attention->payload);
+        if (!payload || payload->query_heads == 0 || payload->kv_heads == 0 || payload->head_dimension == 0) {
+            detail = "canonical Metal dense attention geometry is invalid at layer " +
+                     std::to_string(layer.layer_index);
+            return false;
+        }
+        const uint64_t query_width = static_cast<uint64_t>(payload->query_heads) *
+                                     payload->head_dimension;
+        const uint64_t key_value_width = static_cast<uint64_t>(payload->kv_heads) *
+                                         payload->head_dimension;
+        if (query_width > INT_MAX || key_value_width > INT_MAX) {
+            detail = "canonical Metal dense attention geometry exceeds token capacity at layer " +
+                     std::to_string(layer.layer_index);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool canonical_moe_capabilities(const RuntimeCapabilities& capabilities) {
+    return capabilities.metal_device && capabilities.metal_library && capabilities.metal_pipeline &&
+           capabilities.global_fp32_kv && capabilities.transactional_state &&
+           capabilities.metal_moe_router_topk && capabilities.metal_moe_gate_up && capabilities.metal_moe_reduce;
+}
+
+bool canonical_moe_q5_capabilities(const RuntimeCapabilities& capabilities) {
+    return canonical_moe_capabilities(capabilities) && capabilities.metal_moe_down_q5_0;
+}
+
+bool canonical_moe_q8_capabilities(const RuntimeCapabilities& capabilities) {
+    return canonical_moe_capabilities(capabilities) && capabilities.metal_moe_down_q8_0;
+}
+
+bool moe_metal_layer(const SemanticModel& model, const SemanticLayer& layer,
+                     const SemanticOperator*& attention, uint32_t* weight_format = nullptr,
+                     MoeDescriptorFacts* facts_out = nullptr) {
+    uint32_t dense_format = 0;
+    if (layer.first_operator > model.operators.size() ||
+        layer.operator_count > model.operators.size() - layer.first_operator ||
+        !dense_metal_layer(model, layer, attention, &dense_format, true) || !attention) return false;
+
+    auto unique_kind = [&](OperatorKind kind) -> const SemanticOperator* {
+        const SemanticOperator* result = nullptr;
+        for (uint32_t index = 0; index != layer.operator_count; ++index) {
+            const SemanticOperator& op = model.operators[layer.first_operator + index];
+            if (op.kind != kind) continue;
+            if (result) return nullptr;
+            result = &op;
+        }
+        return result;
+    };
+
+    // The MoE leaf shares the same dense attention and dense-FFN prefix as
+    // the dense leaf.  Physical-format admission is not enough: freeze the
+    // exact value edges that the Metal implementation executes before
+    // matching the routed branch.
+    const SemanticOperator* dense_attention_norm = layer_operator(
+        model, layer, OperatorKind::RmsNorm, TensorRole::AttentionNormWeight);
+    const SemanticOperator* dense_query = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::QueryWeight);
+    const SemanticOperator* dense_query_gate = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::AttentionQueryGateWeight);
+    const SemanticOperator* dense_key = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::KeyWeight);
+    const SemanticOperator* dense_value = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::ValueWeight);
+    const SemanticOperator* dense_attention_output = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::AttentionOutputWeight);
+    const SemanticOperator* dense_ffn_norm = layer_operator(
+        model, layer, OperatorKind::RmsNorm, TensorRole::FfnNormWeight);
+    const SemanticOperator* dense_gate_for_edges = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::FfnGateWeight);
+    const SemanticOperator* dense_up_for_edges = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::FfnUpWeight);
+    const SemanticOperator* dense_down_for_edges = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::FfnDownWeight);
+    const SemanticOperator* dense_swiglu = unique_kind(OperatorKind::SwiGlu);
+    const SemanticOperator* dense_query_projection = dense_query_gate ? dense_query_gate : dense_query;
+    if (!dense_attention_norm || !dense_query_projection || !dense_key || !dense_value ||
+        !dense_attention_output || !dense_ffn_norm || !dense_gate_for_edges || !dense_up_for_edges ||
+        !dense_down_for_edges || !dense_swiglu || dense_attention_norm->inputs.size() != 1 ||
+        dense_attention_norm->outputs.size() != 1 || dense_query_projection->outputs.size() != 1 ||
+        dense_key->outputs.size() != 1 || dense_value->outputs.size() != 1 ||
+        dense_attention_output->outputs.size() != 1 || dense_ffn_norm->outputs.size() != 1 ||
+        dense_gate_for_edges->outputs.size() != 1 || dense_up_for_edges->outputs.size() != 1 ||
+        dense_swiglu->outputs.size() != 1 || dense_down_for_edges->outputs.size() != 1) return false;
+    const uint32_t dense_residual_input = dense_attention_norm->inputs[0];
+    const uint32_t dense_normalized = dense_attention_norm->outputs[0];
+    if (dense_query_projection->inputs != std::vector<uint32_t>{dense_normalized} ||
+        dense_key->inputs != std::vector<uint32_t>{dense_normalized} ||
+        dense_value->inputs != std::vector<uint32_t>{dense_normalized}) return false;
+    const SemanticOperator* exact_attention_residual = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Add ||
+            op.inputs != std::vector<uint32_t>{dense_residual_input,
+                                                dense_attention_output->outputs[0]} ||
+            op.outputs.size() != 1) continue;
+        if (exact_attention_residual) return false;
+        exact_attention_residual = &op;
+    }
+    if (!exact_attention_residual || dense_ffn_norm->inputs != exact_attention_residual->outputs ||
+        dense_gate_for_edges->inputs != dense_ffn_norm->outputs ||
+        dense_up_for_edges->inputs != dense_ffn_norm->outputs ||
+        dense_swiglu->inputs != std::vector<uint32_t>{dense_gate_for_edges->outputs[0],
+                                                       dense_up_for_edges->outputs[0]} ||
+        dense_down_for_edges->inputs != dense_swiglu->outputs ||
+        !exact_linear_binding(model, *dense_query_projection, dense_normalized,
+                              dense_query_projection->outputs[0]) ||
+        !exact_linear_binding(model, *dense_key, dense_normalized, dense_key->outputs[0]) ||
+        !exact_linear_binding(model, *dense_value, dense_normalized, dense_value->outputs[0]) ||
+        !exact_linear_binding(model, *dense_attention_output,
+                              dense_attention_output->inputs[0],
+                              dense_attention_output->outputs[0]) ||
+        !exact_linear_binding(model, *dense_gate_for_edges, dense_ffn_norm->outputs[0],
+                              dense_gate_for_edges->outputs[0]) ||
+        !exact_linear_binding(model, *dense_up_for_edges, dense_ffn_norm->outputs[0],
+                              dense_up_for_edges->outputs[0]) ||
+        !exact_linear_binding(model, *dense_down_for_edges, dense_swiglu->outputs[0],
+                              dense_down_for_edges->outputs[0])) return false;
+
+    const SemanticOperator* router = unique_kind(OperatorKind::RouterTopK);
+    if (!router || router->inputs.size() != 1 || router->outputs.size() != 2) return false;
+    const auto* router_payload = std::get_if<RouterTopKPayload>(&router->payload);
+    if (!router_payload || router_payload->expert_count == 0 || router_payload->expert_count > 512 ||
+        router_payload->selected_count == 0 || router_payload->selected_count > 16 ||
+        router_payload->selected_count > router_payload->expert_count ||
+        router_payload->score_domain != RouterScoreDomain::Logits ||
+        router_payload->normalization_order != RouterNormalizationOrder::NormalizeThenSelect ||
+        router_payload->selected_weight_normalization !=
+            SelectedWeightNormalization::RenormalizeSelectedProbabilities ||
+        router_payload->tie_policy != RouterTiePolicy::LowestExpertId ||
+        router_payload->weight_source != RouterWeightSource::SelectedNormalizedScore ||
+        !value_last_width(model, router->inputs[0], ScalarType::F32, router_payload->expert_count) ||
+        !value_last_width(model, router->outputs[0], ScalarType::U32, router_payload->selected_count) ||
+        !value_last_width(model, router->outputs[1], ScalarType::F32, router_payload->selected_count) ||
+        !same_value_prefix(model, router->inputs[0], router->outputs[0]) ||
+        !same_value_prefix(model, router->outputs[0], router->outputs[1])) return false;
+
+    const SemanticOperator* router_linear = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Linear || op.outputs != router->inputs) continue;
+        if (router_linear) return false;
+        router_linear = &op;
+    }
+    const auto* router_linear_payload = router_linear
+        ? std::get_if<LinearPayload>(&router_linear->payload) : nullptr;
+    if (!router_linear || !router_linear_payload || router_linear_payload->transpose_weight ||
+        router_linear_payload->has_bias || router_linear_payload->accumulation_type != ScalarType::F32 ||
+        router_linear->inputs.size() != 1 || router_linear->outputs.size() != 1 ||
+        !value_with_id(model, router_linear->inputs[0]) ||
+        value_with_id(model, router_linear->inputs[0])->logical_type != ScalarType::F32 ||
+        router_linear->outputs[0] != router->inputs[0]) return false;
+    const SemanticValue* router_input = value_with_id(model, router_linear->inputs[0]);
+    if (!router_input || router_input->dimensions.empty()) return false;
+    const Dimension& hidden_dimension = router_input->dimensions.back();
+    if (hidden_dimension.kind != DimensionKind::Constant || hidden_dimension.constant_or_symbol == 0 ||
+        hidden_dimension.constant_or_symbol > UINT32_MAX) return false;
+    const uint32_t hidden = static_cast<uint32_t>(hidden_dimension.constant_or_symbol);
+    if (router_linear->tensors.size() != 1 ||
+        !exact_f32_matrix(model, *router_linear, router_linear->tensors[0], router_payload->expert_count, hidden)) return false;
+
+    // The router has two semantically distinct scales: the learned tensor
+    // scale and the explicit H^-1/2 literal immediately before projection.
+    // The native leaf must consume the latter's exact bits; it may not infer
+    // or default the factor from the hidden width.
+    const SemanticOperator* normalization_scale = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Scale || op.outputs != router_linear->inputs) continue;
+        if (normalization_scale) return false;
+        normalization_scale = &op;
+    }
+    const SemanticOperator* route_scale = nullptr;
+    if (!normalization_scale || normalization_scale->inputs.size() != 1 ||
+        normalization_scale->outputs.size() != 1) return false;
+    const auto* normalization_payload = std::get_if<ScalePayload>(&normalization_scale->payload);
+    if (!normalization_payload || normalization_payload->source != ScaleSource::LiteralF32 ||
+        normalization_payload->literal_f32_bits == 0 || !normalization_scale->tensors.empty() ||
+        !std::isfinite(std::bit_cast<float>(normalization_payload->literal_f32_bits)) ||
+        std::bit_cast<float>(normalization_payload->literal_f32_bits) <= 0.0f ||
+        std::fabs(std::bit_cast<float>(normalization_payload->literal_f32_bits) -
+                  1.0f / std::sqrt(static_cast<float>(hidden))) > 1.0e-6f) return false;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Scale || op.outputs != normalization_scale->inputs) continue;
+        if (route_scale) return false;
+        route_scale = &op;
+    }
+    if (!route_scale || route_scale->inputs.size() != 1 || route_scale->outputs.size() != 1) return false;
+    const auto* route_payload = std::get_if<ScalePayload>(&route_scale->payload);
+    if (!route_payload || route_payload->source != ScaleSource::Tensor ||
+        route_payload->literal_f32_bits != 0 ||
+        route_scale->tensors.size() != 1 ||
+        !exact_f32_vector(model, *route_scale, route_scale->tensors[0], hidden)) return false;
+    const SemanticOperator* router_norm = nullptr;
+    const uint32_t norm_output = route_scale->inputs[0];
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::RmsNorm || op.outputs != std::vector<uint32_t>{norm_output}) continue;
+        if (router_norm) return false;
+        router_norm = &op;
+    }
+    if (!router_norm || !exact_norm_binding(model, *router_norm, hidden, true) ||
+        std::get_if<RmsNormPayload>(&router_norm->payload)->weight_mode != 0 ||
+        route_scale->inputs[0] != router_norm->outputs[0] ||
+        normalization_scale->inputs[0] != route_scale->outputs[0]) return false;
+
+    const SemanticOperator* expert_up = nullptr;
+    const SemanticOperator* split = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& candidate_split = model.operators[layer.first_operator + index];
+        if (candidate_split.kind != OperatorKind::AxisSplit || candidate_split.inputs.size() != 1 ||
+            candidate_split.outputs.size() != 2) continue;
+        const auto* split_payload = std::get_if<AxisSplitPayload>(&candidate_split.payload);
+        if (!split_payload || split_payload->first_width == 0 ||
+            split_payload->first_width != split_payload->second_width) return false;
+        const SemanticOperator* candidate_up = nullptr;
+        for (uint32_t routed_index = 0; routed_index != layer.operator_count; ++routed_index) {
+            const SemanticOperator& candidate = model.operators[layer.first_operator + routed_index];
+            if (candidate.kind != OperatorKind::RoutedLinear || candidate.outputs != candidate_split.inputs ||
+                candidate.inputs.size() != 3 || candidate.inputs[1] != router->outputs[0] ||
+                candidate.inputs[2] != router->outputs[1]) continue;
+            if (candidate_up) return false;
+            candidate_up = &candidate;
+        }
+        if (!candidate_up) continue;
+        if (split || expert_up) return false;
+        split = &candidate_split;
+        expert_up = candidate_up;
+    }
+    if (!expert_up || !split) return false;
+    const auto* split_payload = std::get_if<AxisSplitPayload>(&split->payload);
+    const auto* up_payload = std::get_if<RoutedLinearPayload>(&expert_up->payload);
+    if (!split_payload || !up_payload || up_payload->accumulation_type != ScalarType::F32 ||
+        expert_up->outputs.size() != 1 || !value_last_width(model, expert_up->inputs[0], ScalarType::F32, hidden) ||
+        !value_matches_routed(model, expert_up->outputs[0], router->outputs[0], ScalarType::F32,
+                              2 * split_payload->first_width) ||
+        !value_matches_routed(model, split->outputs[0], router->outputs[0], ScalarType::F32,
+                              split_payload->first_width) ||
+        !value_matches_routed(model, split->outputs[1], router->outputs[0], ScalarType::F32,
+                              split_payload->second_width)) return false;
+
+    const SemanticOperator* expert_norm = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::RmsNorm || expert_up->inputs.empty() ||
+            op.outputs != std::vector<uint32_t>{expert_up->inputs[0]}) continue;
+        if (expert_norm) return false;
+        expert_norm = &op;
+    }
+    if (!expert_norm || !exact_norm_binding(model, *expert_norm, hidden, false) ||
+        expert_norm->inputs.size() != 1 || router_norm->inputs != expert_norm->inputs) return false;
+
+    const SemanticOperator* activation = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::GatedActivation || op.inputs != split->outputs) continue;
+        if (activation) return false;
+        activation = &op;
+    }
+    const auto* activation_payload = activation ? std::get_if<GatedActivationPayload>(&activation->payload) : nullptr;
+    if (!activation || !activation_payload || activation_payload->activation != ActivationKind::GeluTanh ||
+        activation->outputs.size() != 1 ||
+        !value_matches_routed(model, activation->outputs[0], router->outputs[0], ScalarType::F32,
+                              split_payload->first_width)) return false;
+
+    const SemanticOperator* expert_down = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::RoutedLinear ||
+            op.inputs != std::vector<uint32_t>{activation->outputs[0], router->outputs[0], router->outputs[1]}) continue;
+        if (expert_down) return false;
+        expert_down = &op;
+    }
+    const auto* down_payload = expert_down ? std::get_if<RoutedLinearPayload>(&expert_down->payload) : nullptr;
+    if (!expert_down || !down_payload || down_payload->accumulation_type != ScalarType::F32 ||
+        !value_matches_routed(model, expert_down->outputs.size() == 1 ? expert_down->outputs[0] : UINT32_MAX,
+                              router->outputs[0], ScalarType::F32, hidden)) return false;
+
+    const SemanticOperator* reduce = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::WeightedExpertReduce ||
+            op.inputs != std::vector<uint32_t>{expert_down->outputs[0], router->outputs[0], router->outputs[1]}) continue;
+        if (reduce) return false;
+        reduce = &op;
+    }
+    const auto* reduce_payload = reduce ? std::get_if<WeightedExpertReducePayload>(&reduce->payload) : nullptr;
+    if (!reduce || !reduce_payload || reduce_payload->association != ExpertReduceAssociation::SelectedOrderLeftToRight ||
+        reduce_payload->accumulation_type != ScalarType::F32 || reduce->outputs.size() != 1 ||
+        !value_last_width(model, reduce->outputs[0], ScalarType::F32, hidden)) return false;
+    if (reduce_payload->scale_source != ExpertScaleSource::PerExpertTensor ||
+        reduce->tensors.size() != 1 ||
+        !exact_f32_vector(model, *reduce, reduce->tensors[0], router_payload->expert_count)) {
+        return false;
+    }
+
+    const SemanticOperator* attention_residual = nullptr;
+    const SemanticOperator* ffn_norm_for_edges = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                                 TensorRole::FfnNormWeight);
+    const SemanticOperator* attention_output_for_edges = layer_operator(
+        model, layer, OperatorKind::Linear, TensorRole::AttentionOutputWeight);
+    const uint32_t attention_value =
+        ffn_norm_for_edges && ffn_norm_for_edges->inputs.size() == 1
+            ? ffn_norm_for_edges->inputs[0] : UINT32_MAX;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Add || op.outputs != std::vector<uint32_t>{attention_value}) continue;
+        if (attention_residual) return false;
+        attention_residual = &op;
+    }
+    if (!attention_residual || attention_residual->inputs.size() != 2 ||
+        attention_residual->outputs.size() != 1 || router_norm->inputs != std::vector<uint32_t>{attention_value} ||
+        expert_norm->inputs != std::vector<uint32_t>{attention_value} || !attention_output_for_edges ||
+        attention_output_for_edges->outputs.size() != 1 ||
+        std::find(attention_residual->inputs.begin(), attention_residual->inputs.end(),
+                  attention_output_for_edges->outputs[0]) ==
+            attention_residual->inputs.end()) return false;
+
+    const auto unique_role_norm = [&](uint32_t input, TensorRole role,
+                                      bool& ambiguous) -> const SemanticOperator* {
+        const SemanticOperator* found = nullptr;
+        ambiguous = false;
+        for (uint32_t index = 0; index != layer.operator_count; ++index) {
+            const SemanticOperator& op = model.operators[layer.first_operator + index];
+            if (op.kind != OperatorKind::RmsNorm || op.inputs != std::vector<uint32_t>{input} ||
+                !role_tensor(model, op, role, false)) continue;
+            if (found) {
+                ambiguous = true;
+                return nullptr;
+            }
+            found = &op;
+        }
+        return found;
+    };
+    bool ambiguous_dense_post = false;
+    bool ambiguous_moe_post = false;
+    bool ambiguous_output_post = false;
+    // The dense branch terminates at the role-tagged FfnDownWeight operator
+    // found by the dense matcher, while the routed branch terminates at the
+    // routed down operator above.
+    const SemanticOperator* dense_down = layer_operator(model, layer, OperatorKind::Linear,
+                                                        TensorRole::FfnDownWeight);
+    if (!dense_down || dense_down->outputs.size() != 1) return false;
+    const SemanticOperator* dense_post_norm =
+        unique_role_norm(dense_down->outputs[0], TensorRole::NextnEmbeddingNormWeight,
+                         ambiguous_dense_post);
+    const SemanticOperator* moe_post_norm =
+        unique_role_norm(reduce->outputs[0], TensorRole::NextnEmbeddingNormWeight,
+                         ambiguous_moe_post);
+    const uint32_t dense_terminal = dense_post_norm && dense_post_norm->outputs.size() == 1
+        ? dense_post_norm->outputs[0] : dense_down->outputs[0];
+    const uint32_t moe_terminal = moe_post_norm && moe_post_norm->outputs.size() == 1
+        ? moe_post_norm->outputs[0] : reduce->outputs[0];
+    const SemanticOperator* residual = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Add || op.inputs != std::vector<uint32_t>{dense_terminal, moe_terminal}) continue;
+        if (residual) return false;
+        residual = &op;
+    }
+    if (!residual || residual->outputs.size() != 1) return false;
+    const SemanticOperator* output_post_norm =
+        unique_role_norm(residual->outputs[0], TensorRole::NextnEmbeddingNormWeight,
+                         ambiguous_output_post);
+    const uint32_t final_input = output_post_norm && output_post_norm->outputs.size() == 1
+        ? output_post_norm->outputs[0] : residual->outputs[0];
+    const SemanticOperator* final_add = nullptr;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Add || op.inputs != std::vector<uint32_t>{attention_value, final_input}) continue;
+        if (final_add) return false;
+        final_add = &op;
+    }
+    const SemanticValue* residual_output = value_with_id(model, residual->outputs[0]);
+    const SemanticValue* final_output = final_add ? value_with_id(model, final_add->outputs[0]) : nullptr;
+    if (!final_add || residual->inputs.size() != 2 || final_add->inputs.size() != 2 ||
+        !residual_output || !final_output || residual_output->logical_type != ScalarType::F32 ||
+        final_output->logical_type != ScalarType::F32 ||
+        !value_last_width(model, residual->outputs[0], ScalarType::F32, hidden) ||
+        !value_last_width(model, final_add->outputs[0], ScalarType::F32, hidden) ||
+        residual_output->dimensions != final_output->dimensions) return false;
+    if (ambiguous_dense_post || ambiguous_moe_post || ambiguous_output_post ||
+        (dense_post_norm && !exact_norm_binding(model, *dense_post_norm, hidden, false)) ||
+        (moe_post_norm && !exact_norm_binding(model, *moe_post_norm, hidden, false)) ||
+        (output_post_norm && !exact_norm_binding(model, *output_post_norm, hidden, false))) return false;
+    const SemanticOperator* output_scale = nullptr;
+    const uint32_t output_scale_input = final_add->outputs[0];
+    bool ambiguous_output_scale = false;
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (op.kind != OperatorKind::Scale || op.inputs != std::vector<uint32_t>{output_scale_input} ||
+            !role_tensor(model, op, TensorRole::NextnEmbeddingNormWeight, false)) continue;
+        if (output_scale) {
+            ambiguous_output_scale = true;
+            break;
+        }
+        output_scale = &op;
+    }
+    if (ambiguous_output_scale) return false;
+    if (output_scale) {
+        const auto* scale_payload = std::get_if<ScalePayload>(&output_scale->payload);
+        if (!scale_payload || scale_payload->source != ScaleSource::Tensor ||
+            scale_payload->literal_f32_bits != 0 || output_scale->inputs.size() != 1 ||
+            output_scale->outputs.size() != 1 || output_scale->tensors.size() != 1 ||
+            !exact_f32_vector(model, *output_scale,
+                              output_scale->tensors[0], 1)) return false;
+    }
+
+    // All norms fused by the native leaf share one epsilon payload.  Keeping
+    // this as an exact-bit gate prevents the Metal binding from silently
+    // applying one norm's value to another semantic edge.
+    const SemanticOperator* attn_norm_witness = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                               TensorRole::AttentionNormWeight);
+    const SemanticOperator* ffn_norm_witness = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                              TensorRole::FfnNormWeight);
+    const auto* attn_norm_payload = attn_norm_witness
+        ? std::get_if<RmsNormPayload>(&attn_norm_witness->payload) : nullptr;
+    const auto* ffn_norm_payload = ffn_norm_witness
+        ? std::get_if<RmsNormPayload>(&ffn_norm_witness->payload) : nullptr;
+    if (!attn_norm_payload || !ffn_norm_payload ||
+        attn_norm_payload->epsilon_f32_bits != ffn_norm_payload->epsilon_f32_bits) return false;
+    const uint32_t fused_epsilon_bits = attn_norm_payload->epsilon_f32_bits;
+    const auto same_fused_epsilon = [&](const SemanticOperator* op) {
+        if (!op) return true;
+        const auto* payload = std::get_if<RmsNormPayload>(&op->payload);
+        return payload && payload->epsilon_f32_bits == fused_epsilon_bits;
+    };
+    if (!same_fused_epsilon(router_norm) || !same_fused_epsilon(expert_norm) ||
+        !same_fused_epsilon(dense_post_norm) || !same_fused_epsilon(moe_post_norm) ||
+        !same_fused_epsilon(output_post_norm)) return false;
+
+    const auto* attention_payload = std::get_if<CausalAttentionPayload>(&attention->payload);
+    if (!attention_payload || attention_payload->value_source != ValueSource::SeparateProjection) return false;
+    const SemanticTensor* up_tensor = role_tensor(model, *expert_up, TensorRole::FfnUpWeight, true);
+    const SemanticTensor* down_tensor = role_tensor(model, *expert_down, TensorRole::FfnDownWeight, true);
+    if (!up_tensor || !down_tensor ||
+        !exact_expert_format(model, *expert_up, TensorRole::FfnUpWeight, router_payload->expert_count,
+                             hidden, 2 * split_payload->first_width, MetalWeightFormatQ4K)) return false;
+    uint32_t down_format = 0;
+    if (down_tensor->layout.block_elements == 32 && down_tensor->layout.block_bytes == 22) down_format = MetalWeightFormatQ5_0;
+    if (down_tensor->layout.block_elements == 32 && down_tensor->layout.block_bytes == 34) down_format = MetalWeightFormatQ8_0;
+    if (!down_format || !exact_expert_format(model, *expert_down, TensorRole::FfnDownWeight, router_payload->expert_count,
+                                              split_payload->first_width, hidden, down_format)) return false;
+
+    // Freeze one exact witness for both planner and lowerer.  The matcher may
+    // discover edges in any order, but every operator in the layer must be one
+    // of these typed nodes; an extra disconnected node or a cycle is not an
+    // admissible native leaf.
+    const SemanticOperator* embedding = unique_kind(OperatorKind::EmbeddingLookup);
+    const SemanticOperator* rope = unique_kind(OperatorKind::Rope);
+    const SemanticOperator* swiglu = unique_kind(OperatorKind::SwiGlu);
+    const SemanticOperator* gated_attention = unique_kind(OperatorKind::GatedAttention);
+    const SemanticOperator* query = layer_operator(model, layer, OperatorKind::Linear,
+                                                    TensorRole::QueryWeight);
+    const SemanticOperator* query_gate = layer_operator(model, layer, OperatorKind::Linear,
+                                                        TensorRole::AttentionQueryGateWeight);
+    const SemanticOperator* key = layer_operator(model, layer, OperatorKind::Linear,
+                                                 TensorRole::KeyWeight);
+    const SemanticOperator* value = layer_operator(model, layer, OperatorKind::Linear,
+                                                   TensorRole::ValueWeight);
+    const SemanticOperator* output = layer_operator(model, layer, OperatorKind::Linear,
+                                                    TensorRole::AttentionOutputWeight);
+    const SemanticOperator* query_norm = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                        TensorRole::AttentionQueryNormWeight);
+    const SemanticOperator* key_norm = layer_operator(model, layer, OperatorKind::RmsNorm,
+                                                      TensorRole::AttentionKeyNormWeight);
+    const SemanticOperator* dense_gate = layer_operator(model, layer, OperatorKind::Linear,
+                                                        TensorRole::FfnGateWeight);
+    const SemanticOperator* dense_up = layer_operator(model, layer, OperatorKind::Linear,
+                                                      TensorRole::FfnUpWeight);
+    std::vector<const SemanticOperator*> covered;
+    const auto cover = [&](const SemanticOperator* op) {
+        if (!op) return true;
+        if (std::find(covered.begin(), covered.end(), op) != covered.end()) return true;
+        covered.push_back(op);
+        return true;
+    };
+    if (!cover(embedding) || !cover(attn_norm_witness) || !cover(query_gate ? query_gate : query) ||
+        !cover(key) || !cover(value) || !cover(output) || !cover(query_norm) || !cover(key_norm) ||
+        !cover(ffn_norm_witness) || !cover(dense_gate) || !cover(dense_up) || !cover(dense_down) ||
+        !cover(rope) || !cover(attention) || !cover(swiglu) || !cover(gated_attention) ||
+        !cover(router) || !cover(router_linear) || !cover(route_scale) ||
+        !cover(normalization_scale) || !cover(router_norm) || !cover(expert_norm) ||
+        !cover(expert_up) || !cover(split) || !cover(activation) || !cover(expert_down) ||
+        !cover(reduce) || !cover(attention_residual) || !cover(residual) || !cover(final_add) || !cover(dense_post_norm) ||
+        !cover(moe_post_norm) || !cover(output_post_norm) || !cover(output_scale) ||
+        covered.size() != layer.operator_count) {
+        return false;
+    }
+
+    std::vector<uint32_t> covered_operator_ids;
+    covered_operator_ids.reserve(covered.size());
+    for (uint32_t index = 0; index != layer.operator_count; ++index) {
+        const SemanticOperator& op = model.operators[layer.first_operator + index];
+        if (std::find(covered.begin(), covered.end(), &op) == covered.end() ||
+            std::find(covered_operator_ids.begin(), covered_operator_ids.end(), op.id) !=
+                covered_operator_ids.end()) return false;
+        covered_operator_ids.push_back(op.id);
+    }
+
+    // Kahn's test is deliberately value-edge based, not serialized-index
+    // based.  Self-edges fail closed; values entering from outside this layer
+    // are graph inputs.  Ambiguous producers are handled by the typed edge
+    // checks above (compact qualification fixtures may reuse value IDs for
+    // unrelated dense edges).
+    std::vector<uint32_t> indegree(covered.size(), 0);
+    std::vector<std::vector<size_t>> successors(covered.size());
+    for (size_t consumer = 0; consumer != covered.size(); ++consumer) {
+        const SemanticOperator& op = *covered[consumer];
+        for (uint32_t input : op.inputs) {
+            size_t producer = covered.size();
+            bool ambiguous = false;
+            for (size_t candidate = 0; candidate != covered.size(); ++candidate) {
+                if (std::find(covered[candidate]->outputs.begin(), covered[candidate]->outputs.end(), input) ==
+                    covered[candidate]->outputs.end()) continue;
+                if (producer != covered.size()) {
+                    ambiguous = true;
+                    break;
+                }
+                producer = candidate;
+            }
+            if (ambiguous) continue;
+            if (producer == covered.size()) continue; // graph input owned outside this layer
+            if (producer == consumer) return false;
+            if (std::find(successors[producer].begin(), successors[producer].end(), consumer) ==
+                successors[producer].end()) {
+                successors[producer].push_back(consumer);
+                ++indegree[consumer];
+            }
+        }
+    }
+    std::vector<size_t> ready;
+    for (size_t index = 0; index != covered.size(); ++index)
+        if (indegree[index] == 0) ready.push_back(index);
+    size_t processed = 0;
+    for (size_t cursor = 0; cursor != ready.size(); ++cursor) {
+        ++processed;
+        for (size_t successor : successors[ready[cursor]])
+            if (--indegree[successor] == 0) ready.push_back(successor);
+    }
+    if (processed != covered.size()) {
+        return false;
+    }
+
+    if (weight_format) *weight_format = dense_format | MetalWeightFormatQ4K | down_format;
+    if (facts_out) {
+        facts_out->covered_operator_ids = std::move(covered_operator_ids);
+        facts_out->dense_attn_norm = attn_norm_witness;
+        facts_out->dense_query = query;
+        facts_out->dense_query_gate = query_gate;
+        facts_out->dense_key = key;
+        facts_out->dense_value = value;
+        facts_out->dense_output = output;
+        facts_out->dense_query_norm = query_norm;
+        facts_out->dense_key_norm = key_norm;
+        facts_out->dense_ffn_norm = ffn_norm_witness;
+        facts_out->dense_gate = dense_gate;
+        facts_out->dense_up = dense_up;
+        facts_out->dense_down = dense_down;
+        facts_out->rope = rope;
+        facts_out->swiglu = swiglu;
+        facts_out->attention = attention;
+        facts_out->router = router;
+        facts_out->router_linear = router_linear;
+        facts_out->router_scale = route_scale;
+        facts_out->router_normalization_scale = normalization_scale;
+        facts_out->router_norm = router_norm;
+        facts_out->expert_norm = expert_norm;
+        facts_out->expert_up = expert_up;
+        facts_out->expert_split = split;
+        facts_out->expert_activation = activation;
+        facts_out->expert_down = expert_down;
+        facts_out->expert_reduce = reduce;
+        facts_out->attention_residual = attention_residual;
+        facts_out->residual = residual;
+        facts_out->final_add = final_add;
+        facts_out->dense_post_norm = dense_post_norm;
+        facts_out->moe_post_norm = moe_post_norm;
+        facts_out->output_post_norm = output_post_norm;
+        facts_out->output_scale = output_scale;
+        facts_out->gate_up_tensor = up_tensor;
+        facts_out->down_tensor = down_tensor;
+        facts_out->hidden = hidden;
+        facts_out->intermediate = split_payload->first_width;
+        facts_out->experts = router_payload->expert_count;
+        facts_out->selected = router_payload->selected_count;
+        facts_out->gate_up_format = MetalWeightFormatQ4K;
+        facts_out->down_format = down_format;
+        facts_out->gate_up_layout = up_tensor->layout.kind;
+        facts_out->down_layout = down_tensor->layout.kind;
+        facts_out->gate_up_quantization = up_tensor->quantization.kind;
+        facts_out->down_quantization = down_tensor->quantization.kind;
+        facts_out->gate_up_plane_mask = up_tensor->quantization.required_plane_mask;
+        facts_out->down_plane_mask = down_tensor->quantization.required_plane_mask;
+        facts_out->gate_up_block_elements = up_tensor->layout.block_elements;
+        facts_out->gate_up_block_bytes = up_tensor->layout.block_bytes;
+        facts_out->down_block_elements = down_tensor->layout.block_elements;
+        facts_out->down_block_bytes = down_tensor->layout.block_bytes;
+        facts_out->gate_up_input = hidden;
+        facts_out->gate_up_output = 2 * split_payload->first_width;
+        facts_out->down_input = split_payload->first_width;
+        facts_out->down_output = hidden;
+        facts_out->gate_up_expert_stride = up_tensor->expert_axis.per_expert_byte_stride;
+        facts_out->down_expert_stride = down_tensor->expert_axis.per_expert_byte_stride;
+        facts_out->activation = activation_payload->activation;
+        facts_out->scale_source = reduce_payload->scale_source;
+        facts_out->value_source = attention_payload->value_source;
+        facts_out->router_normalization_scale_bits = normalization_payload->literal_f32_bits;
+    }
     return true;
 }
 
@@ -324,23 +1582,94 @@ KernelQuery dense_metal_query(const SemanticModel& model, const SemanticLayer& l
     uint32_t format = 0;
     query.metal_dense_token_pattern = dense_metal_layer(model, layer, candidate, &format) && candidate == &attention;
     query.metal_weight_format_mask = format;
+    query.metal_affine_u2_256 = (format & MetalWeightFormatAffineUInt2_256) != 0;
+    query.metal_column_grouped_affine_u2_skip_256 =
+        (format & MetalWeightFormatColumnGroupedAffineUInt2Skip256) != 0;
     if (format == MetalWeightFormatF16) {
         query.storage_type = ScalarType::F16;
         query.layout = PhysicalLayoutKind::ContiguousRowMajor;
         query.quantization = QuantizationKind::None;
         query.alignment = 64;
     } else if ((format & MetalWeightFormatF16) == 0) {
-        query.storage_type = ScalarType::U8;
-        query.layout = PhysicalLayoutKind::GgufBlocked;
+        query.storage_type = format == MetalWeightFormatAffineUInt2_256
+            ? ScalarType::U32 : ScalarType::U8;
+        query.layout = format == MetalWeightFormatAffineUInt2_256
+            ? PhysicalLayoutKind::GroupedAffine
+            : format == MetalWeightFormatColumnGroupedAffineUInt2Skip256
+                ? PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip
+                : PhysicalLayoutKind::GgufBlocked;
         query.quantization = QuantizationKind::BlockedAffine;
-        query.alignment = 32;
+        query.alignment = (query.metal_affine_u2_256 ||
+                           query.metal_column_grouped_affine_u2_skip_256) ? 128 : 32;
         if (const MetalBlockedFormat* blocked = metal_blocked_format(format)) {
             query.quantization = blocked->quantization;
             query.block_elements = blocked->elements;
             query.block_bytes = blocked->bytes;
+        } else if (format == MetalWeightFormatAffineUInt2_256 ||
+                   format == MetalWeightFormatColumnGroupedAffineUInt2Skip256) {
+            query.block_elements = 256;
+            query.block_bytes = 64;
         } else if ((format & MetalWeightFormatIQ2XXS) != 0) {
             query.quantization = QuantizationKind::Codebook;
         }
+    } else if (format != MetalWeightFormatF16) {
+        // A mixed layer has no single physical block tuple.  Keep the query
+        // role-free and let the format mask carry the per-role evidence.
+        query.storage_type = static_cast<ScalarType>(0);
+        query.layout = static_cast<PhysicalLayoutKind>(0);
+        query.quantization = static_cast<QuantizationKind>(0);
+        query.alignment = (query.metal_affine_u2_256 ||
+                           query.metal_column_grouped_affine_u2_skip_256) ? 128 : 32;
+    }
+    return query;
+}
+
+KernelQuery moe_metal_query(const SemanticModel& model, const SemanticLayer& layer,
+                            const SemanticOperator& attention, ExecutionPhase phase) {
+    KernelQuery query = query_for(model, attention, phase);
+    const SemanticOperator* candidate = nullptr;
+    uint32_t format = 0;
+    MoeDescriptorFacts facts;
+    query.metal_moe_token_pattern = moe_metal_layer(model, layer, candidate, &format, &facts) && candidate == &attention;
+    query.metal_weight_format_mask = format;
+    query.metal_affine_u2_256 = (format & MetalWeightFormatAffineUInt2_256) != 0;
+    query.metal_column_grouped_affine_u2_skip_256 =
+        (format & MetalWeightFormatColumnGroupedAffineUInt2Skip256) != 0;
+    query.storage_type = ScalarType::U8;
+    query.layout = PhysicalLayoutKind::GgufBlocked;
+    query.quantization = QuantizationKind::BlockedAffine;
+    query.alignment = 32;
+    // A fused MoE layer can contain several independent physical block
+    // contracts (dense attention, Q4_K gate/up, and Q5_0 or Q8_0 down).  Do
+    // not collapse those into one arbitrary top-level block tuple; the
+    // per-role facts below are the authoritative physical contract.
+    query.block_elements = 0;
+    query.block_bytes = 0;
+    if (query.metal_moe_token_pattern) {
+        query.moe_expert_count = facts.experts;
+        query.moe_selected_count = facts.selected;
+        query.moe_gate_up_format = facts.gate_up_format;
+        query.moe_down_format = facts.down_format;
+        query.moe_gate_up_layout = facts.gate_up_layout;
+        query.moe_down_layout = facts.down_layout;
+        query.moe_gate_up_quantization = facts.gate_up_quantization;
+        query.moe_down_quantization = facts.down_quantization;
+        query.moe_gate_up_plane_mask = facts.gate_up_plane_mask;
+        query.moe_down_plane_mask = facts.down_plane_mask;
+        query.moe_gate_up_block_elements = facts.gate_up_block_elements;
+        query.moe_gate_up_block_bytes = facts.gate_up_block_bytes;
+        query.moe_down_block_elements = facts.down_block_elements;
+        query.moe_down_block_bytes = facts.down_block_bytes;
+        query.moe_gate_up_input = facts.gate_up_input;
+        query.moe_gate_up_output = facts.gate_up_output;
+        query.moe_down_input = facts.down_input;
+        query.moe_down_output = facts.down_output;
+        query.moe_gate_up_expert_stride = facts.gate_up_expert_stride;
+        query.moe_down_expert_stride = facts.down_expert_stride;
+        query.moe_router_normalization_scale_bits = facts.router_normalization_scale_bits;
+        query.moe_activation = facts.activation;
+        query.moe_scale_source = facts.scale_source;
+        query.moe_value_source = facts.value_source;
     }
     return query;
 }
@@ -467,8 +1796,7 @@ bool recurrent_metal_layer(const SemanticModel& model, const SemanticLayer& laye
     const SemanticOperator* ffn_up = layer_operator(model, layer, OperatorKind::Linear, TensorRole::FfnUpWeight);
     const SemanticOperator* ffn_down = layer_operator(model, layer, OperatorKind::Linear, TensorRole::FfnDownWeight);
     const SemanticOperator* conv = nullptr;
-    const SemanticOperator* l2_query = nullptr;
-    const SemanticOperator* l2_key = nullptr;
+    std::vector<const SemanticOperator*> l2_operators;
     const SemanticOperator* gated_rms = nullptr;
     const SemanticOperator* swiglu = nullptr;
     const SemanticOperator* recurrent_residual = nullptr;
@@ -477,11 +1805,7 @@ bool recurrent_metal_layer(const SemanticModel& model, const SemanticLayer& laye
     for (uint32_t index = 0; index != layer.operator_count; ++index) {
         const SemanticOperator& op = model.operators[layer.first_operator + index];
         if (op.kind == OperatorKind::DepthwiseConvSilu) conv = conv ? nullptr : &op;
-        if (op.kind == OperatorKind::L2Normalize) {
-            if (!l2_query) l2_query = &op;
-            else if (!l2_key) l2_key = &op;
-            else l2_key = nullptr;
-        }
+        if (op.kind == OperatorKind::L2Normalize) l2_operators.push_back(&op);
         if (op.kind == OperatorKind::GatedDeltaNet) delta_out = delta_out ? nullptr : &op;
         if (op.kind == OperatorKind::GatedRmsNorm) gated_rms = gated_rms ? nullptr : &op;
         if (op.kind == OperatorKind::SwiGlu) swiglu = swiglu ? nullptr : &op;
@@ -489,6 +1813,25 @@ bool recurrent_metal_layer(const SemanticModel& model, const SemanticLayer& laye
             if (!recurrent_residual) recurrent_residual = &op;
             else if (!ffn_residual) ffn_residual = &op;
             else ffn_residual = nullptr;
+        }
+    }
+    const SemanticOperator* l2_query = nullptr;
+    const SemanticOperator* l2_key = nullptr;
+    if (conv && conv->outputs.size() >= 2 && l2_operators.size() == 2) {
+        for (const SemanticOperator* candidate : l2_operators) {
+            if (candidate->inputs == std::vector<uint32_t>{conv->outputs[0]}) {
+                if (l2_query) {
+                    l2_query = nullptr;
+                    break;
+                }
+                l2_query = candidate;
+            } else if (candidate->inputs == std::vector<uint32_t>{conv->outputs[1]}) {
+                if (l2_key) {
+                    l2_key = nullptr;
+                    break;
+                }
+                l2_key = candidate;
+            }
         }
     }
     const auto* input_norm_payload = input_norm ? std::get_if<RmsNormPayload>(&input_norm->payload) : nullptr;
@@ -499,6 +1842,16 @@ bool recurrent_metal_layer(const SemanticModel& model, const SemanticLayer& laye
     const auto* gated_rms_payload = gated_rms ? std::get_if<GatedRmsNormPayload>(&gated_rms->payload) : nullptr;
     const auto* ffn_norm_payload = ffn_norm ? std::get_if<RmsNormPayload>(&ffn_norm->payload) : nullptr;
     const auto* swiglu_payload = swiglu ? std::get_if<SwiGluPayload>(&swiglu->payload) : nullptr;
+    const float input_norm_epsilon = input_norm_payload
+        ? std::bit_cast<float>(input_norm_payload->epsilon_f32_bits) : -1.0f;
+    const float l2_query_epsilon = l2_query_payload
+        ? std::bit_cast<float>(l2_query_payload->epsilon_f32_bits) : -1.0f;
+    const float l2_key_epsilon = l2_key_payload
+        ? std::bit_cast<float>(l2_key_payload->epsilon_f32_bits) : -1.0f;
+    const float gated_rms_epsilon = gated_rms_payload
+        ? std::bit_cast<float>(gated_rms_payload->epsilon_f32_bits) : -1.0f;
+    const float ffn_norm_epsilon = ffn_norm_payload
+        ? std::bit_cast<float>(ffn_norm_payload->epsilon_f32_bits) : -1.0f;
     const uint16_t semantic_version = delta_out ? delta_out->semantic_version : 0;
     if (semantic_version != 3 && semantic_version != 4 && semantic_version != 6) return false;
     for (uint32_t index = 0; index != layer.operator_count; ++index) {
@@ -508,6 +1861,11 @@ bool recurrent_metal_layer(const SemanticModel& model, const SemanticLayer& laye
         !conv || !l2_query || !l2_key || !delta_out || !gated_rms || !swiglu || !recurrent_residual || !ffn_residual ||
         !input_norm_payload || !conv_payload || !delta_payload || !l2_query_payload || !l2_key_payload ||
         !gated_rms_payload || !ffn_norm_payload || !swiglu_payload ||
+        !std::isfinite(input_norm_epsilon) || input_norm_epsilon < 0.0f ||
+        !std::isfinite(l2_query_epsilon) || l2_query_epsilon < 0.0f ||
+        !std::isfinite(l2_key_epsilon) || l2_key_epsilon < 0.0f ||
+        !std::isfinite(gated_rms_epsilon) || gated_rms_epsilon < 0.0f ||
+        !std::isfinite(ffn_norm_epsilon) || ffn_norm_epsilon < 0.0f ||
         conv_payload->qk_heads != delta_payload->qk_heads || conv_payload->value_heads != delta_payload->value_heads ||
         conv_payload->head_dimension != delta_payload->head_dimension || conv->states.size() != 1 || delta_out->states.size() != 1 ||
         input_norm->tensors.size() != 1 || conv->tensors.size() != 1 || delta_out->tensors.size() != 2 ||
@@ -577,29 +1935,58 @@ KernelQuery recurrent_metal_query(const SemanticModel& model, const SemanticLaye
     const SemanticOperator* candidate = nullptr;
     query.metal_recurrent_token_pattern = recurrent_metal_layer(model, layer, candidate, &format) && candidate == &delta;
     query.metal_weight_format_mask = format;
+    query.metal_affine_u2_256 = (format & MetalWeightFormatAffineUInt2_256) != 0;
+    query.metal_column_grouped_affine_u2_skip_256 =
+        (format & MetalWeightFormatColumnGroupedAffineUInt2Skip256) != 0;
     if (format && (format & MetalWeightFormatF16) == 0) {
-        query.storage_type = ScalarType::U8;
-        query.layout = PhysicalLayoutKind::GgufBlocked;
+        query.storage_type = format == MetalWeightFormatAffineUInt2_256
+            ? ScalarType::U32 : ScalarType::U8;
+        query.layout = format == MetalWeightFormatAffineUInt2_256
+            ? PhysicalLayoutKind::GroupedAffine
+            : format == MetalWeightFormatColumnGroupedAffineUInt2Skip256
+                ? PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip
+                : PhysicalLayoutKind::GgufBlocked;
         query.quantization = QuantizationKind::BlockedAffine;
-        query.alignment = 32;
+        query.alignment = (query.metal_affine_u2_256 ||
+                           query.metal_column_grouped_affine_u2_skip_256) ? 128 : 32;
         if (const MetalBlockedFormat* blocked = metal_blocked_format(format)) {
             query.quantization = blocked->quantization;
             query.block_elements = blocked->elements;
             query.block_bytes = blocked->bytes;
         } else if ((format & MetalWeightFormatIQ2XXS) != 0) {
             query.quantization = QuantizationKind::Codebook;
+        } else if (format == MetalWeightFormatAffineUInt2_256 ||
+                   format == MetalWeightFormatColumnGroupedAffineUInt2Skip256) {
+            query.block_elements = 256;
+            query.block_bytes = 64;
         }
+    } else if (format != MetalWeightFormatF16) {
+        query.storage_type = static_cast<ScalarType>(0);
+        query.layout = static_cast<PhysicalLayoutKind>(0);
+        query.quantization = static_cast<QuantizationKind>(0);
+        query.alignment = (query.metal_affine_u2_256 ||
+                           query.metal_column_grouped_affine_u2_skip_256) ? 128 : 32;
     }
     if (payload) query.head_dimension = payload->head_dimension;
     return query;
 }
 
-bool canonical_metal_operator_coverage(const SemanticModel& model, uint32_t& unexpected_operator) {
+bool canonical_metal_operator_coverage(const SemanticModel& model,
+                                       uint32_t& unexpected_operator,
+                                       std::string& detail) {
     std::vector<bool> covered(model.operators.size(), false);
     for (const SemanticLayer& layer : model.layers) {
-        if (layer.first_operator > model.operators.size() || layer.operator_count > model.operators.size() - layer.first_operator) return false;
+        if (layer.first_operator > model.operators.size() ||
+            layer.operator_count > model.operators.size() - layer.first_operator) {
+            detail = "canonical Metal layer operator range is invalid";
+            return false;
+        }
         for (uint32_t index = 0; index != layer.operator_count; ++index) {
-            if (covered[layer.first_operator + index]) return false;
+            if (covered[layer.first_operator + index]) {
+                unexpected_operator = layer.first_operator + index;
+                detail = "canonical Metal layer operator ranges overlap";
+                return false;
+            }
             covered[layer.first_operator + index] = true;
         }
     }
@@ -632,9 +2019,16 @@ bool canonical_metal_operator_coverage(const SemanticModel& model, uint32_t& une
             }
         }
         unexpected_operator = op.id;
+        detail = "canonical Metal graph-level operator is unsupported";
         return false;
     }
-    return embedding == 1 && final_norm == 1 && output == 1;
+    if (embedding != 1 || final_norm != 1 || output != 1) {
+        detail = "canonical Metal requires exactly one graph-level embedding, final norm, and output projection; observed " +
+                 std::to_string(embedding) + "/" + std::to_string(final_norm) + "/" +
+                 std::to_string(output);
+        return false;
+    }
+    return true;
 }
 
 bool checked_multiply(uint64_t left, uint64_t right, uint64_t& result) {
@@ -685,10 +2079,15 @@ KernelQuery query_for(const SemanticModel& model, const SemanticOperator& op, Ex
         if (tensor_id >= model.tensors.size()) continue;
         const SemanticTensor& tensor = model.tensors[tensor_id];
         if (first_tensor) {
+            const auto values = std::find_if(
+                tensor.planes.begin(), tensor.planes.end(), [](const TensorPlane& plane) {
+                    return plane.kind == PlaneKind::Values;
+                });
             query.layout = tensor.layout.kind;
             query.quantization = tensor.quantization.kind;
-            query.alignment = tensor.planes.empty() ? 0 : tensor.planes.front().alignment;
-            query.storage_type = tensor.planes.empty() ? static_cast<ScalarType>(0) : tensor.planes.front().storage_type;
+            query.alignment = values == tensor.planes.end() ? 0 : values->alignment;
+            query.storage_type = values == tensor.planes.end()
+                ? static_cast<ScalarType>(0) : values->storage_type;
             first_tensor = false;
         } else if (query.layout != tensor.layout.kind || query.quantization != tensor.quantization.kind) {
             query.layout = static_cast<PhysicalLayoutKind>(0);
@@ -733,11 +2132,350 @@ uint64_t state_bytes(const SemanticModel& model, const SessionRequest& request, 
 
 } // namespace
 
+bool canonical_layer_chain_witness(const SemanticModel& model,
+                                   std::vector<CanonicalLayerBoundary>& witness,
+                                   std::string& detail) {
+    constexpr uint32_t unassigned = std::numeric_limits<uint32_t>::max();
+    witness.clear();
+    detail.clear();
+    if (model.layers.empty() || model.values.empty() || model.operators.empty()) {
+        detail = "canonical Metal layer residual chain is empty";
+        return false;
+    }
+
+    std::vector<uint32_t> operator_layer(model.operators.size(), unassigned);
+    std::vector<bool> disabled_operator(model.operators.size(), false);
+    std::vector<const SemanticLayer*> active_layers;
+    uint32_t previous_end = 0;
+    bool have_previous = false;
+    for (const SemanticLayer& layer : model.layers) {
+        if (layer.first_operator > model.operators.size() ||
+            layer.operator_count == 0 ||
+            layer.operator_count > model.operators.size() - layer.first_operator) {
+            detail = "canonical Metal layer residual chain has an invalid layer range";
+            return false;
+        }
+        const bool disabled = (layer.flags & kSemanticLayerFlagSpeculative) != 0;
+        if (!disabled && have_previous && layer.first_operator != previous_end) {
+            detail = "canonical Metal layer residual chain has an inter-layer operator gap";
+            return false;
+        }
+        const uint32_t active_index = static_cast<uint32_t>(active_layers.size());
+        for (uint32_t offset = 0; offset != layer.operator_count; ++offset) {
+            const uint32_t operator_index = layer.first_operator + offset;
+            if (operator_layer[operator_index] != unassigned || disabled_operator[operator_index]) {
+                detail = "canonical Metal layer residual chain has overlapping layer ranges";
+                return false;
+            }
+            if (disabled) disabled_operator[operator_index] = true;
+            else operator_layer[operator_index] = active_index;
+        }
+        if (!disabled) {
+            active_layers.push_back(&layer);
+            previous_end = layer.first_operator + layer.operator_count;
+            have_previous = true;
+        }
+    }
+    if (active_layers.empty()) {
+        detail = "canonical Metal layer residual chain has no executable layer";
+        return false;
+    }
+
+    std::vector<uint32_t> producer(model.values.size(), unassigned);
+    std::vector<std::vector<uint32_t>> consumers(model.values.size());
+    for (uint32_t operator_index = 0; operator_index != model.operators.size();
+         ++operator_index) {
+        if (disabled_operator[operator_index]) continue;
+        const SemanticOperator& op = model.operators[operator_index];
+        for (uint32_t value_id : op.outputs) {
+            if (value_id >= model.values.size() || producer[value_id] != unassigned) {
+                detail = "canonical Metal layer residual chain has an invalid value producer";
+                return false;
+            }
+            producer[value_id] = operator_index;
+        }
+        for (uint32_t value_id : op.inputs) {
+            if (value_id >= model.values.size()) {
+                detail = "canonical Metal layer residual chain has an invalid value consumer";
+                return false;
+            }
+            consumers[value_id].push_back(operator_index);
+        }
+    }
+
+    const auto graph_output = [&](uint32_t value_id) {
+        return model.output_values_count != 0 &&
+               value_id >= model.output_values_first &&
+               value_id - model.output_values_first < model.output_values_count;
+    };
+    uint32_t previous_output = unassigned;
+    for (uint32_t active_index = 0; active_index != active_layers.size(); ++active_index) {
+        const SemanticLayer& layer = *active_layers[active_index];
+        std::vector<uint32_t> external_inputs;
+        std::vector<uint32_t> external_outputs;
+        for (uint32_t offset = 0; offset != layer.operator_count; ++offset) {
+            const SemanticOperator& op = model.operators[layer.first_operator + offset];
+            for (uint32_t value_id : op.inputs) {
+                const uint32_t source = producer[value_id];
+                if (source == unassigned || operator_layer[source] != active_index)
+                    external_inputs.push_back(value_id);
+            }
+            for (uint32_t value_id : op.outputs) {
+                bool escapes = graph_output(value_id) || consumers[value_id].empty();
+                for (uint32_t consumer : consumers[value_id])
+                    escapes = escapes || operator_layer[consumer] != active_index;
+                if (escapes) external_outputs.push_back(value_id);
+            }
+        }
+        const auto unique = [](std::vector<uint32_t>& values) {
+            std::sort(values.begin(), values.end());
+            values.erase(std::unique(values.begin(), values.end()), values.end());
+        };
+        unique(external_inputs);
+        unique(external_outputs);
+        if (external_inputs.size() != 1 || external_outputs.size() != 1) {
+            detail = "canonical Metal layer residual chain requires one input and one output at layer " +
+                     std::to_string(layer.layer_index);
+            return false;
+        }
+        if (previous_output != unassigned && external_inputs.front() != previous_output) {
+            detail = "canonical Metal layer residual chain bypasses the previous layer at layer " +
+                     std::to_string(layer.layer_index);
+            return false;
+        }
+        witness.push_back({layer.layer_index, external_inputs.front(), external_outputs.front()});
+        previous_output = external_outputs.front();
+    }
+    return true;
+}
+
+bool canonical_program_witness(const SemanticModel& model,
+                               CanonicalProgramWitness& witness,
+                               std::string& detail) {
+    witness = {};
+    detail.clear();
+    if (!canonical_layer_chain_witness(model, witness.layers, detail)) return false;
+
+    std::vector<bool> layer_operator(model.operators.size(), false);
+    for (size_t layer_index = 0; layer_index != model.layers.size(); ++layer_index) {
+        const SemanticLayer& layer = model.layers[layer_index];
+        if (layer.layer_index != layer_index) {
+            detail = "canonical Metal layer table has a non-canonical layer index";
+            return false;
+        }
+        if (layer.flags != 0) {
+            detail = "canonical Metal primary program cannot skip a declared layer";
+            return false;
+        }
+        for (uint32_t offset = 0; offset != layer.operator_count; ++offset)
+            layer_operator[layer.first_operator + offset] = true;
+    }
+    for (uint32_t index = 0; index != model.operators.size(); ++index) {
+        if (model.operators[index].id != index) {
+            detail = "canonical Metal operator table is not canonical";
+            return false;
+        }
+    }
+
+    const SemanticOperator* embedding = nullptr;
+    const SemanticOperator* final_norm = nullptr;
+    const SemanticOperator* output = nullptr;
+    for (uint32_t index = 0; index != model.operators.size(); ++index) {
+        if (layer_operator[index]) continue;
+        const SemanticOperator& op = model.operators[index];
+        if (op.kind == OperatorKind::EmbeddingLookup &&
+            role_tensor(model, op, TensorRole::TokenEmbedding)) {
+            if (embedding) {
+                detail = "canonical Metal primary program has multiple embeddings";
+                return false;
+            }
+            embedding = &op;
+        }
+        if (op.kind == OperatorKind::RmsNorm &&
+            role_tensor(model, op, TensorRole::FinalNormWeight)) {
+            if (final_norm) {
+                detail = "canonical Metal primary program has multiple final norms";
+                return false;
+            }
+            final_norm = &op;
+        }
+        if (op.kind == OperatorKind::Linear &&
+            role_tensor(model, op, TensorRole::OutputWeight)) {
+            if (output) {
+                detail = "canonical Metal primary program has multiple output projections";
+                return false;
+            }
+            output = &op;
+        }
+    }
+    if (!embedding || !final_norm || !output || embedding->inputs.size() != 1 ||
+        embedding->outputs.size() != 1 || final_norm->inputs.size() != 1 ||
+        final_norm->outputs.size() != 1 || output->inputs.size() != 1 ||
+        output->outputs.size() != 1) {
+        detail = "canonical Metal primary program spine is incomplete";
+        return false;
+    }
+    const SemanticLayer& last_layer = model.layers.back();
+    const uint32_t last_layer_end = last_layer.first_operator + last_layer.operator_count;
+    if (embedding->id >= model.layers.front().first_operator ||
+        final_norm->id < last_layer_end || output->id <= final_norm->id) {
+        detail = "canonical Metal primary program spine is out of serialized order";
+        return false;
+    }
+
+    const uint32_t token_input = embedding->inputs[0];
+    const bool declared_input = model.input_values_count != 0 &&
+        token_input >= model.input_values_first &&
+        token_input - model.input_values_first < model.input_values_count;
+    const SemanticValue* token_value = value_with_id(model, token_input);
+    if (!declared_input || !token_value || token_value->logical_type != ScalarType::U32 ||
+        embedding->outputs[0] != witness.layers.front().input_value_id ||
+        final_norm->inputs[0] != witness.layers.back().output_value_id ||
+        output->inputs != final_norm->outputs || model.output_values_count != 1 ||
+        output->outputs[0] != model.output_values_first) {
+        detail = "canonical Metal primary program edges differ from the executable spine";
+        return false;
+    }
+
+    uint32_t hidden = 0;
+    uint32_t vocabulary = 0;
+    const auto* embedding_payload = std::get_if<EmbeddingLookupPayload>(&embedding->payload);
+    const float embedding_scale = embedding_payload
+        ? std::bit_cast<float>(embedding_payload->scale_f32_bits) : 0.0f;
+    const SemanticTensor* embedding_tensor = role_tensor(
+        model, *embedding, TensorRole::TokenEmbedding);
+    if (!embedding_payload || !std::isfinite(embedding_scale) || embedding_scale <= 0.0f ||
+        !semantic_flat_width(
+            model, embedding->outputs[0], ScalarType::F32, hidden) ||
+        !semantic_flat_width(model, output->outputs[0], ScalarType::F32, vocabulary) ||
+        hidden == 0 || vocabulary == 0 || embedding_payload->width != hidden ||
+        embedding_payload->vocabulary != vocabulary || vocabulary != model.vocabulary_size ||
+        !embedding_tensor || embedding_tensor->dimensions != std::vector<Dimension>{
+            {DimensionKind::Constant, hidden}, {DimensionKind::Constant, vocabulary}} ||
+        !exact_norm_binding(model, *final_norm, hidden, false) ||
+        !exact_linear_binding(model, *output, final_norm->outputs[0], output->outputs[0])) {
+        detail = "canonical Metal primary program tensor bindings differ from the executable spine";
+        return false;
+    }
+
+    witness.token_input_value_id = token_input;
+    witness.embedding_operator_id = embedding->id;
+    witness.embedding_output_value_id = embedding->outputs[0];
+    witness.final_norm_operator_id = final_norm->id;
+    witness.final_norm_output_value_id = final_norm->outputs[0];
+    witness.output_operator_id = output->id;
+    witness.output_value_id = output->outputs[0];
+    return true;
+}
+
+bool match_canonical_dense_operator_edges(const SemanticModel& model,
+                                          const SemanticLayer& layer,
+                                          DenseGraphWitness& witness) {
+    return match_dense_graph_impl(model, layer, witness);
+}
+
+bool match_canonical_moe_operator_edges(const SemanticModel& model,
+                                        const SemanticLayer& layer,
+                                        CanonicalMoeOperatorEdges& edges) {
+    edges = {};
+    const SemanticOperator* attention = nullptr;
+    MoeDescriptorFacts facts;
+    if (!moe_metal_layer(model, layer, attention, nullptr, &facts)) return false;
+    edges.covered_operator_ids = facts.covered_operator_ids;
+    edges.dense_attn_norm = facts.dense_attn_norm;
+    edges.dense_query = facts.dense_query;
+    edges.dense_query_gate = facts.dense_query_gate;
+    edges.dense_key = facts.dense_key;
+    edges.dense_value = facts.dense_value;
+    edges.dense_output = facts.dense_output;
+    edges.dense_query_norm = facts.dense_query_norm;
+    edges.dense_key_norm = facts.dense_key_norm;
+    edges.dense_ffn_norm = facts.dense_ffn_norm;
+    edges.dense_gate = facts.dense_gate;
+    edges.dense_up = facts.dense_up;
+    edges.dense_down = facts.dense_down;
+    edges.rope = facts.rope;
+    edges.swiglu = facts.swiglu;
+    edges.attention = facts.attention;
+    edges.router = facts.router;
+    edges.router_linear = facts.router_linear;
+    edges.router_scale = facts.router_scale;
+    edges.router_normalization_scale = facts.router_normalization_scale;
+    edges.router_norm = facts.router_norm;
+    edges.expert_norm = facts.expert_norm;
+    edges.expert_up = facts.expert_up;
+    edges.expert_split = facts.expert_split;
+    edges.expert_activation = facts.expert_activation;
+    edges.expert_down = facts.expert_down;
+    edges.expert_reduce = facts.expert_reduce;
+    edges.attention_residual = facts.attention_residual;
+    edges.residual = facts.residual;
+    edges.final_add = facts.final_add;
+    edges.dense_post_norm = facts.dense_post_norm;
+    edges.moe_post_norm = facts.moe_post_norm;
+    edges.output_post_norm = facts.output_post_norm;
+    edges.output_scale = facts.output_scale;
+    edges.gate_up_tensor = facts.gate_up_tensor;
+    edges.down_tensor = facts.down_tensor;
+    edges.hidden = facts.hidden;
+    edges.intermediate = facts.intermediate;
+    edges.expert_count = facts.experts;
+    edges.selected_count = facts.selected;
+    edges.gate_up_format = facts.gate_up_format;
+    edges.down_format = facts.down_format;
+    edges.gate_up_layout = facts.gate_up_layout;
+    edges.down_layout = facts.down_layout;
+    edges.gate_up_quantization = facts.gate_up_quantization;
+    edges.down_quantization = facts.down_quantization;
+    edges.gate_up_plane_mask = facts.gate_up_plane_mask;
+    edges.down_plane_mask = facts.down_plane_mask;
+    edges.gate_up_block_elements = facts.gate_up_block_elements;
+    edges.gate_up_block_bytes = facts.gate_up_block_bytes;
+    edges.down_block_elements = facts.down_block_elements;
+    edges.down_block_bytes = facts.down_block_bytes;
+    edges.gate_up_expert_stride = facts.gate_up_expert_stride;
+    edges.down_expert_stride = facts.down_expert_stride;
+    edges.activation = facts.activation;
+    edges.scale_source = facts.scale_source;
+    edges.value_source = facts.value_source;
+    edges.router_normalization_scale_bits = facts.router_normalization_scale_bits;
+    return !edges.covered_operator_ids.empty() && edges.attention && edges.router && edges.router_linear &&
+           edges.router_scale && edges.router_normalization_scale && edges.router_normalization_scale_bits != 0 &&
+           edges.router_norm && edges.expert_norm && edges.expert_up &&
+           edges.expert_split && edges.expert_activation && edges.expert_down &&
+           edges.expert_reduce && edges.residual && edges.final_add;
+}
+
 bool requires_scalar_fp32(const RuntimeCapabilities& capabilities) {
     return capabilities.scalar_fp32;
 }
 
 bool pattern_matches(const KernelPattern& pattern, const KernelQuery& query) {
+    const bool moe_pattern = !pattern.require_moe_descriptor ||
+                             (query.metal_moe_token_pattern &&
+                              pattern.moe_expert_count.contains(query.moe_expert_count) &&
+                              pattern.moe_selected_count.contains(query.moe_selected_count) &&
+                              matches(pattern.moe_gate_up_format, query.moe_gate_up_format) &&
+                              matches(pattern.moe_down_format, query.moe_down_format) &&
+                              matches(pattern.moe_gate_up_layout, query.moe_gate_up_layout) &&
+                              matches(pattern.moe_down_layout, query.moe_down_layout) &&
+                              matches(pattern.moe_gate_up_quantization, query.moe_gate_up_quantization) &&
+                              matches(pattern.moe_down_quantization, query.moe_down_quantization) &&
+                              matches(pattern.moe_gate_up_plane_mask, query.moe_gate_up_plane_mask) &&
+                              matches(pattern.moe_down_plane_mask, query.moe_down_plane_mask) &&
+                              pattern.moe_gate_up_block_elements.contains(query.moe_gate_up_block_elements) &&
+                              pattern.moe_gate_up_block_bytes.contains(query.moe_gate_up_block_bytes) &&
+                              pattern.moe_down_block_elements.contains(query.moe_down_block_elements) &&
+                              pattern.moe_down_block_bytes.contains(query.moe_down_block_bytes) &&
+                              pattern.moe_gate_up_input.contains(query.moe_gate_up_input) &&
+                              pattern.moe_gate_up_output.contains(query.moe_gate_up_output) &&
+                              pattern.moe_down_input.contains(query.moe_down_input) &&
+                              pattern.moe_down_output.contains(query.moe_down_output) &&
+                              matches(pattern.moe_gate_up_expert_stride, query.moe_gate_up_expert_stride) &&
+                              matches(pattern.moe_down_expert_stride, query.moe_down_expert_stride) &&
+                              matches(pattern.moe_activation, query.moe_activation) &&
+                              matches(pattern.moe_scale_source, query.moe_scale_source) &&
+                              matches(pattern.moe_value_source, query.moe_value_source));
     return pattern.semantic_version.contains(query.semantic_version) &&
            pattern.rank.contains(query.rank) &&
            pattern.alignment.contains(query.alignment) &&
@@ -753,8 +2491,13 @@ bool pattern_matches(const KernelPattern& pattern, const KernelQuery& query) {
            (!pattern.require_mixed_metal_weight_formats ||
             (query.metal_weight_format_mask & (query.metal_weight_format_mask - 1)) != 0) &&
            (!pattern.require_metal_dense_token_pattern || query.metal_dense_token_pattern) &&
+           (!pattern.require_metal_moe_token_pattern || query.metal_moe_token_pattern) &&
            (!pattern.require_metal_dense_prefill_batch_pattern || query.metal_dense_prefill_batch_pattern) &&
            (!pattern.require_metal_recurrent_token_pattern || query.metal_recurrent_token_pattern) &&
+           (!pattern.require_metal_affine_u2_256 || query.metal_affine_u2_256) &&
+           (!pattern.require_metal_column_grouped_affine_u2_skip_256 ||
+            query.metal_column_grouped_affine_u2_skip_256) &&
+           moe_pattern &&
            matches(pattern.operation, query.operation) &&
            matches(pattern.phase, query.phase) &&
            matches(pattern.logical_type, query.logical_type) &&
@@ -768,6 +2511,18 @@ bool pattern_matches(const KernelPattern& pattern, const KernelQuery& query) {
 KernelSelection select_kernel(const KernelQuery& query, const SessionRequest& request,
                               const RuntimeCapabilities& capabilities,
                               const std::vector<KernelDescriptor>& registry) {
+    // The affine bit is emitted only after the complete three-plane physical
+    // tuple has been checked.  Once present, a real queried pipeline
+    // capability is mandatory; no other descriptor or CPU fallback may
+    // silently consume the same semantic layer.
+    if ((query.metal_weight_format_mask & MetalWeightFormatAffineUInt2_256) != 0 &&
+        !capabilities.metal_affine_u2_256) {
+        return plan_error(CompatibilityError::CAPABILITY_MISSING);
+    }
+    if ((query.metal_weight_format_mask & MetalWeightFormatColumnGroupedAffineUInt2Skip256) != 0 &&
+        !capabilities.metal_column_grouped_affine_u2_skip_256) {
+        return plan_error(CompatibilityError::CAPABILITY_MISSING);
+    }
     std::vector<const KernelDescriptor*> matches;
     for (const KernelDescriptor& descriptor : registry) {
         if (!pattern_matches(descriptor.pattern, query) || descriptor.numerical_class != request.minimum_class ||
@@ -852,6 +2607,10 @@ bool requires_canonical_metal(const RuntimeCapabilities& capabilities) {
            capabilities.global_fp32_kv && capabilities.transactional_state;
 }
 
+bool requires_canonical_moe(const RuntimeCapabilities& capabilities) {
+    return canonical_moe_capabilities(capabilities);
+}
+
 std::vector<KernelDescriptor> builtin_canonical_metal_registry() {
     std::vector<KernelDescriptor> registry;
     for (ExecutionPhase phase : {ExecutionPhase::Prefill, ExecutionPhase::Decode}) {
@@ -908,11 +2667,58 @@ std::vector<KernelDescriptor> builtin_canonical_metal_registry() {
         mixed.pattern.alignment = {32, 32};
         mixed.pattern.block_elements = {0, 256};
         mixed.pattern.block_bytes = {0, 210};
-        mixed.pattern.allowed_metal_weight_formats = MetalWeightFormatQ4K | MetalWeightFormatQ5_0 |
+        mixed.pattern.allowed_metal_weight_formats = MetalWeightFormatQ4_0 | MetalWeightFormatQ4K | MetalWeightFormatQ5_0 |
                                                       MetalWeightFormatQ6K | MetalWeightFormatQ8_0 |
                                                       MetalWeightFormatQ2K | MetalWeightFormatIQ2XXS;
         mixed.pattern.require_mixed_metal_weight_formats = true;
+        KernelDescriptor mixed_affine = mixed;
+        mixed_affine.id = phase == ExecutionPhase::Prefill ? 1093 : 1094;
+        mixed_affine.pattern.allowed_metal_weight_formats |=
+            MetalWeightFormatF16 | MetalWeightFormatAffineUInt2_256;
+        mixed_affine.pattern.storage_type = any<ScalarType>();
+        mixed_affine.pattern.layout = any<PhysicalLayoutKind>();
+        mixed_affine.pattern.quantization = any<QuantizationKind>();
+        mixed_affine.pattern.alignment = {32, 128};
+        mixed_affine.pattern.require_metal_affine_u2_256 = true;
+        KernelDescriptor mixed_column_grouped = mixed;
+        mixed_column_grouped.id = phase == ExecutionPhase::Prefill ? 1099 : 1100;
+        mixed_column_grouped.pattern.allowed_metal_weight_formats |=
+            MetalWeightFormatF16 | MetalWeightFormatColumnGroupedAffineUInt2Skip256;
+        mixed_column_grouped.pattern.storage_type = any<ScalarType>();
+        mixed_column_grouped.pattern.layout = any<PhysicalLayoutKind>();
+        mixed_column_grouped.pattern.quantization = any<QuantizationKind>();
+        mixed_column_grouped.pattern.alignment = {32, 128};
+        mixed_column_grouped.pattern.require_metal_column_grouped_affine_u2_skip_256 = true;
         registry.push_back(std::move(mixed));
+        registry.push_back(std::move(mixed_affine));
+        registry.push_back(std::move(mixed_column_grouped));
+
+        KernelDescriptor affine = descriptor;
+        affine.id = phase == ExecutionPhase::Prefill ? 1095 : 1096;
+        affine.pattern.storage_type = exact(ScalarType::U32);
+        affine.pattern.layout = exact(PhysicalLayoutKind::GroupedAffine);
+        affine.pattern.quantization = exact(QuantizationKind::BlockedAffine);
+        affine.pattern.alignment = {128, 128};
+        affine.pattern.block_elements = {256, 256};
+        affine.pattern.block_bytes = {64, 64};
+        affine.pattern.allowed_metal_weight_formats = MetalWeightFormatAffineUInt2_256;
+        affine.pattern.require_mixed_metal_weight_formats = false;
+        affine.pattern.require_metal_affine_u2_256 = true;
+        registry.push_back(std::move(affine));
+
+        KernelDescriptor column_grouped = descriptor;
+        column_grouped.id = phase == ExecutionPhase::Prefill ? 1097 : 1098;
+        column_grouped.pattern.storage_type = exact(ScalarType::U8);
+        column_grouped.pattern.layout = exact(PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip);
+        column_grouped.pattern.quantization = exact(QuantizationKind::BlockedAffine);
+        column_grouped.pattern.alignment = {128, 128};
+        column_grouped.pattern.block_elements = {256, 256};
+        column_grouped.pattern.block_bytes = {64, 64};
+        column_grouped.pattern.allowed_metal_weight_formats =
+            MetalWeightFormatColumnGroupedAffineUInt2Skip256;
+        column_grouped.pattern.require_mixed_metal_weight_formats = false;
+        column_grouped.pattern.require_metal_column_grouped_affine_u2_skip_256 = true;
+        registry.push_back(std::move(column_grouped));
     }
     const size_t dense_descriptor_count = registry.size();
     for (size_t index = 0; index != dense_descriptor_count; ++index) {
@@ -926,6 +2732,75 @@ std::vector<KernelDescriptor> builtin_canonical_metal_registry() {
         descriptor.id += 4000;
         descriptor.pattern.semantic_version = {6, 6};
         registry.push_back(std::move(descriptor));
+    }
+    for (ExecutionPhase phase : {ExecutionPhase::Prefill, ExecutionPhase::Decode}) {
+        const auto add_moe = [&](uint32_t id, uint32_t down_format, uint32_t down_elements,
+                                 uint32_t down_bytes, CapabilityPredicate capability) {
+            KernelDescriptor moe;
+            moe.id = id;
+            moe.priority = 101;
+            moe.implementation = KernelImplementation::MetalDenseToken;
+            moe.pattern.operation = exact(OperatorKind::CausalAttention);
+            // MoE admission is a semantic/physical contract.  The schema and
+            // operator numbering are intentionally absent from this matcher.
+            moe.pattern.semantic_version = {1, UINT16_MAX};
+            moe.pattern.phase = exact(phase);
+            moe.pattern.logical_type = exact(ScalarType::F32);
+            moe.pattern.storage_type = exact(ScalarType::U8);
+            moe.pattern.layout = exact(PhysicalLayoutKind::GgufBlocked);
+            moe.pattern.quantization = exact(QuantizationKind::BlockedAffine);
+            moe.pattern.state_kind = exact(StateKind::KeyCache);
+            moe.pattern.state_format = exact(StateFormatKind::GlobalContiguous);
+            moe.pattern.rank = {2, 3};
+            moe.pattern.alignment = {32, 32};
+            moe.pattern.head_dimension = {32, 512};
+            moe.pattern.batch_rows = {1, 1};
+            moe.pattern.head_dimension_multiple = 16;
+            moe.pattern.tile_tokens = {0, 0};
+            moe.pattern.block_elements = {0, UINT32_MAX};
+            moe.pattern.block_bytes = {0, UINT32_MAX};
+            moe.pattern.allowed_metal_weight_formats = MetalWeightFormatF16 | MetalWeightFormatQ4K |
+                                                        MetalWeightFormatQ5_0 | MetalWeightFormatQ6K |
+                                                        MetalWeightFormatQ8_0 | MetalWeightFormatQ2K |
+                                                        MetalWeightFormatIQ2XXS;
+            moe.pattern.require_mixed_metal_weight_formats = true;
+            moe.pattern.require_metal_moe_token_pattern = true;
+            moe.pattern.require_moe_descriptor = true;
+            moe.pattern.moe_expert_count = {1, 512};
+            moe.pattern.moe_selected_count = {1, 16};
+            moe.pattern.moe_gate_up_format = exact(static_cast<uint32_t>(MetalWeightFormatQ4K));
+            moe.pattern.moe_down_format = exact(down_format);
+            moe.pattern.moe_gate_up_layout = exact(PhysicalLayoutKind::GgufBlocked);
+            moe.pattern.moe_down_layout = exact(PhysicalLayoutKind::GgufBlocked);
+            moe.pattern.moe_gate_up_quantization = exact(QuantizationKind::BlockedAffine);
+            moe.pattern.moe_down_quantization = exact(QuantizationKind::BlockedAffine);
+            moe.pattern.moe_gate_up_plane_mask = exact(1u);
+            moe.pattern.moe_down_plane_mask = exact(1u);
+            moe.pattern.moe_gate_up_block_elements = {256, 256};
+            moe.pattern.moe_gate_up_block_bytes = {144, 144};
+            moe.pattern.moe_down_block_elements = {down_elements, down_elements};
+            moe.pattern.moe_down_block_bytes = {down_bytes, down_bytes};
+            moe.pattern.moe_gate_up_input = {256, UINT32_MAX};
+            moe.pattern.moe_gate_up_output = {256, UINT32_MAX};
+            moe.pattern.moe_down_input = {256, UINT32_MAX};
+            moe.pattern.moe_down_output = {256, UINT32_MAX};
+            moe.pattern.moe_gate_up_expert_stride = any<uint64_t>();
+            moe.pattern.moe_down_expert_stride = any<uint64_t>();
+            moe.pattern.moe_activation = exact(ActivationKind::GeluTanh);
+            moe.pattern.moe_scale_source = exact(ExpertScaleSource::PerExpertTensor);
+            moe.pattern.moe_value_source = exact(ValueSource::SeparateProjection);
+            moe.capability_predicate = capability;
+            moe.numerical_class = NumericalClass::ExactFp32;
+            moe.transactional = true;
+            moe.effects = {BackendWriter::Metal, NumericalClass::ExactFp32, StateFormatKind::GlobalContiguous,
+                           FallbackKind::None, true, ScratchLifetime::Session};
+            moe.cost = {1, 1};
+            registry.push_back(std::move(moe));
+        };
+        add_moe(phase == ExecutionPhase::Prefill ? 9001 : 9002,  MetalWeightFormatQ5_0, 32, 22,
+                &canonical_moe_q5_capabilities);
+        add_moe(phase == ExecutionPhase::Prefill ? 9011 : 9012, MetalWeightFormatQ8_0, 32, 34,
+                &canonical_moe_q8_capabilities);
     }
     KernelDescriptor prefill_batch;
     prefill_batch.id = 7001;
@@ -992,6 +2867,28 @@ std::vector<KernelDescriptor> builtin_canonical_metal_registry() {
         descriptor.cost = {1, 1};
         registry.push_back(descriptor);
 
+        KernelDescriptor mixed_affine = descriptor;
+        mixed_affine.id = phase == ExecutionPhase::Prefill ? 1103 : 1104;
+        mixed_affine.pattern.allowed_metal_weight_formats |=
+            MetalWeightFormatF16 | MetalWeightFormatAffineUInt2_256;
+        mixed_affine.pattern.storage_type = any<ScalarType>();
+        mixed_affine.pattern.layout = any<PhysicalLayoutKind>();
+        mixed_affine.pattern.quantization = any<QuantizationKind>();
+        mixed_affine.pattern.alignment = {32, 128};
+        mixed_affine.pattern.require_metal_affine_u2_256 = true;
+        registry.push_back(std::move(mixed_affine));
+
+        KernelDescriptor mixed_column_grouped = descriptor;
+        mixed_column_grouped.id = phase == ExecutionPhase::Prefill ? 1105 : 1106;
+        mixed_column_grouped.pattern.allowed_metal_weight_formats |=
+            MetalWeightFormatF16 | MetalWeightFormatColumnGroupedAffineUInt2Skip256;
+        mixed_column_grouped.pattern.storage_type = any<ScalarType>();
+        mixed_column_grouped.pattern.layout = any<PhysicalLayoutKind>();
+        mixed_column_grouped.pattern.quantization = any<QuantizationKind>();
+        mixed_column_grouped.pattern.alignment = {32, 128};
+        mixed_column_grouped.pattern.require_metal_column_grouped_affine_u2_skip_256 = true;
+        registry.push_back(std::move(mixed_column_grouped));
+
         KernelDescriptor q4k = descriptor;
         q4k.id = phase == ExecutionPhase::Prefill ? 1111 : 1112;
         q4k.pattern.block_elements = {256, 256};
@@ -1027,6 +2924,33 @@ std::vector<KernelDescriptor> builtin_canonical_metal_registry() {
         iq2_xxs.pattern.allowed_metal_weight_formats = MetalWeightFormatIQ2XXS;
         iq2_xxs.pattern.require_mixed_metal_weight_formats = false;
         registry.push_back(std::move(iq2_xxs));
+
+        KernelDescriptor affine = descriptor;
+        affine.id = phase == ExecutionPhase::Prefill ? 1151 : 1152;
+        affine.pattern.alignment = {128, 128};
+        affine.pattern.storage_type = exact(ScalarType::U32);
+        affine.pattern.layout = exact(PhysicalLayoutKind::GroupedAffine);
+        affine.pattern.block_elements = {256, 256};
+        affine.pattern.block_bytes = {64, 64};
+        affine.pattern.quantization = exact(QuantizationKind::BlockedAffine);
+        affine.pattern.allowed_metal_weight_formats = MetalWeightFormatAffineUInt2_256;
+        affine.pattern.require_mixed_metal_weight_formats = false;
+        affine.pattern.require_metal_affine_u2_256 = true;
+        registry.push_back(std::move(affine));
+
+        KernelDescriptor column_grouped = descriptor;
+        column_grouped.id = phase == ExecutionPhase::Prefill ? 1153 : 1154;
+        column_grouped.pattern.alignment = {128, 128};
+        column_grouped.pattern.storage_type = exact(ScalarType::U8);
+        column_grouped.pattern.layout = exact(PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip);
+        column_grouped.pattern.block_elements = {256, 256};
+        column_grouped.pattern.block_bytes = {64, 64};
+        column_grouped.pattern.quantization = exact(QuantizationKind::BlockedAffine);
+        column_grouped.pattern.allowed_metal_weight_formats =
+            MetalWeightFormatColumnGroupedAffineUInt2Skip256;
+        column_grouped.pattern.require_mixed_metal_weight_formats = false;
+        column_grouped.pattern.require_metal_column_grouped_affine_u2_skip_256 = true;
+        registry.push_back(std::move(column_grouped));
     }
     const size_t recurrent_descriptor_end = registry.size();
     for (size_t index = recurrent_descriptor_begin; index != recurrent_descriptor_end; ++index) {
@@ -1034,6 +2958,7 @@ std::vector<KernelDescriptor> builtin_canonical_metal_registry() {
         descriptor.id += 2000;
         descriptor.pattern.semantic_version = {4, 4};
         registry.push_back(std::move(descriptor));
+
     }
     for (size_t index = recurrent_descriptor_begin; index != recurrent_descriptor_end; ++index) {
         KernelDescriptor descriptor = registry[index];
@@ -1055,15 +2980,9 @@ PlanResult plan_canonical_metal(const SemanticModel& model, const SessionRequest
                          model.opset_major == 4 && model.opset_minor == 0;
     const bool schema6 = model.schema_major == 6 && model.schema_minor == 0 &&
                          model.opset_major == 6 && model.opset_minor == 0;
-    for (const SemanticOperator& op : model.operators) {
-        if (op.kind != OperatorKind::RouterTopK && op.kind != OperatorKind::RoutedLinear &&
-            op.kind != OperatorKind::WeightedExpertReduce) continue;
-        CompatibilityReport report = plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
-        report.operator_id = op.id;
-        report.detail = "canonical Metal MoE operators are not admitted";
-        return report;
-    }
-    if (!schema1 && !schema3 && !schema4 && !schema6)
+    const bool schema7 = model.schema_major == 7 && model.schema_minor == 0 &&
+                         model.opset_major == 7 && model.opset_minor == 0;
+    if (!schema1 && !schema3 && !schema4 && !schema6 && !schema7)
         return plan_error(CompatibilityError::IR_VERSION_UNSUPPORTED);
     if (request.enable_streaming) return plan_error(CompatibilityError::STREAMING_UNSUPPORTED);
     if (request.enable_speculation) return plan_error(CompatibilityError::FALLBACK_FORBIDDEN);
@@ -1073,6 +2992,19 @@ PlanResult plan_canonical_metal(const SemanticModel& model, const SessionRequest
                               ? CompatibilityError::PLAN_CONTEXT_EXCEEDED
                               : CompatibilityError::RUNTIME_INPUT_INVALID);
     }
+    CanonicalProgramWitness program;
+    std::string program_detail;
+    if (!canonical_program_witness(model, program, program_detail)) {
+        CompatibilityReport report = plan_error(CompatibilityError::IR_REFERENCE_INVALID);
+        report.detail = std::move(program_detail);
+        return report;
+    }
+    std::string attention_window_detail;
+    if (!canonical_attention_window_is_global(model, attention_window_detail)) {
+        CompatibilityReport report = plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
+        report.detail = std::move(attention_window_detail);
+        return report;
+    }
     bool state_memory_valid = false;
     const uint64_t reserved_bytes = state_bytes(model, request, state_memory_valid);
     uint64_t total_peak = 0;
@@ -1080,13 +3012,25 @@ PlanResult plan_canonical_metal(const SemanticModel& model, const SessionRequest
         return plan_error(CompatibilityError::PLAN_MEMORY_EXCEEDED);
     }
     uint32_t unexpected_operator = UINT32_MAX;
-    if (!canonical_metal_operator_coverage(model, unexpected_operator)) {
+    std::string coverage_detail;
+    if (!canonical_metal_operator_coverage(model, unexpected_operator,
+                                           coverage_detail)) {
         CompatibilityReport report = plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
         report.operator_id = unexpected_operator;
+        report.detail = std::move(coverage_detail);
+        return report;
+    }
+    std::string geometry_detail;
+    if (!dense_attention_geometry_is_valid(model, geometry_detail)) {
+        CompatibilityReport report =
+            plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
+        report.detail = std::move(geometry_detail);
         return report;
     }
 
     ExecutionPlan plan;
+    plan.layer_chain = program.layers;
+    plan.program = std::move(program);
     plan.reserved_bytes = reserved_bytes;
     plan.peak_bytes = total_peak;
     auto append_phase = [&](ExecutionPhase phase) -> std::optional<CompatibilityReport> {
@@ -1094,22 +3038,29 @@ PlanResult plan_canonical_metal(const SemanticModel& model, const SessionRequest
             if ((layer.flags & kSemanticLayerFlagSpeculative) != 0) continue;
             const SemanticOperator* dense_anchor = nullptr;
             const SemanticOperator* recurrent_anchor = nullptr;
-            const bool dense = dense_metal_layer(model, layer, dense_anchor);
+            // Layer admission is driven by the graph and physical contracts.
+            // Schema versions may describe the IR, but they are not a model
+            // identity selector and must not decide whether a routed graph is
+            // MoE-capable.
+            const bool moe = moe_metal_layer(model, layer, dense_anchor);
+            const bool dense = !moe && dense_metal_layer(model, layer, dense_anchor);
             const bool recurrent = recurrent_metal_layer(model, layer, recurrent_anchor);
-            if (dense == recurrent || (!dense_anchor && !recurrent_anchor)) {
+            if ((dense || moe) == recurrent || (!dense_anchor && !recurrent_anchor)) {
                 CompatibilityReport report = plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
                 report.layer = layer.layer_index;
                 report.detail = "canonical Metal layer does not match an admitted full-token pattern";
                 return report;
             }
-            const SemanticOperator& anchor = dense ? *dense_anchor : *recurrent_anchor;
-            if (anchor.semantic_version != model.opset_major) {
+            const SemanticOperator& anchor = (dense || moe) ? *dense_anchor : *recurrent_anchor;
+            if (!moe && anchor.semantic_version != model.opset_major) {
                 CompatibilityReport report = plan_error(CompatibilityError::IR_VERSION_UNSUPPORTED);
                 report.layer = layer.layer_index;
                 report.operator_id = anchor.id;
                 return report;
             }
-            const KernelQuery query = dense
+            const KernelQuery query = moe
+                ? moe_metal_query(model, layer, anchor, phase)
+                : dense
                 ? (phase == ExecutionPhase::Prefill && request.max_batch != 1
                        ? dense_prefill_batch_query(model, layer, anchor, request.max_batch)
                        : dense_metal_query(model, layer, anchor, phase))
@@ -1120,7 +3071,8 @@ PlanResult plan_canonical_metal(const SemanticModel& model, const SessionRequest
                 annotated.layer = layer.layer_index;
                 annotated.operator_id = anchor.id;
                 if (annotated.detail.empty()) {
-                    annotated.detail = std::string(dense ? "canonical Metal dense" : "canonical Metal recurrent") +
+                    annotated.detail = std::string(moe ? "canonical Metal MoE" :
+                                                    dense ? "canonical Metal dense" : "canonical Metal recurrent") +
                                        " descriptor is unavailable: semantic=" + std::to_string(query.semantic_version) +
                                        " formats=" + std::to_string(query.metal_weight_format_mask) +
                                        " block=" + std::to_string(query.block_elements) + "x" +
@@ -1184,6 +3136,19 @@ PlanResult plan_canonical_metal_dense(const SemanticModel& model, const SessionR
                               ? CompatibilityError::PLAN_CONTEXT_EXCEEDED
                               : CompatibilityError::RUNTIME_INPUT_INVALID);
     }
+    std::vector<CanonicalLayerBoundary> layer_chain;
+    std::string layer_chain_detail;
+    if (!canonical_layer_chain_witness(model, layer_chain, layer_chain_detail)) {
+        CompatibilityReport report = plan_error(CompatibilityError::IR_REFERENCE_INVALID);
+        report.detail = std::move(layer_chain_detail);
+        return report;
+    }
+    std::string attention_window_detail;
+    if (!canonical_attention_window_is_global(model, attention_window_detail)) {
+        CompatibilityReport report = plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
+        report.detail = std::move(attention_window_detail);
+        return report;
+    }
     bool state_memory_valid = false;
     const uint64_t reserved_bytes = state_bytes(model, request, state_memory_valid);
     uint64_t total_peak = 0;
@@ -1191,12 +3156,23 @@ PlanResult plan_canonical_metal_dense(const SemanticModel& model, const SessionR
         return plan_error(CompatibilityError::PLAN_MEMORY_EXCEEDED);
     }
     uint32_t unexpected_operator = UINT32_MAX;
-    if (!canonical_metal_operator_coverage(model, unexpected_operator)) {
+    std::string coverage_detail;
+    if (!canonical_metal_operator_coverage(model, unexpected_operator,
+                                           coverage_detail)) {
         CompatibilityReport report = plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
         report.operator_id = unexpected_operator;
+        report.detail = std::move(coverage_detail);
+        return report;
+    }
+    std::string geometry_detail;
+    if (!dense_attention_geometry_is_valid(model, geometry_detail)) {
+        CompatibilityReport report =
+            plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
+        report.detail = std::move(geometry_detail);
         return report;
     }
     ExecutionPlan plan;
+    plan.layer_chain = std::move(layer_chain);
     plan.reserved_bytes = reserved_bytes;
     plan.peak_bytes = total_peak;
     auto append_phase = [&](ExecutionPhase phase) -> std::optional<CompatibilityReport> {
@@ -1271,6 +3247,19 @@ PlanResult plan_canonical_metal_recurrent(const SemanticModel& model, const Sess
                               ? CompatibilityError::PLAN_CONTEXT_EXCEEDED
                               : CompatibilityError::RUNTIME_INPUT_INVALID);
     }
+    std::vector<CanonicalLayerBoundary> layer_chain;
+    std::string layer_chain_detail;
+    if (!canonical_layer_chain_witness(model, layer_chain, layer_chain_detail)) {
+        CompatibilityReport report = plan_error(CompatibilityError::IR_REFERENCE_INVALID);
+        report.detail = std::move(layer_chain_detail);
+        return report;
+    }
+    std::string attention_window_detail;
+    if (!canonical_attention_window_is_global(model, attention_window_detail)) {
+        CompatibilityReport report = plan_error(CompatibilityError::KERNEL_UNAVAILABLE);
+        report.detail = std::move(attention_window_detail);
+        return report;
+    }
     bool state_memory_valid = false;
     const uint64_t reserved_bytes = state_bytes(model, request, state_memory_valid);
     uint64_t total_peak = 0;
@@ -1278,6 +3267,7 @@ PlanResult plan_canonical_metal_recurrent(const SemanticModel& model, const Sess
         return plan_error(CompatibilityError::PLAN_MEMORY_EXCEEDED);
     }
     ExecutionPlan plan;
+    plan.layer_chain = std::move(layer_chain);
     plan.reserved_bytes = reserved_bytes;
     plan.peak_bytes = total_peak;
     auto append_phase = [&](ExecutionPhase phase) -> std::optional<CompatibilityReport> {
@@ -1433,8 +3423,12 @@ bool plan_entry_matches(const SemanticModel& model, const PlanEntry& entry) {
         fused_layer = layer_for_operator(model, operator_it->id);
         const SemanticOperator* attention = nullptr;
         if (!fused_layer) return false;
-        if (!dense_metal_layer(model, *fused_layer, attention) || attention != &*operator_it) return false;
-        query = dense_metal_query(model, *fused_layer, *operator_it, entry.phase);
+        if (moe_metal_layer(model, *fused_layer, attention) && attention == &*operator_it) {
+            query = moe_metal_query(model, *fused_layer, *operator_it, entry.phase);
+        } else {
+            if (!dense_metal_layer(model, *fused_layer, attention) || attention != &*operator_it) return false;
+            query = dense_metal_query(model, *fused_layer, *operator_it, entry.phase);
+        }
     }
     if (entry.descriptor.implementation == KernelImplementation::MetalDensePrefillBatch) {
         fused_layer = layer_for_operator(model, operator_it->id);

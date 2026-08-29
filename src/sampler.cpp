@@ -6,26 +6,41 @@
 
 namespace Laplace {
 
+int Sampler::remember(int token) {
+    if (token == last_token_) {
+        repeat_run_++;
+    } else {
+        last_token_ = token;
+        repeat_run_ = 1;
+    }
+    return token;
+}
+
 int Sampler::sample(const float* logits, int n) {
+    const int blocked = repeat_run_ >= 8 && n > 1 ? last_token_ : -1;
+
     // Greedy
     if (params_.temperature <= 0.0f) {
-        int best = 0;
+        int best = blocked == 0 && n > 1 ? 1 : 0;
         float bestv = logits[best];
         for (int i = 0; i < n; i++) {
+            if (i == blocked) continue;
             if (logits[i] > bestv) { bestv = logits[i]; best = i; }
         }
-        return best;
+        return remember(best);
     }
 
     // Softmax with temperature.
     probs_.assign(n, 0.0f);
-    float maxv = logits[0];
+    int first = blocked == 0 && n > 1 ? 1 : 0;
+    float maxv = logits[first];
     for (int i = 0; i < n; i++) {
-        if (logits[i] > maxv) maxv = logits[i];
+        if (i != blocked && logits[i] > maxv) maxv = logits[i];
     }
     float invT = 1.0f / params_.temperature;
     float sum = 0.0f;
     for (int i = 0; i < n; i++) {
+        if (i == blocked) continue;
         probs_[i] = std::exp((logits[i] - maxv) * invT);
         sum += probs_[i];
     }
@@ -65,9 +80,9 @@ int Sampler::sample(const float* logits, int n) {
     float acc = 0.0f;
     for (int i = 0; i < n_cand; i++) {
         acc += probs_[indices_[i]];
-        if (r < acc) return indices_[i];
+        if (r < acc) return remember(indices_[i]);
     }
-    return indices_[n_cand - 1];
+    return remember(indices_[n_cand - 1]);
 }
 
 } // namespace Laplace

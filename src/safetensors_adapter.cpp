@@ -117,10 +117,12 @@ build_safetensors_artifact_index(const PackageView& artifact) {
         tensor.layout.version = 1;
         tensor.layout.packing = PackingKind::None;
         tensor.layout.rank = static_cast<uint8_t>(source.shape.size());
+        tensor.axis.source_rank = static_cast<uint8_t>(source.shape.size());
         uint64_t element_count = 1;
         for (size_t reverse = source.shape.size(); reverse != 0; --reverse) {
             const size_t axis = reverse - 1;
             tensor.layout.axis_order[axis] = static_cast<uint8_t>(axis);
+            tensor.axis.source_axis_order[axis] = static_cast<uint8_t>(axis);
             tensor.layout.strides[axis] = element_count;
             if (!checked_multiply(element_count, source.shape[axis], element_count)) {
                 return adapter_failure(CompatibilityError::IR_SHAPE_MISMATCH,
@@ -130,8 +132,7 @@ build_safetensors_artifact_index(const PackageView& artifact) {
         }
         tensor.quantization.kind = QuantizationKind::None;
         tensor.quantization.version = 1;
-        tensor.quantization.required_plane_mask =
-            artifact_plane_mask(PlaneKind::Values);
+        tensor.quantization.required_plane_mask = 0;
         uint64_t source_offset = 0;
         if (!checked_add(data_base, source.data_offset, source_offset)) {
             return adapter_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID,

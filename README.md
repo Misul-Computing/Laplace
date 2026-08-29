@@ -1,71 +1,64 @@
 # Laplace
 
-Laplace is the Apple Inference Engine for Apple Silicon Macs.
+Laplace is the Apple Inference Engine for M-series Macs.
 
-It is built to maximize M-series inference throughput and efficiency through
-an Apple-native Metal runtime, unified memory, a universal semantic model
-compiler and loader, and automatic capability planning. The same architecture
-is designed for dense, recurrent, and MoE models.
-
-The current alpha turns compatible GGUF packages into typed physical facts, a
-semantic graph, and a capability-checked execution plan. A session owns its
-Metal resources and mutable state, then executes each validated token step as
-a transaction. The V1 design applies the same package pipeline to GGUF and
-MLX contracts.
+Laplace is being built to load local language models and run them through an
+Apple-native Metal pipeline. Its execution core keeps compatible graph work on
+the GPU from token embedding to final logits. It reads supported quantized
+weights directly and uses Apple unified memory for model data and runtime
+state.
 
 ## Why Laplace
 
-Apple Silicon puts CPU and GPU work in one unified-memory system. Laplace keeps
-the execution model close to that hardware: Metal handles tensor work through
-compatible plans, runtime capability queries select those plans, and
-session-owned state keeps token execution explicit. See Apple's [unified-memory guidance](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus)
-and [Metal compute documentation](https://developer.apple.com/documentation/metal).
+Laplace builds its runtime plan from the model's operations, tensor layouts,
+state, and weight formats. It compiles those facts into one typed graph, then
+selects Metal kernels from the active Mac's capabilities.
 
-Universal means one semantic compiler and execution runtime that selects from
-the graph, tensor physical contract, execution phase, and queried device
-capability. Model names, paths, and hashes remain metadata.
+This design gives Laplace one execution system for compatible dense,
+recurrent, and mixture-of-experts (MoE) models. Model names, file names, and
+paths do not choose runtime kernels.
 
-## What exists today
+## Current alpha
 
-The current tree contains the core of that architecture:
+The engine contains these implemented parts:
 
-- Physical artifact validation records checked files, tensor planes, layouts,
-  aliases, and digests before semantic loading.
-- The semantic model represents tensors, values, operators, layers, state,
-  constraints, capability requirements, and tokenizer/template digests in a
-  versioned form.
-- The capability planner matches complete execution plans against operators,
-  physical formats, state contracts, and device capabilities.
-- The canonical Metal session provides dense prefill and decode transactions
-  with session-owned resources, checkpoint, commit, and rollback state.
+- Package validation for GGUF, MLX, and SafeTensors files. It checks file
+  identity, tensor bounds, planes, layouts, aliases, and digests.
+- A versioned model graph with explicit operators, data edges, layers, tensor
+  roles, and persistent state.
+- A capability planner that matches the full graph to Metal kernels and the
+  physical weight formats in the package.
+- A session-owned Metal execution core for embedding, attention, recurrent
+  state, feed-forward work, expert routing, normalization, and output
+  projection.
+- Transactional token state. The session advances only after the GPU completes
+  the token command.
 
-Semantic routed operators and expert-axis tensor contracts are present
-alongside dense and recurrent graph primitives.
+Laplace also includes direct Metal paths for quantized matrix work, mapped
+model weights, device-side routing, and compact result handling.
 
-Laplace is under active development and its interfaces may change before V1.
-
-## Architecture
+## How it works
 
 ```text
-local package
-  -> physical artifact index
-  -> versioned semantic graph and state contracts
-  -> capability-aware execution plan
-  -> session-owned Metal resources and state
-  -> transactional prefill or decode
+model package
+  -> checked tensor index
+  -> typed model graph
+  -> capability and kernel plan
+  -> session-owned Metal resources
+  -> token execution
 ```
 
-Every plan entry binds an operator to its tensor and state contract. The
-session commits a token position only after the command transaction completes.
-This gives the runtime one place to validate physical layout, capability
-requirements, resource ownership, and mutable state before work is admitted.
+The loader describes what the model contains. The planner decides how the
+active Apple GPU can execute it. The Metal session owns the command queue,
+weight mappings, temporary buffers, and model state for the full run.
 
-Dense, recurrent, routed, and expert operators share the same semantic graph,
-physical contracts, capability planner, and session state model.
+The public command-line tool currently provides GGUF metadata inspection. The
+strict product loader and Metal runtime are connected through versioned schema,
+manifest, tokenizer, planner, and session interfaces.
 
 ## Build
 
-Build on a native Apple Silicon Mac with CMake and the macOS Metal toolchain.
+Use an Apple Silicon Mac with CMake and the macOS Metal toolchain.
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLAPLACE_NATIVE=ON
@@ -75,24 +68,15 @@ ctest --test-dir build --output-on-failure
 
 ## Run
 
-Inspect a local package and create its native plan:
+Inspect local GGUF metadata:
 
 ```bash
 ./build/laplace /absolute/path/to/model.gguf
 ```
 
-Run a fixed native sample with phase-separated measurement:
-
-```bash
-./build/laplace /absolute/path/to/model.gguf \
-  -p "Hello, Laplace" -n 32 --greedy --seed 7 --max-seq 2048 --bench
-```
-
-The `--bench` option reports prefill and decode separately.
-
 See [Architecture](docs/architecture.md), [Support](docs/support.md), and
-[Benchmarks](docs/benchmarks.md) for the execution model, support levels, and
-measurement contract.
+[Benchmarks](docs/benchmarks.md) for the engine design, current capability
+surface, and benchmark format.
 
 ## License
 

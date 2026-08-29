@@ -7,6 +7,8 @@
 #include <vector>
 
 #include "compat_rule.h"
+#include "execution_plan.h"
+#include "sparse_ffn_bank.h"
 #if defined(LAPLACE_METAL_TESTING)
 #include "tensor.h"
 #endif
@@ -15,16 +17,23 @@ namespace Laplace {
 
 struct CanonicalMetalOutput {
     std::vector<float> logits;
+    uint32_t sampled_token_id = 0;
+    float sampled_logit = 0.0f;
+    uint64_t host_result_bytes = 0;
+    bool sampled = false;
     uint32_t command_buffers = 0;
     uint32_t operator_count = 0;
     double cpu_wait_ms = 0.0;
     double gpu_time_ms = 0.0;
     uint64_t peak_session_bytes = 0;
-    uint64_t projection_weight_bytes = 0;
+    uint64_t kv_cache_bytes = 0;
+    uint64_t requested_projection_source_bytes = 0;
     uint32_t projection_dispatches = 0;
     uint32_t batched_projection_dispatches = 0;
     uint32_t q4k_projection_dispatches = 0;
     uint32_t q6k_projection_dispatches = 0;
+    uint32_t grouped_affine_u2_projection_dispatches = 0;
+    uint32_t column_grouped_affine_u2_skip_projection_dispatches = 0;
     uint64_t counter_sample_count = 0;
     bool profiled = false;
     bool counter_samples = false;
@@ -50,21 +59,11 @@ struct CanonicalMetalResourceDiagnostics {
     uint64_t implicit_weight_copies = 0;
 };
 
-#if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_CANONICAL_INTERNAL)
 struct CanonicalMetalCursor {
     uint64_t session_id = 0;
     uint64_t generation = 0;
     uint32_t position = 0;
     friend bool operator==(const CanonicalMetalCursor&, const CanonicalMetalCursor&) = default;
-};
-#endif
-
-#if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_CANONICAL_INTERNAL)
-// Qualification-only conversion and sparse-selection experiments. They are
-// intentionally absent from the product API until independently admitted.
-struct SparseBlockRun {
-    uint32_t first = 0;
-    uint32_t count = 0;
 };
 
 struct CanonicalDerivedQ2KPolicy {
@@ -80,6 +79,14 @@ struct CanonicalDerivedIQ2XXSPolicy {
     bool enable_metal_error_diagnostics = false;
 #if defined(LAPLACE_METAL_TESTING)
     bool zero_fill_for_testing = false;
+#endif
+};
+
+struct CanonicalDerivedColumnGroupedU2Policy {
+    std::vector<TensorRole> tensor_roles;
+    const CalibrationCacheBundle* calibration_cache = nullptr;
+#if defined(LAPLACE_METAL_TESTING)
+    bool uniform_importance_for_testing = false;
 #endif
 };
 
@@ -184,7 +191,6 @@ struct CanonicalSparseFfnWindowDiagnostic {
     uint32_t oracle_first = 0;
     uint32_t oracle_second = 0;
 };
-#endif
 
 class CanonicalMetalProgram {
 public:
@@ -196,12 +202,14 @@ public:
 
     std::variant<CanonicalMetalOutput, CompatibilityReport> prefill(std::span<const uint32_t> token_ids);
     std::variant<CanonicalMetalOutput, CompatibilityReport> decode(uint32_t token_id);
-#if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_CANONICAL_INTERNAL)
+    std::variant<CanonicalMetalOutput, CompatibilityReport> prefill_sampled(
+        std::span<const uint32_t> token_ids);
+    std::variant<CanonicalMetalOutput, CompatibilityReport> decode_sampled(uint32_t token_id);
     std::variant<CanonicalMetalOutput, CompatibilityReport> accumulate_calibration(uint32_t token_id);
-#endif
     uint32_t layer_count() const noexcept;
     uint32_t position() const noexcept;
-#if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_CANONICAL_INTERNAL)
+    const ExecutionPlan& plan() const noexcept;
+    bool has_recurrent_layers() const noexcept;
     uint32_t derived_q2_storage_count() const noexcept;
     uint64_t derived_q2_storage_bytes() const noexcept;
     uint64_t original_source_registered_bytes() const noexcept;
@@ -212,6 +220,9 @@ public:
     uint64_t derived_iq2_xxs_source_bytes() const noexcept;
     uint64_t derived_iq2_xxs_storage_bytes() const noexcept;
     uint64_t derived_iq2_xxs_registered_bytes() const noexcept;
+    uint32_t derived_column_grouped_u2_tensor_count() const noexcept;
+    uint64_t derived_column_grouped_u2_source_bytes() const noexcept;
+    uint64_t derived_column_grouped_u2_storage_bytes() const noexcept;
     CanonicalMetalResourceDiagnostics resource_diagnostics() const noexcept;
     uint32_t sparse_ffn_layer_count() const noexcept;
     uint64_t sparse_ffn_source_bytes() const noexcept;
@@ -221,28 +232,39 @@ public:
     std::vector<uint32_t> sparse_ffn_block_counts_for_testing() const;
 #endif
     bool read_calibration(std::vector<CalibrationRecord>& records) const;
-#endif
-#if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_CANONICAL_INTERNAL)
     CanonicalMetalCursor checkpoint() const noexcept;
     bool commit(CanonicalMetalCursor) noexcept;
     bool rollback(CanonicalMetalCursor) noexcept;
-#endif
+    bool rollback_to_position(uint32_t position) noexcept;
 
 private:
+    enum class OutputMode : uint8_t { None = 0, Logits = 1, GreedySample = 2 };
     struct Impl;
     explicit CanonicalMetalProgram(std::unique_ptr<Impl> impl);
     std::variant<CanonicalMetalOutput, CompatibilityReport> run(std::span<const uint32_t> token_ids,
                                                                   ExecutionPhase phase,
-                                                                  bool produce_logits);
+                                                                  OutputMode output_mode);
+    std::variant<CanonicalMetalOutput, CompatibilityReport> advance_prefill(uint32_t token_id);
     std::unique_ptr<Impl> impl_;
 
+    friend class RuntimeSession;
+
     friend std::variant<CanonicalMetalProgram, CompatibilityReport>
-    create_canonical_metal_program(std::shared_ptr<const RuntimePackage>, uint32_t);
-#if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_CANONICAL_INTERNAL)
-    friend std::variant<CanonicalMetalProgram, CompatibilityReport>
-    create_canonical_metal_program(std::shared_ptr<const RuntimePackage>, uint32_t,
+    create_canonical_metal_program(std::shared_ptr<const RuntimePackage>, const SessionRequest&,
                                    const CanonicalDerivedQ2KPolicy&, const CanonicalSparseFfnPolicy&,
-                                   const CanonicalDerivedIQ2XXSPolicy&, const CanonicalCalibrationPolicy&);
+                                   const CanonicalDerivedIQ2XXSPolicy&, const CanonicalCalibrationPolicy&,
+                                   const CanonicalDerivedColumnGroupedU2Policy&);
+    friend std::variant<CanonicalMetalProgram, CompatibilityReport>
+    create_canonical_metal_program_internal(std::shared_ptr<const RuntimePackage>, SessionRequest,
+                                            const CanonicalDerivedQ2KPolicy&, const CanonicalSparseFfnPolicy&,
+                                            const CanonicalDerivedIQ2XXSPolicy&, const CanonicalCalibrationPolicy&,
+                                            const CanonicalDerivedColumnGroupedU2Policy&);
+#if defined(LAPLACE_QUALIFICATION_RUNTIME) || defined(LAPLACE_METAL_TESTING)
+    friend std::variant<CanonicalMetalProgram, CompatibilityReport>
+    create_qualification_canonical_metal_program(std::shared_ptr<const RuntimePackage>, uint32_t,
+                                                 const CanonicalDerivedQ2KPolicy&, const CanonicalSparseFfnPolicy&,
+                                                 const CanonicalDerivedIQ2XXSPolicy&, const CanonicalCalibrationPolicy&,
+                                                 uint32_t, const CanonicalDerivedColumnGroupedU2Policy&);
 #endif
 #if defined(LAPLACE_METAL_TESTING)
     friend void canonical_metal_fail_after_completed_submission_for_testing(CanonicalMetalProgram&);
@@ -259,16 +281,25 @@ private:
 using CanonicalMetalCreateResult = std::variant<CanonicalMetalProgram, CompatibilityReport>;
 using CanonicalMetalRunResult = std::variant<CanonicalMetalOutput, CompatibilityReport>;
 
-#if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_CANONICAL_INTERNAL)
 CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const RuntimePackage> package,
-                                                            uint32_t maximum_context,
+                                                            const SessionRequest& request,
                                                             const CanonicalDerivedQ2KPolicy& derived_q2 = {},
                                                             const CanonicalSparseFfnPolicy& sparse_ffn = {},
                                                             const CanonicalDerivedIQ2XXSPolicy& derived_iq2_xxs = {},
-                                                            const CanonicalCalibrationPolicy& calibration = {});
-#else
-CanonicalMetalCreateResult create_canonical_metal_program(std::shared_ptr<const RuntimePackage> package,
-                                                          uint32_t maximum_context);
+                                                            const CanonicalCalibrationPolicy& calibration = {},
+                                                            const CanonicalDerivedColumnGroupedU2Policy& derived_column_u2 = {});
+
+#if defined(LAPLACE_QUALIFICATION_RUNTIME) || defined(LAPLACE_METAL_TESTING)
+// Qualification and device tests may exercise an unpromoted package. This API
+// is absent from product builds.
+CanonicalMetalCreateResult create_qualification_canonical_metal_program(
+    std::shared_ptr<const RuntimePackage> package, uint32_t maximum_context,
+    const CanonicalDerivedQ2KPolicy& derived_q2 = {},
+    const CanonicalSparseFfnPolicy& sparse_ffn = {},
+    const CanonicalDerivedIQ2XXSPolicy& derived_iq2_xxs = {},
+    const CanonicalCalibrationPolicy& calibration = {},
+    uint32_t maximum_batch_rows = 1,
+    const CanonicalDerivedColumnGroupedU2Policy& derived_column_u2 = {});
 #endif
 
 #if defined(LAPLACE_METAL_TESTING)

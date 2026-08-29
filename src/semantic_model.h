@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <variant>
@@ -10,6 +11,8 @@
 #include "compatibility_report.h"
 
 namespace Laplace {
+
+inline constexpr uint32_t kSemanticModelMaximumLayers = 4096;
 
 enum class DimensionKind : uint8_t { Constant = 1, Symbol = 2 };
 enum class ScalarType : uint16_t { F32 = 1, F16 = 2, U32 = 3, I32 = 4, U8 = 5 };
@@ -25,8 +28,19 @@ enum class TensorRole : uint16_t {
     NextnProjectionWeight = 28, NextnEmbeddingNormWeight = 29,
     NextnHiddenNormWeight = 30, NextnSharedHeadNormWeight = 31,
 };
-enum class PhysicalLayoutKind : uint16_t { ContiguousRowMajor = 1, GgufBlocked = 2 };
-enum class PackingKind : uint16_t { None = 0, Gguf = 1 };
+enum class PhysicalLayoutKind : uint16_t {
+    ContiguousRowMajor = 1,
+    GgufBlocked = 2,
+    GroupedAffine = 3,
+    // Output-block-major UInt2 groups. This is a separate ABI from the
+    // legacy input-block-major GroupedAffine contract.
+    ColumnGroupedAffineUInt2Skip = 4,
+};
+enum class PackingKind : uint16_t {
+    None = 0,
+    Gguf = 1,
+    LsbBitPacked = 2,
+};
 enum class QuantizationKind : uint16_t { None = 0, BlockedAffine = 1, Codebook = 2 };
 enum class PlaneKind : uint16_t { Values = 1, Scales = 2, Biases = 3, Zeros = 4, Indexes = 5, LayoutMetadata = 6 };
 enum class OperatorKind : uint16_t {
@@ -135,6 +149,11 @@ struct SemanticTensor {
     friend bool operator==(const SemanticTensor&, const SemanticTensor&) = default;
 };
 
+// The package retains and authenticates this physical tensor, but the
+// authoritative executable graph does not reference it. This is the bounded
+// V1 boundary for optional programs that are not yet requested or executable.
+constexpr uint16_t kSemanticTensorFlagInactiveProgram = 1;
+
 struct SemanticValue {
     uint32_t id = 0;
     ScalarType logical_type = ScalarType::F32;
@@ -172,6 +191,10 @@ struct RopePayload {
     uint32_t base_f32_bits = 0;
     uint32_t scale_f32_bits = 0;
     std::array<uint32_t, 4> position_sections{};
+    // Zero preserves the historical schedule. Version 7 may set a larger
+    // even dimension when only a prefix is rotated but frequencies are
+    // defined over the full head (proportional/partial RoPE).
+    uint32_t frequency_dimension = 0;
     friend bool operator==(const RopePayload&, const RopePayload&) = default;
 };
 
@@ -255,7 +278,11 @@ struct ConcatPayload {
 
 enum class RouterScoreDomain : uint8_t { Logits = 1, Probabilities = 2 };
 enum class RouterNormalizationOrder : uint8_t { SelectThenNormalize = 1, NormalizeThenSelect = 2 };
-enum class SelectedWeightNormalization : uint8_t { Softmax = 1, PreserveSource = 2 };
+enum class SelectedWeightNormalization : uint8_t {
+    Softmax = 1,
+    PreserveSource = 2,
+    RenormalizeSelectedProbabilities = 3,
+};
 enum class RouterTiePolicy : uint8_t { LowestExpertId = 1 };
 enum class RouterWeightSource : uint8_t { SelectedNormalizedScore = 1 };
 
@@ -323,6 +350,96 @@ struct SemanticOperator {
     OperatorPayload payload = AddPayload{};
     friend bool operator==(const SemanticOperator&, const SemanticOperator&) = default;
 };
+
+// Validate every versioned payload field in addition to structural arity.
+// Source compilers use this before issuing a graph proof so a proof cannot
+// authenticate a payload that the semantic runtime would reject.
+bool semantic_operator_contract_valid(const SemanticOperator& op);
+
+// Validate the complete structural signature of one operator before its
+// references are interpreted. The arity is semantic-versioned and may depend
+// only on payload flags such as has_bias or value_source; it never depends on
+// model or tensor names.
+inline bool semantic_operator_signature_valid(const SemanticOperator& op) {
+    if (op.inputs.size() > 64 || op.outputs.size() > 64 || op.tensors.size() > 64 || op.states.size() > 64) {
+        return false;
+    }
+    const auto exact = [&](size_t inputs, size_t outputs, size_t tensors, size_t states) {
+        return op.inputs.size() == inputs && op.outputs.size() == outputs &&
+               op.tensors.size() == tensors && op.states.size() == states;
+    };
+    if (op.semantic_version == 1) {
+        if (static_cast<uint16_t>(op.kind) < 1 || static_cast<uint16_t>(op.kind) > 7) return false;
+    } else if (op.semantic_version < 2 || op.semantic_version > 7) {
+        return false;
+    }
+    switch (op.kind) {
+    case OperatorKind::EmbeddingLookup:
+        return exact(1, 1, 1, 0);
+    case OperatorKind::RmsNorm: {
+        const auto* payload = std::get_if<RmsNormPayload>(&op.payload);
+        if (!payload) return false;
+        if (payload->weight_mode == 0) return op.semantic_version == 7 && exact(1, 1, 0, 0);
+        return payload->weight_mode == 1 && exact(1, 1, 1, 0);
+    }
+    case OperatorKind::Linear: {
+        const auto* payload = std::get_if<LinearPayload>(&op.payload);
+        return payload && exact(1, 1, payload->has_bias ? 2 : 1, 0);
+    }
+    case OperatorKind::Rope:
+        return exact(2, 2, 0, 0);
+    case OperatorKind::CausalAttention: {
+        const auto* payload = std::get_if<CausalAttentionPayload>(&op.payload);
+        if (!payload) return false;
+        if (op.semantic_version < 7 || payload->value_source == ValueSource::SeparateProjection) {
+            return exact(3, 1, 0, 2);
+        }
+        if (payload->value_source == ValueSource::KeyStateAlias) return exact(2, 1, 0, 1);
+        if (payload->value_source == ValueSource::KeyPreRope ||
+            payload->value_source == ValueSource::KeyPostRope) {
+            return exact(2, 1, 0, 2);
+        }
+        return false;
+    }
+    case OperatorKind::SwiGlu:
+        return exact(2, 1, 0, 0);
+    case OperatorKind::Add:
+        return exact(2, 1, 0, 0);
+    case OperatorKind::DepthwiseConvSilu:
+        return op.semantic_version >= 2 && exact(1, 3, 1, 1);
+    case OperatorKind::GatedDeltaNet:
+        return op.semantic_version >= 2 && exact(5, 1, 2, 1);
+    case OperatorKind::GatedAttention:
+        return op.semantic_version >= 2 && exact(2, 1, 0, 0);
+    case OperatorKind::GatedRmsNorm:
+        return op.semantic_version >= 2 && exact(2, 1, 1, 0);
+    case OperatorKind::L2Normalize:
+        return op.semantic_version >= 2 && exact(1, 1, 0, 0);
+    case OperatorKind::AxisSplit:
+        return op.semantic_version >= 4 && exact(1, 2, 0, 0);
+    case OperatorKind::Concat:
+        return op.semantic_version >= 6 && exact(2, 1, 0, 0);
+    case OperatorKind::RouterTopK:
+        return op.semantic_version == 7 && exact(1, 2, 0, 0);
+    case OperatorKind::RoutedLinear:
+        return op.semantic_version == 7 && exact(3, 1, 1, 0);
+    case OperatorKind::GatedActivation:
+        return op.semantic_version == 7 && exact(2, 1, 0, 0);
+    case OperatorKind::WeightedExpertReduce: {
+        const auto* payload = std::get_if<WeightedExpertReducePayload>(&op.payload);
+        if (!payload || op.semantic_version != 7) return false;
+        return exact(3, 1, payload->scale_source == ExpertScaleSource::PerExpertTensor ? 1 : 0, 0);
+    }
+    case OperatorKind::Scale: {
+        const auto* payload = std::get_if<ScalePayload>(&op.payload);
+        if (!payload || op.semantic_version != 7) return false;
+        return exact(1, 1, payload->source == ScaleSource::Tensor ? 1 : 0, 0);
+    }
+    case OperatorKind::TanhSoftcap:
+        return op.semantic_version == 7 && exact(1, 1, 0, 0);
+    }
+    return false;
+}
 
 struct SemanticLayer {
     uint32_t layer_index = 0;
@@ -466,16 +583,19 @@ SemanticVectorResult semantic_linear(const std::vector<float>& input,
 SemanticVectorResult semantic_rope_half_split(const std::vector<float>& query,
                                               const std::vector<float>& key,
                                               uint32_t position, uint32_t rotary_dimension,
-                                              float base, float scale);
+                                              float base, float scale,
+                                              uint32_t frequency_dimension = 0);
 SemanticVectorResult semantic_rope_interleaved(const std::vector<float>& query,
                                                 const std::vector<float>& key,
                                                 uint32_t position, uint32_t rotary_dimension,
-                                                float base, float scale);
+                                                float base, float scale,
+                                                uint32_t frequency_dimension = 0);
 SemanticVectorResult semantic_rope_multi_section_half_split(const std::vector<float>& query,
                                                              const std::vector<float>& key,
                                                              const std::array<uint32_t, 4>& positions,
                                                              const std::array<uint32_t, 4>& sections,
-                                                             uint32_t rotary_dimension, float base, float scale);
+                                                             uint32_t rotary_dimension, float base, float scale,
+                                                             uint32_t frequency_dimension = 0);
 SemanticVectorResult semantic_depthwise_conv1d_silu_step(const std::vector<float>& input,
                                                           const std::vector<float>& weight,
                                                           uint32_t channels, uint32_t kernel,

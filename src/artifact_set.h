@@ -59,6 +59,9 @@ struct ArtifactIdentityForTesting {
     uint64_t size;
     int64_t mtime_seconds;
     int64_t mtime_nanoseconds;
+    int64_t ctime_seconds;
+    int64_t ctime_nanoseconds;
+    uint64_t generation;
 };
 
 bool artifact_identity_equal_for_testing(const ArtifactIdentityForTesting& left,
@@ -67,6 +70,12 @@ bool artifact_identity_equal_for_testing(const ArtifactIdentityForTesting& left,
 
 class ArtifactSet {
 public:
+    // Copies caller bytes into one immutable, reference-counted owner. The
+    // returned view remains valid after the input span and ArtifactSet have
+    // gone out of scope; it never aliases mutable caller storage.
+    static std::variant<PackageView, CompatibilityReport>
+    make_owned_blob(ArtifactId id, ArtifactRole role, std::span<const uint8_t> bytes);
+
     static std::variant<ArtifactSet, CompatibilityReport>
     load_single_file(std::string_view path);
     static std::variant<ArtifactSet, CompatibilityReport>

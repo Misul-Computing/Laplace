@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <cstddef>
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "execution_plan.h"
@@ -123,44 +126,72 @@ SemanticModel q4k_dense_model() {
         dense_tensor(10, TensorRole::FinalNormWeight, hidden, ScalarType::F32),
         dense_tensor(11, TensorRole::OutputWeight, embedding, ScalarType::F16),
     };
-    model.values = {
-        {0, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0},
-        {1, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0},
-        {2, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0},
-        {3, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 4}, {DimensionKind::Constant, 64}}, 0},
-        {4, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0},
+    model.values.clear();
+    const auto value = [&](uint32_t id, ScalarType type, std::vector<Dimension> dimensions) {
+        model.values.push_back({id, type, std::move(dimensions), 0});
     };
-    auto add = [&](OperatorKind kind, std::vector<uint32_t> tensors, std::vector<uint32_t> outputs, OperatorPayload payload) {
+    const auto rows = [](uint32_t width) {
+        return std::vector<Dimension>{{DimensionKind::Symbol, 1}, {DimensionKind::Constant, width}};
+    };
+    value(0, ScalarType::F32, rows(256)); // embedding output / residual input
+    value(1, ScalarType::F32, rows(256)); // attention norm
+    value(2, ScalarType::F32, rows(256)); // query
+    value(3, ScalarType::F32, rows(256)); // key
+    value(4, ScalarType::F32, rows(256)); // value
+    value(5, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 4}, {DimensionKind::Constant, 64}});
+    value(6, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 4}, {DimensionKind::Constant, 64}});
+    value(7, ScalarType::F32, rows(256)); // attention context
+    value(8, ScalarType::F32, rows(256)); // attention output projection
+    value(9, ScalarType::F32, rows(256)); // attention residual
+    value(10, ScalarType::F32, rows(256)); // FFN norm
+    value(11, ScalarType::F32, rows(256)); // gate
+    value(12, ScalarType::F32, rows(256)); // up
+    value(13, ScalarType::F32, rows(256)); // SwiGLU
+    value(14, ScalarType::F32, rows(256)); // FFN down
+    value(15, ScalarType::F32, rows(256)); // final residual
+    value(16, ScalarType::F32, rows(256)); // final norm
+    value(17, ScalarType::F32, rows(3)); // output logits
+    value(18, ScalarType::U32, {{DimensionKind::Symbol, 1}}); // token IDs
+    auto add = [&](OperatorKind kind, std::vector<uint32_t> inputs, std::vector<uint32_t> outputs,
+                   std::vector<uint32_t> tensors, OperatorPayload payload) {
         SemanticOperator op;
         op.id = static_cast<uint32_t>(model.operators.size());
         op.kind = kind;
+        op.inputs = std::move(inputs);
         op.tensors = std::move(tensors);
         op.outputs = std::move(outputs);
         op.payload = std::move(payload);
         model.operators.push_back(std::move(op));
     };
-    add(OperatorKind::EmbeddingLookup, {0}, {0}, EmbeddingLookupPayload{0x3f800000u, 3, 256, 0});
-    add(OperatorKind::RmsNorm, {1}, {1}, RmsNormPayload{0x358637bdu, -1, 1});
-    add(OperatorKind::Linear, {2}, {1}, LinearPayload{});
-    add(OperatorKind::Linear, {3}, {1}, LinearPayload{});
-    add(OperatorKind::Linear, {4}, {1}, LinearPayload{});
-    add(OperatorKind::Rope, {}, {1, 2}, RopePayload{RopePairing::HalfSplit, true, 64, 0x49742400u, 0x3f800000u});
+    add(OperatorKind::EmbeddingLookup, {18}, {0}, {0}, EmbeddingLookupPayload{0x3f800000u, 3, 256, 0});
+    add(OperatorKind::RmsNorm, {0}, {1}, {1}, RmsNormPayload{0x358637bdu, -1, 1});
+    add(OperatorKind::Linear, {1}, {2}, {2}, LinearPayload{});
+    add(OperatorKind::Linear, {1}, {3}, {3}, LinearPayload{});
+    add(OperatorKind::Linear, {1}, {4}, {4}, LinearPayload{});
+    add(OperatorKind::Rope, {2, 3}, {5, 6}, {}, RopePayload{RopePairing::HalfSplit, true, 64, 0x49742400u, 0x3f800000u});
     SemanticOperator attention;
     attention.id = static_cast<uint32_t>(model.operators.size());
     attention.kind = OperatorKind::CausalAttention;
-    attention.outputs = {3};
+    attention.inputs = {5, 6, 4};
+    attention.outputs = {7};
     attention.states = {0, 1};
     attention.payload = CausalAttentionPayload{4, 4, 64, 0x3e800000u, AttentionMask::Causal, CachePolicy::Global};
     model.operators.push_back(std::move(attention));
-    add(OperatorKind::Linear, {5}, {1}, LinearPayload{});
-    add(OperatorKind::RmsNorm, {6}, {1}, RmsNormPayload{0x358637bdu, -1, 1});
-    add(OperatorKind::Linear, {7}, {1}, LinearPayload{});
-    add(OperatorKind::Linear, {8}, {1}, LinearPayload{});
-    add(OperatorKind::SwiGlu, {}, {1}, SwiGluPayload{});
-    add(OperatorKind::Linear, {9}, {1}, LinearPayload{});
-    add(OperatorKind::RmsNorm, {10}, {1}, RmsNormPayload{0x358637bdu, -1, 1});
-    add(OperatorKind::Linear, {11}, {4}, LinearPayload{});
-    model.layers = {{0, 1, 12, 0}};
+    add(OperatorKind::Linear, {7}, {8}, {5}, LinearPayload{});
+    add(OperatorKind::Add, {0, 8}, {9}, {}, AddPayload{});
+    add(OperatorKind::RmsNorm, {9}, {10}, {6}, RmsNormPayload{0x358637bdu, -1, 1});
+    add(OperatorKind::Linear, {10}, {11}, {7}, LinearPayload{});
+    add(OperatorKind::Linear, {10}, {12}, {8}, LinearPayload{});
+    add(OperatorKind::SwiGlu, {11, 12}, {13}, {}, SwiGluPayload{});
+    add(OperatorKind::Linear, {13}, {14}, {9}, LinearPayload{});
+    add(OperatorKind::Add, {9, 14}, {15}, {}, AddPayload{});
+    add(OperatorKind::RmsNorm, {15}, {16}, {10}, RmsNormPayload{0x358637bdu, -1, 1});
+    add(OperatorKind::Linear, {16}, {17}, {11}, LinearPayload{});
+    model.input_values_first = 18;
+    model.input_values_count = 1;
+    model.output_values_first = 17;
+    model.output_values_count = 1;
+    model.layers = {{0, 1, 14, 0}};
     StateFormat key_format;
     key_format.encoded_domain = TransformDomain::RopeApplied;
     key_format.alignment = 64;
@@ -191,25 +222,34 @@ SemanticModel q4k_query_gate_dense_model() {
 
     SemanticTensor& fused_query_gate = model.tensors[2];
     fused_query_gate.role = TensorRole::AttentionQueryGateWeight;
+    fused_query_gate.dimensions[0].constant_or_symbol = 256;
     fused_query_gate.dimensions[1].constant_or_symbol = 512;
-    fused_query_gate.planes[0].length = 256ull * 512 / 256 * 144;
+    fused_query_gate.layout.strides[1] = 256;
+    fused_query_gate.planes[0].length = 512ull * 256 / 256 * 144;
 
-    const auto value = [&](uint32_t id, uint32_t width) {
-        model.values.push_back({id, ScalarType::F32,
-                                {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, width}}, 0});
+    const auto set_value = [&](uint32_t id, uint32_t width) {
+        model.values[id].dimensions = {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, width}};
+        model.values[id].logical_type = ScalarType::F32;
     };
-    value(5, 512); // fused query and gate
-    value(6, 256); // query
-    value(7, 256); // attention gate
-    value(8, 256); // key
-    value(9, 256); // value
-    value(10, 256); // rotated query
-    value(11, 256); // rotated key
-    value(12, 256); // attention context
-    value(13, 256); // gated attention
-    value(14, 256); // attention output projection
+    set_value(5, 512); // fused query and gate
+    set_value(6, 256); // query
+    set_value(7, 256); // attention gate
+    set_value(8, 256); // key
+    set_value(9, 256); // value
+    set_value(10, 256); // rotated query
+    set_value(11, 256); // rotated key
     model.values[12].dimensions = {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 4}, {DimensionKind::Constant, 64}};
     model.values[13].dimensions = model.values[12].dimensions;
+    set_value(14, 256); // attention output projection
+    set_value(15, 256); // attention residual
+    set_value(16, 256); // FFN norm
+    set_value(17, 256); // FFN gate
+    model.values.push_back({19, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0});
+    model.values.push_back({20, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0});
+    model.values.push_back({21, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0});
+    model.values.push_back({22, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0});
+    model.values.push_back({23, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 256}}, 0});
+    model.values.push_back({24, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, 3}}, 0});
 
     SemanticOperator split;
     split.kind = OperatorKind::AxisSplit;
@@ -260,9 +300,95 @@ SemanticModel q4k_query_gate_dense_model() {
     attention_output.outputs = {14};
     model.operators.insert(attention + 1, std::move(gated));
 
+    auto ffn_norm = std::find_if(model.operators.begin(), model.operators.end(), [&](const SemanticOperator& op) {
+        return op.kind == OperatorKind::RmsNorm && !op.tensors.empty() && op.tensors[0] == 6;
+    });
+    auto gate = std::find_if(model.operators.begin(), model.operators.end(), [&](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Linear && !op.tensors.empty() && op.tensors[0] == 7;
+    });
+    auto up = std::find_if(model.operators.begin(), model.operators.end(), [&](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Linear && !op.tensors.empty() && op.tensors[0] == 8;
+    });
+    auto swiglu = std::find_if(model.operators.begin(), model.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::SwiGlu;
+    });
+    auto down = std::find_if(model.operators.begin(), model.operators.end(), [&](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Linear && !op.tensors.empty() && op.tensors[0] == 9;
+    });
+    CHECK(ffn_norm != model.operators.end()); CHECK(gate != model.operators.end());
+    CHECK(up != model.operators.end()); CHECK(swiglu != model.operators.end()); CHECK(down != model.operators.end());
+    if (ffn_norm != model.operators.end()) { ffn_norm->inputs = {15}; ffn_norm->outputs = {16}; }
+    if (gate != model.operators.end()) { gate->inputs = {16}; gate->outputs = {17}; }
+    if (up != model.operators.end()) { up->inputs = {16}; up->outputs = {19}; }
+    if (swiglu != model.operators.end()) { swiglu->inputs = {17, 19}; swiglu->outputs = {20}; }
+    if (down != model.operators.end()) { down->inputs = {20}; down->outputs = {21}; }
+    const auto adds = std::find_if(model.operators.begin(), model.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Add && op.inputs == std::vector<uint32_t>{0, 8};
+    });
+    CHECK(adds != model.operators.end());
+    if (adds != model.operators.end()) { adds->inputs = {0, 14}; adds->outputs = {15}; }
+    const auto final_add = std::find_if(model.operators.begin(), model.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Add && op.inputs == std::vector<uint32_t>{9, 14};
+    });
+    CHECK(final_add != model.operators.end());
+    if (final_add != model.operators.end()) { final_add->inputs = {15, 21}; final_add->outputs = {22}; }
+    const auto final_norm = std::find_if(model.operators.begin(), model.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::RmsNorm && !op.tensors.empty() && op.tensors[0] == 10;
+    });
+    const auto output = std::find_if(model.operators.begin(), model.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Linear && !op.tensors.empty() && op.tensors[0] == 11;
+    });
+    CHECK(final_norm != model.operators.end()); CHECK(output != model.operators.end());
+    if (final_norm != model.operators.end()) { final_norm->inputs = {22}; final_norm->outputs = {23}; }
+    if (output != model.operators.end()) { output->inputs = {23}; output->outputs = {24}; }
+    model.output_values_first = 24;
+
     for (uint32_t id = 0; id != model.operators.size(); ++id) model.operators[id].id = id;
     model.layers[0].first_operator = 1;
     model.layers[0].operator_count = static_cast<uint32_t>(model.operators.size() - 3);
+    return model;
+}
+
+SemanticModel q4k_decoupled_query_width_dense_model() {
+    SemanticModel model = q4k_query_gate_dense_model();
+    const auto set_width = [&](uint32_t value_id, uint32_t width) {
+        model.values[value_id].dimensions = {
+            {DimensionKind::Symbol, 1}, {DimensionKind::Constant, width}};
+    };
+
+    SemanticTensor& query_gate = model.tensors[2];
+    query_gate.dimensions = {{DimensionKind::Constant, 256},
+                             {DimensionKind::Constant, 1024}};
+    query_gate.layout.strides[1] = 256;
+    query_gate.planes[0].length = 256ull * 1024 / 256 * 144;
+    SemanticTensor& attention_output = model.tensors[5];
+    attention_output.dimensions = {{DimensionKind::Constant, 512},
+                                   {DimensionKind::Constant, 256}};
+    attention_output.layout.strides[1] = 512;
+    attention_output.planes[0].length = 512ull * 256 / 256 * 144;
+
+    set_width(5, 1024);
+    set_width(6, 512);
+    set_width(7, 512);
+    set_width(10, 512);
+    model.values[12].dimensions = {{DimensionKind::Symbol, 1},
+                                   {DimensionKind::Constant, 8},
+                                   {DimensionKind::Constant, 64}};
+    model.values[13].dimensions = model.values[12].dimensions;
+
+    for (SemanticOperator& op : model.operators) {
+        if (op.kind == OperatorKind::AxisSplit) {
+            op.payload = AxisSplitPayload{512, 512};
+        } else if (op.kind == OperatorKind::CausalAttention) {
+            auto* payload = std::get_if<CausalAttentionPayload>(&op.payload);
+            CHECK(payload != nullptr);
+            if (payload) {
+                payload->query_heads = 8;
+                payload->kv_heads = 4;
+                payload->head_dimension = 64;
+            }
+        }
+    }
     return model;
 }
 
@@ -460,13 +586,16 @@ SemanticModel mixed_query_gate_recurrent_model() {
     const uint32_t tensor_base = static_cast<uint32_t>(model.tensors.size());
     const uint32_t value_base = static_cast<uint32_t>(model.values.size());
     const uint32_t state_base = static_cast<uint32_t>(model.states.size());
-    const uint32_t operator_base = static_cast<uint32_t>(model.operators.size());
+    const uint32_t operator_base = model.layers.front().first_operator +
+                                   model.layers.front().operator_count;
+    const uint32_t dense_residual = 22;
     for (SemanticTensor tensor : recurrent.tensors) {
         tensor.id += tensor_base;
         model.tensors.push_back(std::move(tensor));
     }
     for (SemanticValue value : recurrent.values) {
-        value.id += value_base;
+        if (value.id == 0) continue;
+        value.id = value_base + value.id - 1;
         model.values.push_back(std::move(value));
     }
     for (SemanticState state : recurrent.states) {
@@ -474,16 +603,28 @@ SemanticModel mixed_query_gate_recurrent_model() {
         state.semantic_version = 4;
         model.states.push_back(std::move(state));
     }
+    std::vector<SemanticOperator> recurrent_operators;
+    recurrent_operators.reserve(recurrent.operators.size());
     for (SemanticOperator op : recurrent.operators) {
-        op.id += operator_base;
         op.semantic_version = 4;
-        for (uint32_t& value : op.inputs) value += value_base;
-        for (uint32_t& value : op.outputs) value += value_base;
+        for (uint32_t& value : op.inputs)
+            value = value == 0 ? dense_residual : value_base + value - 1;
+        for (uint32_t& value : op.outputs)
+            value = value == 0 ? dense_residual : value_base + value - 1;
         for (uint32_t& tensor : op.tensors) tensor += tensor_base;
         for (uint32_t& state : op.states) state += state_base;
-        model.operators.push_back(std::move(op));
+        recurrent_operators.push_back(std::move(op));
     }
-    model.layers.push_back({1, operator_base, static_cast<uint32_t>(recurrent.operators.size()), 0});
+    model.operators.insert(model.operators.begin() + operator_base,
+                           recurrent_operators.begin(), recurrent_operators.end());
+    for (uint32_t id = 0; id != model.operators.size(); ++id) model.operators[id].id = id;
+    model.layers.push_back({1, operator_base,
+                            static_cast<uint32_t>(recurrent_operators.size()), 0});
+
+    const uint32_t recurrent_residual = value_base + 19;
+    SemanticOperator& final_norm = model.operators[operator_base + recurrent_operators.size()];
+    CHECK(final_norm.kind == OperatorKind::RmsNorm);
+    final_norm.inputs = {recurrent_residual};
     return model;
 }
 
@@ -709,6 +850,7 @@ void test_metal_blocked_descriptor_requires_the_exact_q4k_contract() {
 void test_metal_quantized_descriptor_signatures_are_closed() {
     struct Contract { uint32_t format; uint32_t elements; uint32_t bytes; };
     const Contract contracts[] = {
+        {MetalWeightFormatQ4_0, 32, 18},
         {MetalWeightFormatQ5_0, 32, 22},
         {MetalWeightFormatQ6K, 256, 210},
         {MetalWeightFormatQ8_0, 32, 34},
@@ -783,6 +925,216 @@ void test_metal_iq2_xxs_descriptor_requires_the_exact_codebook_contract() {
     selected = select_kernel(blocked, request(), metal,
                              builtin_canonical_metal_registry());
     CHECK(std::holds_alternative<CompatibilityReport>(selected));
+}
+
+void test_affine_u2_requires_a_queried_capability() {
+    constexpr uint32_t affine_format = MetalWeightFormatAffineUInt2_256;
+    KernelDescriptor descriptor;
+    descriptor.id = 90000;
+    descriptor.implementation = KernelImplementation::MetalDenseToken;
+    descriptor.pattern.operation = exact(OperatorKind::CausalAttention);
+    descriptor.pattern.semantic_version = {1, 1};
+    descriptor.pattern.phase = exact(ExecutionPhase::Prefill);
+    descriptor.pattern.logical_type = exact(ScalarType::F32);
+    descriptor.pattern.storage_type = exact(ScalarType::U32);
+    descriptor.pattern.layout = exact(PhysicalLayoutKind::GroupedAffine);
+    descriptor.pattern.quantization = exact(QuantizationKind::BlockedAffine);
+    descriptor.pattern.state_kind = exact(StateKind::KeyCache);
+    descriptor.pattern.state_format = exact(StateFormatKind::GlobalContiguous);
+    descriptor.pattern.rank = {2, 2};
+    descriptor.pattern.alignment = {128, 128};
+    descriptor.pattern.head_dimension = {64, 64};
+    descriptor.pattern.batch_rows = {1, 1};
+    descriptor.pattern.block_elements = {256, 256};
+    descriptor.pattern.block_bytes = {64, 64};
+    descriptor.pattern.allowed_metal_weight_formats = affine_format;
+    descriptor.pattern.require_metal_dense_token_pattern = true;
+    descriptor.capability_predicate = &requires_canonical_metal;
+    descriptor.numerical_class = NumericalClass::ExactFp32;
+    descriptor.transactional = true;
+    descriptor.effects = {BackendWriter::Metal, NumericalClass::ExactFp32,
+                          StateFormatKind::GlobalContiguous, FallbackKind::None,
+                          true, ScratchLifetime::Session};
+    descriptor.cost = {1, 1};
+
+    KernelQuery query;
+    query.operation = OperatorKind::CausalAttention;
+    query.semantic_version = 1;
+    query.phase = ExecutionPhase::Prefill;
+    query.logical_type = ScalarType::F32;
+    query.storage_type = ScalarType::U32;
+    query.layout = PhysicalLayoutKind::GroupedAffine;
+    query.quantization = QuantizationKind::BlockedAffine;
+    query.state_kind = StateKind::KeyCache;
+    query.state_format = StateFormatKind::GlobalContiguous;
+    query.rank = 2;
+    query.alignment = 128;
+    query.head_dimension = 64;
+    query.batch_rows = 1;
+    query.block_elements = 256;
+    query.block_bytes = 64;
+    query.metal_weight_format_mask = affine_format;
+    query.metal_dense_token_pattern = true;
+    query.metal_affine_u2_256 = true;
+
+    RuntimeCapabilities capabilities;
+    capabilities.metal_device = true;
+    capabilities.metal_library = true;
+    capabilities.metal_pipeline = true;
+    capabilities.global_fp32_kv = true;
+    capabilities.transactional_state = true;
+    const KernelSelection selected = select_kernel(query, request(), capabilities, {descriptor});
+    CHECK(std::holds_alternative<CompatibilityReport>(selected));
+    CHECK(std::get<CompatibilityReport>(selected).code == CompatibilityError::CAPABILITY_MISSING);
+    capabilities.metal_affine_u2_256 = true;
+    const KernelSelection admitted = select_kernel(query, request(), capabilities,
+                                                   builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<KernelDescriptor>(admitted));
+    if (const auto* descriptor = std::get_if<KernelDescriptor>(&admitted)) {
+        CHECK(descriptor->pattern.allowed_metal_weight_formats == affine_format);
+        CHECK(descriptor->pattern.require_metal_affine_u2_256);
+    }
+
+    KernelQuery mixed = query;
+    mixed.storage_type = static_cast<ScalarType>(0);
+    mixed.layout = static_cast<PhysicalLayoutKind>(0);
+    mixed.quantization = static_cast<QuantizationKind>(0);
+    mixed.block_elements = 0;
+    mixed.block_bytes = 0;
+    mixed.metal_weight_format_mask = MetalWeightFormatF16 | affine_format;
+    const KernelSelection mixed_admitted = select_kernel(
+        mixed, request(), capabilities, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<KernelDescriptor>(mixed_admitted));
+    if (const auto* selected_descriptor = std::get_if<KernelDescriptor>(&mixed_admitted)) {
+        CHECK(selected_descriptor->pattern.require_mixed_metal_weight_formats);
+        CHECK(selected_descriptor->pattern.require_metal_affine_u2_256);
+        CHECK((selected_descriptor->pattern.allowed_metal_weight_formats &
+               mixed.metal_weight_format_mask) == mixed.metal_weight_format_mask);
+    }
+}
+
+void test_column_grouped_affine_u2_skip_has_a_distinct_typed_route() {
+    constexpr uint32_t legacy_format = MetalWeightFormatAffineUInt2_256;
+    constexpr uint32_t format = MetalWeightFormatColumnGroupedAffineUInt2Skip256;
+    CHECK(format != legacy_format);
+    CHECK(PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip != PhysicalLayoutKind::GroupedAffine);
+
+    KernelDescriptor descriptor;
+    descriptor.id = 90001;
+    descriptor.implementation = KernelImplementation::MetalDenseToken;
+    descriptor.pattern.operation = exact(OperatorKind::CausalAttention);
+    descriptor.pattern.semantic_version = {1, 1};
+    descriptor.pattern.phase = exact(ExecutionPhase::Prefill);
+    descriptor.pattern.logical_type = exact(ScalarType::F32);
+    descriptor.pattern.storage_type = exact(ScalarType::U8);
+    descriptor.pattern.layout = exact(PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip);
+    descriptor.pattern.quantization = exact(QuantizationKind::BlockedAffine);
+    descriptor.pattern.state_kind = exact(StateKind::KeyCache);
+    descriptor.pattern.state_format = exact(StateFormatKind::GlobalContiguous);
+    descriptor.pattern.rank = {2, 2};
+    descriptor.pattern.alignment = {128, 128};
+    descriptor.pattern.head_dimension = {64, 64};
+    descriptor.pattern.batch_rows = {1, 1};
+    descriptor.pattern.block_elements = {256, 256};
+    descriptor.pattern.block_bytes = {64, 64};
+    descriptor.pattern.allowed_metal_weight_formats = format;
+    descriptor.pattern.require_metal_dense_token_pattern = true;
+    descriptor.pattern.require_metal_column_grouped_affine_u2_skip_256 = true;
+    descriptor.capability_predicate = &requires_canonical_metal;
+    descriptor.numerical_class = NumericalClass::ExactFp32;
+    descriptor.transactional = true;
+    descriptor.effects = {BackendWriter::Metal, NumericalClass::ExactFp32,
+                          StateFormatKind::GlobalContiguous, FallbackKind::None,
+                          true, ScratchLifetime::Session};
+    descriptor.cost = {1, 1};
+
+    KernelQuery query;
+    query.operation = OperatorKind::CausalAttention;
+    query.semantic_version = 1;
+    query.phase = ExecutionPhase::Prefill;
+    query.logical_type = ScalarType::F32;
+    query.storage_type = ScalarType::U8;
+    query.layout = PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip;
+    query.quantization = QuantizationKind::BlockedAffine;
+    query.state_kind = StateKind::KeyCache;
+    query.state_format = StateFormatKind::GlobalContiguous;
+    query.rank = 2;
+    query.alignment = 128;
+    query.head_dimension = 64;
+    query.batch_rows = 1;
+    query.block_elements = 256;
+    query.block_bytes = 64;
+    query.metal_weight_format_mask = format;
+    query.metal_dense_token_pattern = true;
+    query.metal_column_grouped_affine_u2_skip_256 = true;
+
+    RuntimeCapabilities capabilities;
+    capabilities.metal_device = true;
+    capabilities.metal_library = true;
+    capabilities.metal_pipeline = true;
+    capabilities.global_fp32_kv = true;
+    capabilities.transactional_state = true;
+    const KernelSelection unavailable = select_kernel(query, request(), capabilities, {descriptor});
+    CHECK(std::holds_alternative<CompatibilityReport>(unavailable));
+    if (const auto* report = std::get_if<CompatibilityReport>(&unavailable))
+        CHECK(report->code == CompatibilityError::CAPABILITY_MISSING);
+
+    capabilities.metal_column_grouped_affine_u2_skip_256 = true;
+    const KernelSelection admitted = select_kernel(query, request(), capabilities, {descriptor});
+    CHECK(std::holds_alternative<KernelDescriptor>(admitted));
+    if (const auto* selected = std::get_if<KernelDescriptor>(&admitted))
+        CHECK(selected->pattern.layout.exact == PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip);
+
+    const KernelSelection builtin = select_kernel(
+        query, request(), capabilities, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<KernelDescriptor>(builtin));
+    if (const auto* selected = std::get_if<KernelDescriptor>(&builtin)) {
+        CHECK(selected->pattern.allowed_metal_weight_formats == format);
+        CHECK(selected->pattern.require_metal_column_grouped_affine_u2_skip_256);
+    }
+
+    KernelQuery mixed = query;
+    mixed.storage_type = static_cast<ScalarType>(0);
+    mixed.layout = static_cast<PhysicalLayoutKind>(0);
+    mixed.quantization = static_cast<QuantizationKind>(0);
+    mixed.block_elements = 0;
+    mixed.block_bytes = 0;
+    mixed.metal_weight_format_mask = MetalWeightFormatQ4K | MetalWeightFormatQ6K | format;
+    const KernelSelection mixed_builtin = select_kernel(
+        mixed, request(), capabilities, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<KernelDescriptor>(mixed_builtin));
+    if (const auto* selected = std::get_if<KernelDescriptor>(&mixed_builtin)) {
+        CHECK(selected->pattern.require_mixed_metal_weight_formats);
+        CHECK(selected->pattern.require_metal_column_grouped_affine_u2_skip_256);
+        CHECK((selected->pattern.allowed_metal_weight_formats &
+               mixed.metal_weight_format_mask) == mixed.metal_weight_format_mask);
+    }
+
+    capabilities.metal_column_grouped_affine_u2_skip_256 = false;
+    const KernelSelection missing_mixed_capability = select_kernel(
+        mixed, request(), capabilities, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<CompatibilityReport>(missing_mixed_capability));
+    capabilities.metal_column_grouped_affine_u2_skip_256 = true;
+
+    query.layout = PhysicalLayoutKind::GroupedAffine;
+    const KernelSelection legacy_layout = select_kernel(query, request(), capabilities, {descriptor});
+    CHECK(std::holds_alternative<CompatibilityReport>(legacy_layout));
+    if (const auto* report = std::get_if<CompatibilityReport>(&legacy_layout))
+        CHECK(report->code == CompatibilityError::KERNEL_UNAVAILABLE);
+
+    query.layout = PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip;
+    query.metal_column_grouped_affine_u2_skip_256 = false;
+    const KernelSelection missing_marker = select_kernel(query, request(), capabilities, {descriptor});
+    CHECK(std::holds_alternative<CompatibilityReport>(missing_marker));
+    if (const auto* report = std::get_if<CompatibilityReport>(&missing_marker))
+        CHECK(report->code == CompatibilityError::KERNEL_UNAVAILABLE);
+
+    query.metal_column_grouped_affine_u2_skip_256 = true;
+    query.block_bytes = 65;
+    const KernelSelection malformed_tuple = select_kernel(query, request(), capabilities, {descriptor});
+    CHECK(std::holds_alternative<CompatibilityReport>(malformed_tuple));
+    if (const auto* report = std::get_if<CompatibilityReport>(&malformed_tuple))
+        CHECK(report->code == CompatibilityError::KERNEL_UNAVAILABLE);
 }
 
 void test_f16_prefill_batch_descriptor_is_exactly_two_rows() {
@@ -906,6 +1258,200 @@ void test_canonical_planner_admits_flattened_attention_context() {
     }
 }
 
+void test_canonical_planner_rejects_sliding_attention_until_windowed_metal_exists() {
+    RuntimeCapabilities metal;
+    metal.global_fp32_kv = true;
+    metal.transactional_state = true;
+    metal.metal_device = true;
+    metal.metal_library = true;
+    metal.metal_pipeline = true;
+    SemanticModel model = q4k_dense_model();
+    const auto attention = std::find_if(model.operators.begin(), model.operators.end(),
+                                        [](const SemanticOperator& op) {
+                                            return op.kind == OperatorKind::CausalAttention;
+                                        });
+    CHECK(attention != model.operators.end());
+    if (attention == model.operators.end()) return;
+    auto* payload = std::get_if<CausalAttentionPayload>(&attention->payload);
+    CHECK(payload != nullptr);
+    if (!payload) return;
+    payload->window = AttentionWindowKind::Sliding;
+    payload->window_tokens = 128;
+    DenseGraphWitness witness;
+    CHECK(!match_canonical_dense_operator_edges(model, model.layers.front(), witness));
+    const auto planned = plan_canonical_metal_dense(model, request(), metal,
+                                                    builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<CompatibilityReport>(planned));
+    if (const auto* report = std::get_if<CompatibilityReport>(&planned)) {
+        CHECK(report->code == CompatibilityError::KERNEL_UNAVAILABLE);
+        CHECK(report->detail.find("canonical Metal attention requires a global window") !=
+              std::string::npos);
+        CHECK(report->detail.find("operator " + std::to_string(attention->id)) !=
+              std::string::npos);
+    }
+}
+
+void test_canonical_planner_rejects_invalid_rope_and_rms_contracts() {
+    RuntimeCapabilities metal;
+    metal.global_fp32_kv = true;
+    metal.transactional_state = true;
+    metal.metal_device = true;
+    metal.metal_library = true;
+    metal.metal_pipeline = true;
+    const auto registry = builtin_canonical_metal_registry();
+    const auto rejected = [&](SemanticModel model) {
+        DenseGraphWitness witness;
+        CHECK(!match_canonical_dense_operator_edges(model, model.layers.front(), witness));
+        CHECK(std::holds_alternative<CompatibilityReport>(
+            plan_canonical_metal_dense(model, request(), metal, registry)));
+    };
+
+    SemanticModel zero_base = q4k_dense_model();
+    auto rope = std::find_if(zero_base.operators.begin(), zero_base.operators.end(),
+                             [](const SemanticOperator& op) {
+                                 return op.kind == OperatorKind::Rope;
+                             });
+    CHECK(rope != zero_base.operators.end());
+    if (rope != zero_base.operators.end()) {
+        auto* payload = std::get_if<RopePayload>(&rope->payload);
+        CHECK(payload != nullptr);
+        if (payload) payload->base_f32_bits = 0;
+    }
+    rejected(std::move(zero_base));
+
+    SemanticModel oversized_rotary = q4k_dense_model();
+    rope = std::find_if(oversized_rotary.operators.begin(), oversized_rotary.operators.end(),
+                        [](const SemanticOperator& op) {
+                            return op.kind == OperatorKind::Rope;
+                        });
+    CHECK(rope != oversized_rotary.operators.end());
+    if (rope != oversized_rotary.operators.end()) {
+        auto* payload = std::get_if<RopePayload>(&rope->payload);
+        CHECK(payload != nullptr);
+        if (payload) {
+            payload->rotary_dimension = 128;
+            payload->frequency_dimension = 128;
+        }
+    }
+    rejected(std::move(oversized_rotary));
+
+    SemanticModel negative_rms = q4k_dense_model();
+    for (SemanticOperator& op : negative_rms.operators) {
+        if (auto* payload = std::get_if<RmsNormPayload>(&op.payload))
+            payload->epsilon_f32_bits = 0xbf800000u;
+    }
+    rejected(std::move(negative_rms));
+
+    SemanticModel transposed_linear = q4k_dense_model();
+    for (SemanticOperator& op : transposed_linear.operators) {
+        if (auto* payload = std::get_if<LinearPayload>(&op.payload)) {
+            payload->transpose_weight = true;
+            break;
+        }
+    }
+    rejected(std::move(transposed_linear));
+
+    SemanticModel mismatched_rms = q4k_dense_model();
+    uint32_t rms_index = 0;
+    for (SemanticOperator& op : mismatched_rms.operators) {
+        if (auto* payload = std::get_if<RmsNormPayload>(&op.payload)) {
+            if (rms_index++ == 1) payload->epsilon_f32_bits = 0x3a83126fu;
+        }
+    }
+    rejected(std::move(mismatched_rms));
+
+    SemanticModel scaled_rope = q4k_dense_model();
+    for (SemanticOperator& op : scaled_rope.operators) {
+        if (auto* payload = std::get_if<RopePayload>(&op.payload)) {
+            payload->scale_f32_bits = 0x40000000u;
+            break;
+        }
+    }
+    rejected(std::move(scaled_rope));
+
+    for (uint32_t scale_bits : {0u, 0xbf800000u, 0x7f800000u, 0x7fc00000u}) {
+        SemanticModel invalid_attention_scale = q4k_dense_model();
+        const auto attention = std::find_if(
+            invalid_attention_scale.operators.begin(),
+            invalid_attention_scale.operators.end(),
+            [](const SemanticOperator& op) {
+                return op.kind == OperatorKind::CausalAttention;
+            });
+        CHECK(attention != invalid_attention_scale.operators.end());
+        if (attention != invalid_attention_scale.operators.end()) {
+            auto* payload = std::get_if<CausalAttentionPayload>(&attention->payload);
+            CHECK(payload != nullptr);
+            if (payload) payload->scale_f32_bits = scale_bits;
+        }
+        rejected(std::move(invalid_attention_scale));
+    }
+
+    const auto with_query_key_norms = [] {
+        SemanticModel model = q4k_dense_model();
+        model.tensors.push_back(dense_tensor(
+            12, TensorRole::AttentionQueryNormWeight,
+            {{DimensionKind::Constant, 256}}, ScalarType::F32));
+        model.tensors.push_back(dense_tensor(
+            13, TensorRole::AttentionKeyNormWeight,
+            {{DimensionKind::Constant, 256}}, ScalarType::F32));
+        model.values.push_back({19, ScalarType::F32,
+                                {{DimensionKind::Symbol, 1},
+                                 {DimensionKind::Constant, 256}}, 0});
+        model.values.push_back({20, ScalarType::F32,
+                                {{DimensionKind::Symbol, 1},
+                                 {DimensionKind::Constant, 256}}, 0});
+        const auto rope = std::find_if(
+            model.operators.begin(), model.operators.end(),
+            [](const SemanticOperator& op) { return op.kind == OperatorKind::Rope; });
+        CHECK(rope != model.operators.end());
+        if (rope == model.operators.end()) return model;
+        const size_t rope_index = static_cast<size_t>(rope - model.operators.begin());
+        SemanticOperator query_norm;
+        query_norm.kind = OperatorKind::RmsNorm;
+        query_norm.inputs = {2};
+        query_norm.outputs = {19};
+        query_norm.tensors = {12};
+        query_norm.payload = RmsNormPayload{0x358637bdu, -1, 1};
+        SemanticOperator key_norm = query_norm;
+        key_norm.inputs = {3};
+        key_norm.outputs = {20};
+        key_norm.tensors = {13};
+        model.operators.insert(model.operators.begin() + rope_index,
+                               std::move(query_norm));
+        model.operators.insert(model.operators.begin() + rope_index + 1,
+                               std::move(key_norm));
+        model.operators[rope_index + 2].inputs = {19, 20};
+        for (uint32_t id = 0; id != model.operators.size(); ++id) {
+            model.operators[id].id = id;
+        }
+        model.layers.front().operator_count += 2;
+        return model;
+    };
+
+    SemanticModel normalized_query_key = with_query_key_norms();
+    DenseGraphWitness normalized_witness;
+    CHECK(match_canonical_dense_operator_edges(
+        normalized_query_key, normalized_query_key.layers.front(), normalized_witness));
+    for (uint32_t epsilon_bits : {0xbf800000u, 0x7f800000u, 0x7fc00000u}) {
+        SemanticModel invalid_query_key_norm = with_query_key_norms();
+        const auto query_norm = std::find_if(
+            invalid_query_key_norm.operators.begin(),
+            invalid_query_key_norm.operators.end(),
+            [&](const SemanticOperator& op) {
+                return op.kind == OperatorKind::RmsNorm && !op.tensors.empty() &&
+                       invalid_query_key_norm.tensors[op.tensors[0]].role ==
+                           TensorRole::AttentionQueryNormWeight;
+            });
+        CHECK(query_norm != invalid_query_key_norm.operators.end());
+        if (query_norm != invalid_query_key_norm.operators.end()) {
+            auto* payload = std::get_if<RmsNormPayload>(&query_norm->payload);
+            CHECK(payload != nullptr);
+            if (payload) payload->epsilon_f32_bits = epsilon_bits;
+        }
+        rejected(std::move(invalid_query_key_norm));
+    }
+}
+
 void test_canonical_planner_materializes_query_gate_dense_entries() {
     RuntimeCapabilities metal;
     metal.global_fp32_kv = true;
@@ -937,7 +1483,7 @@ void test_canonical_planner_materializes_query_gate_dense_entries() {
                                                      builtin_canonical_metal_registry());
     CHECK(std::holds_alternative<CompatibilityReport>(rejected));
     if (const auto* report = std::get_if<CompatibilityReport>(&rejected)) {
-        CHECK(report->code == CompatibilityError::KERNEL_UNAVAILABLE);
+        CHECK(report->code == CompatibilityError::IR_REFERENCE_INVALID);
     }
 }
 
@@ -952,6 +1498,7 @@ void test_canonical_planner_materializes_mixed_quantized_dense_entries() {
         tensor.quantization.group_size = elements;
         tensor.planes[0].length = 256ull * 256 / elements * bytes;
     };
+    set_format(2, 32, 18);   // Query Q4_0.
     set_format(3, 256, 210); // Key Q6_K.
     set_format(4, 32, 34);   // Value Q8_0.
     set_format(8, 256, 84);  // FFN up Q2_K.
@@ -967,7 +1514,7 @@ void test_canonical_planner_materializes_mixed_quantized_dense_entries() {
                                               builtin_canonical_metal_registry());
     CHECK(std::holds_alternative<ExecutionPlan>(planned));
     if (const auto* plan = std::get_if<ExecutionPlan>(&planned)) {
-        const uint32_t expected_formats = MetalWeightFormatQ4K | MetalWeightFormatQ5_0 |
+        const uint32_t expected_formats = MetalWeightFormatQ4_0 | MetalWeightFormatQ4K | MetalWeightFormatQ5_0 |
                                           MetalWeightFormatQ6K | MetalWeightFormatQ8_0 |
                                           MetalWeightFormatQ2K | MetalWeightFormatIQ2XXS;
         CHECK(plan->entries.size() == 2);
@@ -1010,6 +1557,21 @@ void test_canonical_planner_materializes_recurrent_q4k_q6k_entries() {
                    MetalWeightFormatIQ2XXS));
             CHECK(plan_entry_matches(model, entry));
         }
+    }
+
+    SemanticModel reordered_l2 = model;
+    std::vector<size_t> l2_indices;
+    for (size_t index = 0; index != reordered_l2.operators.size(); ++index) {
+        if (reordered_l2.operators[index].kind == OperatorKind::L2Normalize)
+            l2_indices.push_back(index);
+    }
+    CHECK(l2_indices.size() == 2);
+    if (l2_indices.size() == 2) {
+        std::swap(reordered_l2.operators[l2_indices[0]],
+                  reordered_l2.operators[l2_indices[1]]);
+        auto reordered_plan = plan_canonical_metal_recurrent(
+            reordered_l2, request(), metal, builtin_canonical_metal_registry());
+        CHECK(std::holds_alternative<ExecutionPlan>(reordered_plan));
     }
 
     SemanticModel malformed = model;
@@ -1139,6 +1701,75 @@ void test_canonical_planner_materializes_mixed_dense_recurrent_entries() {
     }
 }
 
+void test_canonical_planner_rejects_a_layer_that_bypasses_the_previous_residual() {
+    RuntimeCapabilities metal;
+    metal.global_fp32_kv = true;
+    metal.transactional_state = true;
+    metal.metal_device = true;
+    metal.metal_library = true;
+    metal.metal_pipeline = true;
+
+    SemanticModel model = mixed_query_gate_recurrent_model();
+    CHECK(model.layers.size() == 2);
+    if (model.layers.size() != 2) return;
+    const SemanticLayer& first = model.layers[0];
+    const SemanticLayer& second = model.layers[1];
+    CHECK(first.first_operator < model.operators.size());
+    CHECK(second.first_operator < model.operators.size());
+    if (first.first_operator >= model.operators.size() ||
+        second.first_operator >= model.operators.size()) return;
+
+    const uint32_t original_residual = model.operators[first.first_operator].inputs.front();
+    const uint32_t chained_residual = model.operators[second.first_operator].inputs.front();
+    for (uint32_t offset = 0; offset != second.operator_count; ++offset) {
+        SemanticOperator& op = model.operators[second.first_operator + offset];
+        for (uint32_t& input : op.inputs) {
+            if (input == chained_residual) input = original_residual;
+        }
+    }
+    const auto planned = plan_canonical_metal(
+        model, request(), metal, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<CompatibilityReport>(planned));
+    if (const auto* report = std::get_if<CompatibilityReport>(&planned)) {
+        CHECK(report->code == CompatibilityError::IR_REFERENCE_INVALID);
+        CHECK(report->detail.find("layer residual chain") != std::string::npos);
+    }
+}
+
+void test_canonical_planner_rejects_a_graph_spine_that_differs_from_metal() {
+    RuntimeCapabilities metal;
+    metal.global_fp32_kv = true;
+    metal.transactional_state = true;
+    metal.metal_device = true;
+    metal.metal_library = true;
+    metal.metal_pipeline = true;
+    const auto registry = builtin_canonical_metal_registry();
+
+    const SemanticModel valid = q4k_dense_model();
+    CHECK(std::holds_alternative<ExecutionPlan>(
+        plan_canonical_metal(valid, request(), metal, registry)));
+
+    SemanticModel wrong_embedding = valid;
+    wrong_embedding.operators.front().outputs = {1};
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        plan_canonical_metal(wrong_embedding, request(), metal, registry)));
+
+    SemanticModel wrong_final_norm = valid;
+    wrong_final_norm.operators[15].inputs = {0};
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        plan_canonical_metal(wrong_final_norm, request(), metal, registry)));
+
+    SemanticModel wrong_output_input = valid;
+    wrong_output_input.operators[16].inputs = {15};
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        plan_canonical_metal(wrong_output_input, request(), metal, registry)));
+
+    SemanticModel wrong_declared_output = valid;
+    wrong_declared_output.output_values_first = 16;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        plan_canonical_metal(wrong_declared_output, request(), metal, registry)));
+}
+
 void test_canonical_planner_skips_disabled_schema6_terminal_layer() {
     RuntimeCapabilities metal;
     metal.global_fp32_kv = true;
@@ -1148,13 +1779,10 @@ void test_canonical_planner_skips_disabled_schema6_terminal_layer() {
     metal.metal_pipeline = true;
     const SemanticModel model = schema6_model_with_disabled_terminal_layer();
     const auto planned = plan_canonical_metal(model, request(), metal, builtin_canonical_metal_registry());
-    CHECK(std::holds_alternative<ExecutionPlan>(planned));
-    if (const auto* plan = std::get_if<ExecutionPlan>(&planned)) {
-        CHECK(plan->entries.size() == 4);
-        for (const PlanEntry& entry : plan->entries) {
-            CHECK(entry.operator_id != model.operators.back().id);
-            CHECK(plan_entry_matches(model, entry));
-        }
+    CHECK(std::holds_alternative<CompatibilityReport>(planned));
+    if (const auto* report = std::get_if<CompatibilityReport>(&planned)) {
+        CHECK(report->code == CompatibilityError::IR_REFERENCE_INVALID);
+        CHECK(report->detail.find("skip") != std::string::npos);
     }
 }
 
@@ -1192,29 +1820,6 @@ void test_canonical_planner_admits_q6k_output_projection() {
     CHECK(std::holds_alternative<CompatibilityReport>(rejected));
     if (const auto* report = std::get_if<CompatibilityReport>(&rejected)) {
         CHECK(report->code == CompatibilityError::KERNEL_UNAVAILABLE);
-    }
-}
-
-void test_canonical_planner_refuses_moe_operators() {
-    RuntimeCapabilities metal;
-    metal.global_fp32_kv = true;
-    metal.transactional_state = true;
-    metal.metal_device = true;
-    metal.metal_library = true;
-    metal.metal_pipeline = true;
-    for (const OperatorKind kind : {OperatorKind::RouterTopK, OperatorKind::RoutedLinear,
-                                    OperatorKind::WeightedExpertReduce}) {
-        SemanticModel model = q4k_dense_model();
-        const uint32_t operator_id = static_cast<uint32_t>(model.operators.size());
-        model.operators.push_back({operator_id, kind, 1});
-        const auto planned = plan_canonical_metal(model, request(), metal,
-                                                  builtin_canonical_metal_registry());
-        CHECK(std::holds_alternative<CompatibilityReport>(planned));
-        if (const auto* report = std::get_if<CompatibilityReport>(&planned)) {
-            CHECK(report->code == CompatibilityError::KERNEL_UNAVAILABLE);
-            CHECK(report->operator_id == operator_id);
-            CHECK(report->detail == "canonical Metal MoE operators are not admitted");
-        }
     }
 }
 
@@ -1292,6 +1897,543 @@ void test_canonical_planner_admits_q4k_token_embedding() {
     }
 }
 
+void test_moe_registry_matches_generic_physical_contract() {
+    RuntimeCapabilities metal;
+    metal.global_fp32_kv = true;
+    metal.transactional_state = true;
+    metal.metal_device = true;
+    metal.metal_library = true;
+    metal.metal_pipeline = true;
+    metal.metal_moe_router_topk = true;
+    metal.metal_moe_gate_up = true;
+    metal.metal_moe_down_q5_0 = true;
+    metal.metal_moe_down_q8_0 = true;
+    metal.metal_moe_reduce = true;
+
+    KernelQuery query;
+    query.operation = OperatorKind::CausalAttention;
+    query.semantic_version = 99;
+    query.phase = ExecutionPhase::Decode;
+    query.logical_type = ScalarType::F32;
+    query.storage_type = ScalarType::U8;
+    query.layout = PhysicalLayoutKind::GgufBlocked;
+    query.quantization = QuantizationKind::BlockedAffine;
+    query.state_kind = StateKind::KeyCache;
+    query.state_format = StateFormatKind::GlobalContiguous;
+    query.rank = 2;
+    query.alignment = 32;
+    query.head_dimension = 256;
+    query.batch_rows = 1;
+    query.block_elements = 256;
+    query.block_bytes = 144;
+    query.metal_weight_format_mask = MetalWeightFormatF16 | MetalWeightFormatQ4K | MetalWeightFormatQ5_0;
+    query.metal_moe_token_pattern = true;
+    query.moe_expert_count = 128;
+    query.moe_selected_count = 8;
+    query.moe_gate_up_format = MetalWeightFormatQ4K;
+    query.moe_down_format = MetalWeightFormatQ5_0;
+    query.moe_gate_up_layout = PhysicalLayoutKind::GgufBlocked;
+    query.moe_down_layout = PhysicalLayoutKind::GgufBlocked;
+    query.moe_gate_up_quantization = QuantizationKind::BlockedAffine;
+    query.moe_down_quantization = QuantizationKind::BlockedAffine;
+    query.moe_gate_up_plane_mask = 1;
+    query.moe_down_plane_mask = 1;
+    query.moe_gate_up_block_elements = 256;
+    query.moe_gate_up_block_bytes = 144;
+    query.moe_down_block_elements = 32;
+    query.moe_down_block_bytes = 22;
+    query.moe_gate_up_input = 2816;
+    query.moe_gate_up_output = 1408;
+    query.moe_down_input = 704;
+    query.moe_down_output = 2816;
+    query.moe_gate_up_expert_stride = 2230272;
+    query.moe_down_expert_stride = 1362944;
+    query.moe_activation = ActivationKind::GeluTanh;
+    query.moe_scale_source = ExpertScaleSource::PerExpertTensor;
+    query.moe_value_source = ValueSource::SeparateProjection;
+
+    const auto selected = select_kernel(query, request(), metal, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<KernelDescriptor>(selected));
+    if (const auto* descriptor = std::get_if<KernelDescriptor>(&selected)) {
+        CHECK(descriptor->pattern.moe_down_format.exact == MetalWeightFormatQ5_0);
+        CHECK(descriptor->pattern.moe_activation.exact == ActivationKind::GeluTanh);
+        CHECK(descriptor->pattern.moe_scale_source.exact == ExpertScaleSource::PerExpertTensor);
+    }
+
+    query.moe_down_format = MetalWeightFormatQ8_0;
+    query.moe_down_block_bytes = 34;
+    query.moe_down_expert_stride = 2106368;
+    const auto q8 = select_kernel(query, request(), metal, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<KernelDescriptor>(q8));
+
+    query.moe_down_format = MetalWeightFormatQ4K;
+    query.moe_down_block_elements = 256;
+    query.moe_down_block_bytes = 144;
+    query.moe_down_expert_stride = 2230272;
+    const auto unsupported = select_kernel(query, request(), metal, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<CompatibilityReport>(unsupported));
+}
+
+SemanticTensor moe_f32_matrix(uint32_t id, TensorRole role, uint32_t rows, uint32_t columns) {
+    SemanticTensor tensor;
+    tensor.id = id;
+    tensor.role = role;
+    tensor.logical_type = ScalarType::F32;
+    tensor.dimensions = {{DimensionKind::Constant, rows}, {DimensionKind::Constant, columns}};
+    tensor.layout.kind = PhysicalLayoutKind::ContiguousRowMajor;
+    tensor.layout.rank = 2;
+    tensor.layout.axis_order = {1, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    tensor.layout.strides[0] = 1;
+    tensor.layout.strides[1] = columns;
+    tensor.planes = {{PlaneKind::Values, ScalarType::F32, ArtifactId{0}, 0,
+                      static_cast<uint64_t>(rows) * columns * sizeof(float), 64, 0}};
+    return tensor;
+}
+
+SemanticTensor moe_expert_tensor(uint32_t id, TensorRole role, uint32_t experts, uint32_t input,
+                                 uint32_t output, uint32_t block_elements, uint32_t block_bytes) {
+    SemanticTensor tensor;
+    tensor.id = id;
+    tensor.role = role;
+    tensor.logical_type = ScalarType::F32;
+    tensor.dimensions = {{DimensionKind::Constant, experts}, {DimensionKind::Constant, input},
+                         {DimensionKind::Constant, output}};
+    tensor.layout.kind = PhysicalLayoutKind::GgufBlocked;
+    tensor.layout.version = 1;
+    tensor.layout.packing = PackingKind::Gguf;
+    tensor.layout.rank = 3;
+    tensor.layout.block_rank = 1;
+    tensor.layout.axis_order = {1, 2, 0, 0xff, 0xff, 0xff, 0xff, 0xff};
+    tensor.layout.strides[0] = 1;
+    tensor.layout.strides[1] = input;
+    tensor.layout.strides[2] = static_cast<uint64_t>(input) * output;
+    tensor.layout.block_elements = block_elements;
+    tensor.layout.block_bytes = block_bytes;
+    tensor.quantization.kind = QuantizationKind::BlockedAffine;
+    tensor.quantization.accumulation_type = ScalarType::F32;
+    tensor.quantization.block_elements = block_elements;
+    tensor.quantization.block_bytes = block_bytes;
+    tensor.quantization.group_size = block_elements;
+    tensor.quantization.required_plane_mask = 1;
+    tensor.expert_axis = {ExpertAxisKind::ExpertBank, 0, 0xff, 1, 2, experts,
+                          static_cast<uint64_t>(input) * output / block_elements * block_bytes, 0};
+    tensor.planes = {{PlaneKind::Values, ScalarType::U8, ArtifactId{0}, 0,
+                      static_cast<uint64_t>(experts) * tensor.expert_axis.per_expert_byte_stride, 64, 0}};
+    return tensor;
+}
+
+SemanticModel generic_moe_planner_model(uint32_t down_block_bytes = 22, bool q8_down = false,
+                                        bool add_extra_scale = false, bool duplicate_router = false,
+                                        bool permute_subgraph = false, bool key_alias = false) {
+    constexpr uint32_t hidden = 256;
+    constexpr uint32_t experts = 4;
+    constexpr uint32_t selected = 2;
+    constexpr uint32_t expert_intermediate = 256;
+    SemanticModel model = q4k_dense_model();
+    const uint32_t value_base = static_cast<uint32_t>(model.values.size());
+    // Keep the dense attention/FFN branch intact and replace only its final
+    // residual with the explicit dense/MoE branch merge below.  The dense
+    // matcher is deliberately relaxed for this fixture because MoE admission
+    // owns the larger graph witness.
+    model.schema_major = 7;
+    model.opset_major = 7;
+    for (SemanticOperator& op : model.operators) op.semantic_version = 7;
+    for (SemanticState& state : model.states) state.semantic_version = 7;
+    model.tensors.push_back(dense_tensor(12, TensorRole::NextnEmbeddingNormWeight,
+                                         {{DimensionKind::Constant, hidden}}, ScalarType::F32));
+    model.tensors.push_back(moe_f32_matrix(13, TensorRole::NextnProjectionWeight, experts, hidden));
+    model.tensors.push_back(moe_expert_tensor(14, TensorRole::FfnUpWeight, experts, hidden,
+                                              2 * expert_intermediate, 256, 144));
+    model.tensors.push_back(moe_expert_tensor(15, TensorRole::FfnDownWeight, experts, expert_intermediate,
+                                              hidden, q8_down ? 32 : 32, down_block_bytes));
+    model.tensors.push_back(dense_tensor(16, TensorRole::NextnEmbeddingNormWeight,
+                                         {{DimensionKind::Constant, experts}}, ScalarType::F32));
+    model.tensors.push_back(dense_tensor(17, TensorRole::NextnHiddenNormWeight,
+                                         {{DimensionKind::Constant, hidden}}, ScalarType::F32));
+    const auto rows = [](uint32_t width) {
+        return std::vector<Dimension>{{DimensionKind::Symbol, 1}, {DimensionKind::Constant, width}};
+    };
+    const auto routed = [](uint32_t width) {
+        return std::vector<Dimension>{{DimensionKind::Symbol, 1}, {DimensionKind::Constant, selected},
+                                      {DimensionKind::Constant, width}};
+    };
+    model.values.push_back({value_base + 0, ScalarType::F32, rows(hidden), 0}); // router norm
+    model.values.push_back({value_base + 1, ScalarType::F32, rows(hidden), 0}); // route scale
+    model.values.push_back({value_base + 2, ScalarType::F32, rows(hidden), 0}); // H^-1/2 scale
+    model.values.push_back({value_base + 3, ScalarType::F32, rows(experts), 0}); // router logits
+    model.values.push_back({value_base + 4, ScalarType::U32, rows(selected), 0}); // expert IDs
+    model.values.push_back({value_base + 5, ScalarType::F32, rows(selected), 0}); // expert weights
+    model.values.push_back({value_base + 6, ScalarType::F32, rows(hidden), 0}); // expert norm
+    model.values.push_back({value_base + 7, ScalarType::F32, routed(2 * expert_intermediate), 0});
+    model.values.push_back({value_base + 8, ScalarType::F32, routed(expert_intermediate), 0});
+    model.values.push_back({value_base + 9, ScalarType::F32, routed(expert_intermediate), 0});
+    model.values.push_back({value_base + 10, ScalarType::F32, routed(expert_intermediate), 0});
+    model.values.push_back({value_base + 11, ScalarType::F32, routed(hidden), 0});
+    model.values.push_back({value_base + 12, ScalarType::F32, rows(hidden), 0}); // branch merge
+    model.values.push_back({value_base + 13, ScalarType::F32, rows(hidden), 0}); // final add
+
+    const auto make = [](uint32_t id, OperatorKind kind, std::vector<uint32_t> inputs,
+                         std::vector<uint32_t> outputs, std::vector<uint32_t> tensors,
+                         OperatorPayload payload) {
+        SemanticOperator op;
+        op.id = id;
+        op.kind = kind;
+        op.semantic_version = 7;
+        op.inputs = std::move(inputs);
+        op.outputs = std::move(outputs);
+        op.tensors = std::move(tensors);
+        op.payload = std::move(payload);
+        return op;
+    };
+    RouterTopKPayload router;
+    router.expert_count = experts;
+    router.selected_count = selected;
+    router.normalization_order = RouterNormalizationOrder::NormalizeThenSelect;
+    router.selected_weight_normalization =
+        SelectedWeightNormalization::RenormalizeSelectedProbabilities;
+    const uint32_t router_norm_value = value_base + 0;
+    const uint32_t route_scale_value = value_base + 1;
+    const uint32_t normalized_route_value = value_base + 2;
+    const uint32_t router_logits = value_base + 3;
+    const uint32_t expert_ids = value_base + 4;
+    const uint32_t expert_weights = value_base + 5;
+    const uint32_t expert_norm_value = value_base + 6;
+    const uint32_t expert_up_value = value_base + 7;
+    const uint32_t expert_gate_value = value_base + 8;
+    const uint32_t expert_up_split_value = value_base + 9;
+    const uint32_t expert_act_value = value_base + 10;
+    const uint32_t expert_down_value = value_base + 11;
+    const uint32_t moe_reduce_value = value_base + 12;
+    const uint32_t branch_merge_value = 15;
+    const uint32_t final_add_value = value_base + 13;
+    model.operators[14].inputs = {14, moe_reduce_value};
+    model.operators[14].outputs = {branch_merge_value};
+    model.operators[15].inputs = {final_add_value};
+    std::vector<SemanticOperator> tail = {
+        make(0, OperatorKind::RmsNorm, {9}, {router_norm_value}, {}, RmsNormPayload{0x358637bdu, -1, 0}),
+        make(0, OperatorKind::Scale, {router_norm_value}, {route_scale_value}, {12}, ScalePayload{ScaleSource::Tensor, 0}),
+        make(0, OperatorKind::Scale, {route_scale_value}, {normalized_route_value}, {}, ScalePayload{ScaleSource::LiteralF32, 0x3d800000u}),
+        make(0, OperatorKind::Linear, {normalized_route_value}, {router_logits}, {13}, LinearPayload{}),
+        make(0, OperatorKind::RouterTopK, {router_logits}, {expert_ids, expert_weights}, {}, router),
+        make(0, OperatorKind::RmsNorm, {9}, {expert_norm_value}, {17}, RmsNormPayload{0x358637bdu, -1, 1}),
+        make(0, OperatorKind::RoutedLinear, {expert_norm_value, expert_ids, expert_weights}, {expert_up_value}, {14}, RoutedLinearPayload{ScalarType::F32}),
+        make(0, OperatorKind::AxisSplit, {expert_up_value}, {expert_gate_value, expert_up_split_value}, {}, AxisSplitPayload{expert_intermediate, expert_intermediate}),
+        make(0, OperatorKind::GatedActivation, {expert_gate_value, expert_up_split_value}, {expert_act_value}, {}, GatedActivationPayload{ActivationKind::GeluTanh}),
+        make(0, OperatorKind::RoutedLinear, {expert_act_value, expert_ids, expert_weights}, {expert_down_value}, {15}, RoutedLinearPayload{ScalarType::F32}),
+        make(0, OperatorKind::WeightedExpertReduce, {expert_down_value, expert_ids, expert_weights}, {moe_reduce_value}, {16},
+             WeightedExpertReducePayload{ExpertReduceAssociation::SelectedOrderLeftToRight,
+                                         ExpertScaleSource::PerExpertTensor, ScalarType::F32}),
+        make(0, OperatorKind::Add, {9, branch_merge_value}, {final_add_value}, {}, AddPayload{}),
+    };
+    if (add_extra_scale) tail.push_back(make(0, OperatorKind::Scale, {9}, {final_add_value + 1}, {},
+                                             ScalePayload{ScaleSource::LiteralF32, 0x3f800000u}));
+    if (duplicate_router) tail.push_back(make(0, OperatorKind::RouterTopK, {router_logits}, {expert_ids, expert_weights}, {}, router));
+    if (permute_subgraph) std::rotate(tail.begin(), tail.begin() + 2, tail.end());
+    const size_t tail_begin = 15;
+    model.operators.insert(model.operators.begin() + static_cast<ptrdiff_t>(tail_begin), tail.begin(), tail.end());
+    for (uint32_t id = 0; id != model.operators.size(); ++id) model.operators[id].id = id;
+    model.layers[0].operator_count = static_cast<uint32_t>(14 + tail.size());
+    if (key_alias) {
+        model.tensors[4].role = TensorRole::NextnProjectionWeight;
+        const auto attention = std::find_if(model.operators.begin(), model.operators.end(), [](const SemanticOperator& op) {
+            return op.kind == OperatorKind::CausalAttention;
+        });
+        CHECK(attention != model.operators.end());
+        if (attention != model.operators.end()) {
+            attention->inputs = {1, 2};
+            attention->states = {0};
+            auto* payload = std::get_if<CausalAttentionPayload>(&attention->payload);
+            CHECK(payload != nullptr);
+            if (payload) {
+                payload->value_source = ValueSource::KeyStateAlias;
+                payload->value_source_value = 2;
+            }
+        }
+    }
+    return model;
+}
+
+RuntimeCapabilities moe_capabilities() {
+    RuntimeCapabilities capabilities;
+    capabilities.global_fp32_kv = true;
+    capabilities.transactional_state = true;
+    capabilities.metal_device = true;
+    capabilities.metal_library = true;
+    capabilities.metal_pipeline = true;
+    capabilities.metal_moe_router_topk = true;
+    capabilities.metal_moe_gate_up = true;
+    capabilities.metal_moe_down_q5_0 = true;
+    capabilities.metal_moe_down_q8_0 = true;
+    capabilities.metal_moe_reduce = true;
+    return capabilities;
+}
+
+void test_moe_planner_discovers_permuted_graph_and_formats() {
+    const RuntimeCapabilities capabilities = moe_capabilities();
+    const auto registry = builtin_canonical_metal_registry();
+    const SemanticModel q5 = generic_moe_planner_model(22, false, false, false, true);
+    const PlanResult q5_plan = plan_canonical_metal(q5, request(), capabilities, registry);
+    CHECK(std::holds_alternative<ExecutionPlan>(q5_plan));
+    if (const auto* plan = std::get_if<ExecutionPlan>(&q5_plan)) {
+        CHECK(plan->entries.size() == 2);
+        for (const PlanEntry& entry : plan->entries) {
+            CHECK(entry.descriptor.pattern.require_moe_descriptor);
+            CHECK(entry.descriptor.pattern.moe_down_format.exact == MetalWeightFormatQ5_0);
+            CHECK(plan_entry_matches(q5, entry));
+        }
+    }
+
+    const SemanticModel q8 = generic_moe_planner_model(34, true, false, false, true);
+    const PlanResult q8_plan = plan_canonical_metal(q8, request(), capabilities, registry);
+    CHECK(std::holds_alternative<ExecutionPlan>(q8_plan));
+    if (const auto* plan = std::get_if<ExecutionPlan>(&q8_plan)) {
+        CHECK(plan->entries.size() == 2);
+        for (const PlanEntry& entry : plan->entries) {
+            CHECK(entry.descriptor.pattern.moe_down_format.exact == MetalWeightFormatQ8_0);
+            CHECK(plan_entry_matches(q8, entry));
+        }
+    }
+
+    const SemanticModel alias = generic_moe_planner_model(22, false, false, false, true, true);
+    const PlanResult alias_plan = plan_canonical_metal(alias, request(), capabilities, registry);
+    CHECK(std::holds_alternative<CompatibilityReport>(alias_plan));
+    if (const auto* report = std::get_if<CompatibilityReport>(&alias_plan))
+        CHECK(report->code == CompatibilityError::IR_REFERENCE_INVALID);
+}
+
+void test_moe_planner_rejects_ambiguous_and_nonmatching_graphs() {
+    const RuntimeCapabilities capabilities = moe_capabilities();
+    const auto registry = builtin_canonical_metal_registry();
+    const PlanResult bad_format = plan_canonical_metal(generic_moe_planner_model(144), request(), capabilities, registry);
+    CHECK(std::holds_alternative<CompatibilityReport>(bad_format));
+    const PlanResult duplicate_router = plan_canonical_metal(generic_moe_planner_model(22, false, false, true),
+                                                             request(), capabilities, registry);
+    CHECK(std::holds_alternative<CompatibilityReport>(duplicate_router));
+    RuntimeCapabilities no_q8 = capabilities;
+    no_q8.metal_moe_down_q8_0 = false;
+    const PlanResult unavailable = plan_canonical_metal(generic_moe_planner_model(34, true), request(), no_q8, registry);
+    CHECK(std::holds_alternative<CompatibilityReport>(unavailable));
+
+    SemanticModel swapped = generic_moe_planner_model();
+    auto final_add = std::find_if(swapped.operators.begin(), swapped.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Add && op.inputs.size() == 2 && op.inputs[0] == 9 && op.inputs[1] == 15;
+    });
+    CHECK(final_add != swapped.operators.end());
+    if (final_add != swapped.operators.end()) {
+        std::swap(final_add->inputs[0], final_add->inputs[1]);
+        const PlanResult rejected_order = plan_canonical_metal(swapped, request(), capabilities, registry);
+        CHECK(std::holds_alternative<CompatibilityReport>(rejected_order));
+    }
+
+    const auto operator_with_role = [](SemanticModel& model, OperatorKind kind,
+                                       TensorRole role) -> SemanticOperator* {
+        SemanticOperator* found = nullptr;
+        for (SemanticOperator& op : model.operators) {
+            if (op.kind != kind) continue;
+            const bool carries = std::any_of(op.tensors.begin(), op.tensors.end(), [&](uint32_t tensor_id) {
+                return tensor_id < model.tensors.size() && model.tensors[tensor_id].role == role;
+            });
+            if (!carries) continue;
+            if (found) return nullptr;
+            found = &op;
+        }
+        return found;
+    };
+
+    SemanticModel wrong_qkv_input = generic_moe_planner_model();
+    SemanticOperator* attention_norm = operator_with_role(
+        wrong_qkv_input, OperatorKind::RmsNorm, TensorRole::AttentionNormWeight);
+    CHECK(attention_norm != nullptr);
+    if (attention_norm && attention_norm->inputs.size() == 1) {
+        const uint32_t raw_residual = attention_norm->inputs[0];
+        for (TensorRole role : {TensorRole::QueryWeight, TensorRole::KeyWeight,
+                                TensorRole::ValueWeight}) {
+            SemanticOperator* projection = operator_with_role(
+                wrong_qkv_input, OperatorKind::Linear, role);
+            CHECK(projection != nullptr);
+            if (projection) projection->inputs = {raw_residual};
+        }
+        const PlanResult rejected = plan_canonical_metal(
+            wrong_qkv_input, request(), capabilities, registry);
+        CHECK(std::holds_alternative<CompatibilityReport>(rejected));
+    }
+
+    SemanticModel wrong_attention_residual = generic_moe_planner_model();
+    attention_norm = operator_with_role(
+        wrong_attention_residual, OperatorKind::RmsNorm, TensorRole::AttentionNormWeight);
+    SemanticOperator* attention_output = operator_with_role(
+        wrong_attention_residual, OperatorKind::Linear, TensorRole::AttentionOutputWeight);
+    SemanticOperator* ffn_norm = operator_with_role(
+        wrong_attention_residual, OperatorKind::RmsNorm, TensorRole::FfnNormWeight);
+    CHECK(attention_norm != nullptr);
+    CHECK(attention_output != nullptr);
+    CHECK(ffn_norm != nullptr);
+    if (attention_norm && attention_output && ffn_norm &&
+        attention_norm->outputs.size() == 1 && attention_output->outputs.size() == 1 &&
+        ffn_norm->inputs.size() == 1) {
+        auto residual = std::find_if(
+            wrong_attention_residual.operators.begin(), wrong_attention_residual.operators.end(),
+            [&](const SemanticOperator& op) {
+                return op.kind == OperatorKind::Add && op.outputs == ffn_norm->inputs;
+            });
+        CHECK(residual != wrong_attention_residual.operators.end());
+        if (residual != wrong_attention_residual.operators.end()) {
+            residual->inputs = {attention_norm->outputs[0], attention_output->outputs[0]};
+            const PlanResult rejected = plan_canonical_metal(
+                wrong_attention_residual, request(), capabilities, registry);
+            CHECK(std::holds_alternative<CompatibilityReport>(rejected));
+        }
+    }
+}
+
+void test_dense_graph_witness_closes_the_executed_dag() {
+    const SemanticModel model = q4k_dense_model();
+    DenseGraphWitness witness;
+    CHECK(match_canonical_dense_operator_edges(model, model.layers.front(), witness));
+    CHECK(witness.covered_operator_ids.size() == model.layers.front().operator_count);
+    CHECK(witness.attention_residual != nullptr);
+    CHECK(witness.ffn_norm != nullptr);
+    CHECK(witness.gate != nullptr);
+    CHECK(witness.up != nullptr);
+    CHECK(witness.swiglu != nullptr);
+    CHECK(witness.down != nullptr);
+    CHECK(witness.final_residual != nullptr);
+
+    const SemanticModel decoupled = q4k_decoupled_query_width_dense_model();
+    DenseGraphWitness decoupled_witness;
+    CHECK(match_canonical_dense_operator_edges(
+        decoupled, decoupled.layers.front(), decoupled_witness));
+    const PlanResult decoupled_plan = plan_canonical_metal(
+        decoupled, request(), moe_capabilities(),
+        builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<ExecutionPlan>(decoupled_plan));
+    SemanticModel reversed_query = decoupled;
+    reversed_query.tensors[2].dimensions = {
+        {DimensionKind::Constant, 1024}, {DimensionKind::Constant, 256}};
+    CHECK(!match_canonical_dense_operator_edges(
+        reversed_query, reversed_query.layers.front(), decoupled_witness));
+
+    SemanticModel disconnected = model;
+    SemanticOperator extra;
+    extra.kind = OperatorKind::Scale;
+    extra.inputs = {0};
+    extra.outputs = {18};
+    extra.payload = ScalePayload{ScaleSource::LiteralF32, 0x3f800000u};
+    const size_t insertion = disconnected.layers.front().first_operator +
+                             disconnected.layers.front().operator_count;
+    disconnected.operators.insert(disconnected.operators.begin() + static_cast<ptrdiff_t>(insertion), extra);
+    for (uint32_t id = 0; id != disconnected.operators.size(); ++id) disconnected.operators[id].id = id;
+    ++disconnected.layers.front().operator_count;
+    DenseGraphWitness rejected;
+    CHECK(!match_canonical_dense_operator_edges(disconnected, disconnected.layers.front(), rejected));
+
+    SemanticModel wrong_swiglu = model;
+    auto swiglu = std::find_if(wrong_swiglu.operators.begin(), wrong_swiglu.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::SwiGlu;
+    });
+    CHECK(swiglu != wrong_swiglu.operators.end());
+    if (swiglu != wrong_swiglu.operators.end()) {
+        swiglu->inputs[0] = 10;
+        CHECK(!match_canonical_dense_operator_edges(wrong_swiglu, wrong_swiglu.layers.front(), rejected));
+    }
+
+    SemanticModel wrong_ffn_residual = model;
+    auto final_add = std::find_if(wrong_ffn_residual.operators.begin(), wrong_ffn_residual.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Add && op.inputs == std::vector<uint32_t>{9, 14};
+    });
+    CHECK(final_add != wrong_ffn_residual.operators.end());
+    if (final_add != wrong_ffn_residual.operators.end()) {
+        final_add->inputs[0] = 0;
+        CHECK(!match_canonical_dense_operator_edges(wrong_ffn_residual,
+                                                    wrong_ffn_residual.layers.front(), rejected));
+    }
+
+    SemanticModel duplicate_producer = model;
+    auto duplicate_add = std::find_if(duplicate_producer.operators.begin(), duplicate_producer.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Add && op.inputs == std::vector<uint32_t>{9, 14};
+    });
+    CHECK(duplicate_add != duplicate_producer.operators.end());
+    if (duplicate_add != duplicate_producer.operators.end()) {
+        duplicate_add->outputs[0] = 9;
+        CHECK(!match_canonical_dense_operator_edges(duplicate_producer,
+                                                    duplicate_producer.layers.front(), rejected));
+    }
+
+    SemanticModel self_edge = model;
+    auto self_add = std::find_if(self_edge.operators.begin(), self_edge.operators.end(), [](const SemanticOperator& op) {
+        return op.kind == OperatorKind::Add && op.inputs == std::vector<uint32_t>{9, 14};
+    });
+    CHECK(self_add != self_edge.operators.end());
+    if (self_add != self_edge.operators.end()) {
+        self_add->inputs[0] = self_add->outputs[0];
+        CHECK(!match_canonical_dense_operator_edges(self_edge, self_edge.layers.front(), rejected));
+    }
+
+    SemanticModel truncated = model;
+    --truncated.layers.front().operator_count;
+    CHECK(!match_canonical_dense_operator_edges(truncated, truncated.layers.front(), rejected));
+
+    SemanticModel wrong_gate_shape = model;
+    wrong_gate_shape.tensors[7].dimensions[0].constant_or_symbol = 128;
+    wrong_gate_shape.tensors[7].planes[0].length = 128ull * 256 / 256 * 144;
+    CHECK(!match_canonical_dense_operator_edges(wrong_gate_shape,
+                                                wrong_gate_shape.layers.front(), rejected));
+
+    SemanticModel wrong_fused_shape = q4k_query_gate_dense_model();
+    wrong_fused_shape.tensors[2].dimensions[1].constant_or_symbol = 256;
+    wrong_fused_shape.tensors[2].planes[0].length = 256ull * 256 / 256 * 144;
+    CHECK(!match_canonical_dense_operator_edges(wrong_fused_shape,
+                                                wrong_fused_shape.layers.front(), rejected));
+
+    SemanticModel mixed_geometry = model;
+    const uint32_t value_base = static_cast<uint32_t>(mixed_geometry.values.size());
+    for (const SemanticValue& value : model.values) {
+        SemanticValue copy = value;
+        copy.id += value_base;
+        mixed_geometry.values.push_back(std::move(copy));
+    }
+    std::vector<SemanticOperator> second_layer;
+    for (uint32_t index = model.layers.front().first_operator;
+         index != model.layers.front().first_operator + model.layers.front().operator_count; ++index) {
+        SemanticOperator copy = model.operators[index];
+        for (uint32_t& value : copy.inputs) value += value_base;
+        for (uint32_t& value : copy.outputs) value += value_base;
+        second_layer.push_back(std::move(copy));
+    }
+    const size_t second_layer_begin = model.layers.front().first_operator +
+                                      model.layers.front().operator_count;
+    mixed_geometry.operators.insert(mixed_geometry.operators.begin() +
+                                    static_cast<ptrdiff_t>(second_layer_begin),
+                                    second_layer.begin(), second_layer.end());
+    for (uint32_t id = 0; id != mixed_geometry.operators.size(); ++id) mixed_geometry.operators[id].id = id;
+    mixed_geometry.layers.push_back({0, static_cast<uint32_t>(second_layer_begin),
+                                     model.layers.front().operator_count, 0});
+    auto second_attention = std::find_if(
+        mixed_geometry.operators.begin() + static_cast<ptrdiff_t>(second_layer_begin),
+        mixed_geometry.operators.begin() + static_cast<ptrdiff_t>(second_layer_begin +
+                                                                  model.layers.front().operator_count),
+        [](const SemanticOperator& op) { return op.kind == OperatorKind::CausalAttention; });
+    CHECK(second_attention != mixed_geometry.operators.end());
+    if (second_attention != mixed_geometry.operators.end()) {
+        auto* payload = std::get_if<CausalAttentionPayload>(&second_attention->payload);
+        CHECK(payload != nullptr);
+        if (payload) {
+            payload->query_heads = 8;
+            payload->kv_heads = 8;
+            payload->head_dimension = 32;
+        }
+    }
+    RuntimeCapabilities metal;
+    metal.global_fp32_kv = true;
+    metal.transactional_state = true;
+    metal.metal_device = true;
+    metal.metal_library = true;
+    metal.metal_pipeline = true;
+    const auto mixed_plan = plan_canonical_metal_dense(
+        mixed_geometry, request(), metal, builtin_canonical_metal_registry());
+    CHECK(std::holds_alternative<CompatibilityReport>(mixed_plan));
+}
+
 } // namespace
 
 int main() {
@@ -1302,19 +2444,28 @@ int main() {
     test_metal_blocked_descriptor_requires_the_exact_q4k_contract();
     test_metal_quantized_descriptor_signatures_are_closed();
     test_metal_iq2_xxs_descriptor_requires_the_exact_codebook_contract();
+    test_affine_u2_requires_a_queried_capability();
+    test_column_grouped_affine_u2_skip_has_a_distinct_typed_route();
     test_f16_prefill_batch_descriptor_is_exactly_two_rows();
     test_canonical_planner_materializes_q4k_dense_entries();
     test_canonical_planner_admits_flattened_attention_context();
+    test_canonical_planner_rejects_sliding_attention_until_windowed_metal_exists();
+    test_canonical_planner_rejects_invalid_rope_and_rms_contracts();
     test_canonical_planner_materializes_query_gate_dense_entries();
     test_canonical_planner_materializes_mixed_quantized_dense_entries();
     test_canonical_planner_materializes_recurrent_q4k_q6k_entries();
     test_canonical_planner_admits_uniform_recurrent_q4k_and_q6k();
     test_canonical_planner_materializes_schema4_recurrent_entries();
     test_canonical_planner_materializes_mixed_dense_recurrent_entries();
+    test_canonical_planner_rejects_a_layer_that_bypasses_the_previous_residual();
+    test_canonical_planner_rejects_a_graph_spine_that_differs_from_metal();
     test_canonical_planner_skips_disabled_schema6_terminal_layer();
-    test_canonical_planner_refuses_moe_operators();
     test_canonical_planner_admits_q6k_output_projection();
     test_canonical_planner_admits_q6k_token_embedding();
     test_canonical_planner_admits_q4k_token_embedding();
+    test_moe_registry_matches_generic_physical_contract();
+    test_moe_planner_discovers_permuted_graph_and_formats();
+    test_moe_planner_rejects_ambiguous_and_nonmatching_graphs();
+    test_dense_graph_witness_closes_the_executed_dag();
     return test_summary("test_execution_plan");
 }

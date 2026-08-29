@@ -12,6 +12,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 #include "fp16.h"
@@ -28,6 +30,12 @@ extern void metal_pack_tensor(const Tensor& w, int K, int N);
 extern bool metal_available();
 extern bool metal_gemv_begin(const MatmulBatchSpec* specs, int n);
 extern void metal_gemv_end();
+extern bool metal_decode_ffn_moe(
+    const float* x_norm, const Tensor& ffn_gate, const Tensor& ffn_up,
+    const Tensor& ffn_down, float* xb, int H, int inter, bool swiglu,
+    const float* moe_in, const Tensor* moe_up_stack, const Tensor* moe_dn_stack,
+    const int* expert_ids, int n_exp, int exp_inter, const float* route_w,
+    float* moe_out);
 }
 static bool metal_enabled() {
     const char* e = std::getenv("LAPLACE_METAL");
@@ -41,6 +49,11 @@ void metal_dispatch_metrics_reset() {}
 MetalDispatchMetrics metal_dispatch_metrics() { return {}; }
 void metal_register_weights(const void*, size_t) {}
 void metal_pack_tensor(const Tensor&, int, int) {}
+bool metal_decode_ffn_moe(const float*, const Tensor&, const Tensor&, const Tensor&,
+                          float*, int, int, bool, const float*, const Tensor*,
+                          const Tensor*, const int*, int, int, const float*, float*) {
+    return false;
+}
 bool metal_tok_begin(int, int, int, int, int, int, int, int, int, int, int) { return false; }
 bool metal_tok_active() { return false; }
 void metal_tok_upload_x(const float*, int) {}
@@ -100,6 +113,16 @@ using kernels::get_scale_min_k4;
 
 namespace {
 
+bool is_cpu_rejected_type(GGMLType type) {
+    return type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256;
+}
+
+[[noreturn]] void reject_cpu_execution(GGMLType type) {
+    throw std::invalid_argument(
+        std::string("CPU matmul/dequantize does not support Metal-only weight type ") +
+        type_name(type));
+}
+
 #include "iq2_xxs_tables.inc"
 #include "iq1_s_tables.inc"
 
@@ -114,6 +137,43 @@ std::array<uint8_t, 32> digest_bytes(std::span<const uint8_t> bytes) {
     std::array<uint8_t, 32> digest{};
     CC_SHA256_Final(digest.data(), &context);
     return digest;
+}
+
+void digest_u16(CC_SHA256_CTX& context, uint16_t value);
+void digest_u32(CC_SHA256_CTX& context, uint32_t value);
+void digest_u64(CC_SHA256_CTX& context, uint64_t value);
+
+std::array<uint8_t, 32> column_grouped_affine_u2_skip_provenance_digest(
+    GGMLType source_format, uint64_t logical_k, uint64_t logical_n,
+    std::span<const float> importance) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    static constexpr uint8_t domain[] = {'L','A','P','S','P','Q','C','1'};
+    CC_SHA256_Update(&context, domain, sizeof(domain));
+    digest_u16(context, 1u);  // converter/fitter version
+    digest_u32(context, static_cast<uint32_t>(source_format));
+    digest_u64(context, logical_k);
+    digest_u64(context, logical_n);
+    digest_u64(context, importance.size());
+    for (float value : importance) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        digest_u32(context, bits);
+    }
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    return digest;
+}
+
+bool byte_ranges_overlap(const void* left, size_t left_size,
+                         const void* right, size_t right_size) {
+    const uintptr_t left_begin = reinterpret_cast<uintptr_t>(left);
+    const uintptr_t right_begin = reinterpret_cast<uintptr_t>(right);
+    if (left_size > std::numeric_limits<uintptr_t>::max() - left_begin ||
+        right_size > std::numeric_limits<uintptr_t>::max() - right_begin)
+        return true;
+    return left_begin < right_begin + right_size &&
+           right_begin < left_begin + left_size;
 }
 
 void digest_u16(CC_SHA256_CTX& context, uint16_t value) {
@@ -981,6 +1041,13 @@ bool quantize_iq1_s_block(const float* values, const float* importance,
     return true;
 }
 
+inline float geglu_product(float gate, float up) {
+    constexpr float c = 0.7978845608028654f;
+    constexpr float c2 = 0.044715f;
+    float gate3 = gate * gate * gate;
+    return 0.5f * gate * (1.0f + std::tanh(c * (gate + c2 * gate3))) * up;
+}
+
 // ---------------- runtime kernel dispatch -----------------------------------
 // The SIMD back-end (matmul_simd.cpp, compiled with ARMv8.x ISA flags)
 // exports a whole-GEMM entry point. LAPLACE_NOSIMD=1 forces the portable
@@ -1276,6 +1343,7 @@ void gemm_scalar(const float* x, const uint8_t* data, float* y,
 
 bool gemm_fallback(const float* x, const uint8_t* w, GGMLType type,
                    float* y, int M, int K, int N) {
+    if (is_cpu_rejected_type(type)) return false;
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
     switch (type) {
         case GGMLType::F32:  gemm_scalar<dot_row_f32 >(x, w, y, M, K, N, rb); return true;
@@ -1512,6 +1580,150 @@ bool derive_affine_u2_block256_from_gguf(
     derived.storage_digest = derived_affine_u2_digest(
         derived, packed_weights, scales, biases);
     *record = derived;
+    return true;
+}
+
+bool derive_column_grouped_affine_u2_skip_v1_from_gguf(
+    GGMLType source_format, std::span<const uint8_t> source,
+    uint64_t logical_k, uint64_t logical_n, std::span<const float> importance,
+    std::span<uint8_t> packed_weights, std::span<uint16_t> scales,
+    std::span<uint16_t> biases,
+    ColumnGroupedAffineUInt2SkipV1Storage* storage,
+    DerivedStorageError* error) {
+    const auto reject = [error](DerivedStorageError value) {
+        if (error) *error = value;
+        return false;
+    };
+    if (error) *error = DerivedStorageError::None;
+    if (!storage) return reject(DerivedStorageError::ShapeUnsupported);
+
+    uint64_t source_block_bytes = 0;
+    if (source_format == GGMLType::Q4_K)
+        source_block_bytes = sizeof(kernels::block_q4_K);
+    else if (source_format == GGMLType::Q6_K)
+        source_block_bytes = sizeof(kernels::block_q6_K);
+    else
+        return reject(DerivedStorageError::SourceFormatUnsupported);
+    if (logical_k == 0 || logical_n == 0 || logical_k % 256u != 0 ||
+        logical_n % 256u != 0 || logical_k > static_cast<uint64_t>(INT_MAX) ||
+        logical_n > static_cast<uint64_t>(UINT32_MAX))
+        return reject(DerivedStorageError::ShapeUnsupported);
+    if (importance.size() != logical_k)
+        return reject(DerivedStorageError::ImportanceLengthMismatch);
+    bool any_importance = false;
+    for (float value : importance) {
+        if (!std::isfinite(value) || value < 0.0f)
+            return reject(DerivedStorageError::InvalidImportance);
+        any_importance = any_importance || value > 0.0f;
+    }
+    if (!any_importance) return reject(DerivedStorageError::InvalidImportance);
+
+    const uint64_t blocks_per_row = logical_k / 256u;
+    if (logical_n > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    const uint64_t source_blocks = logical_n * blocks_per_row;
+    if (source_blocks > std::numeric_limits<size_t>::max() / source_block_bytes ||
+        source.size() != static_cast<size_t>(source_blocks * source_block_bytes))
+        return reject(DerivedStorageError::SourceLengthMismatch);
+
+    ColumnGroupedAffineUInt2SkipV1Contract contract;
+    ColumnGroupedAffineUInt2SkipV1Error contract_error{};
+    if (!column_grouped_affine_uint2_skip_v1_make_contract(
+            logical_k, logical_n, &contract, &contract_error))
+        return reject(DerivedStorageError::ShapeUnsupported);
+    if (packed_weights.size() != static_cast<size_t>(contract.values_bytes) ||
+        scales.size() != static_cast<size_t>(contract.group_count) ||
+        biases.size() != static_cast<size_t>(contract.group_count))
+        return reject(DerivedStorageError::DestinationLengthMismatch);
+    constexpr uintptr_t alignment = 128u;
+    if (!packed_weights.data() || !scales.data() || !biases.data() ||
+        (reinterpret_cast<uintptr_t>(packed_weights.data()) & (alignment - 1u)) != 0u ||
+        (reinterpret_cast<uintptr_t>(scales.data()) & (alignment - 1u)) != 0u ||
+        (reinterpret_cast<uintptr_t>(biases.data()) & (alignment - 1u)) != 0u)
+        return reject(DerivedStorageError::DestinationAlignmentMismatch);
+    if (byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            scales.data(), scales.size_bytes()) ||
+        byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            biases.data(), biases.size_bytes()) ||
+        byte_ranges_overlap(scales.data(), scales.size_bytes(),
+                            biases.data(), biases.size_bytes()) ||
+        byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            source.data(), source.size()) ||
+        byte_ranges_overlap(scales.data(), scales.size_bytes(),
+                            source.data(), source.size()) ||
+        byte_ranges_overlap(biases.data(), biases.size_bytes(),
+                            source.data(), source.size()) ||
+        byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            importance.data(), importance.size_bytes()) ||
+        byte_ranges_overlap(scales.data(), scales.size_bytes(),
+                            importance.data(), importance.size_bytes()) ||
+        byte_ranges_overlap(biases.data(), biases.size_bytes(),
+                            importance.data(), importance.size_bytes()))
+        return reject(DerivedStorageError::DestinationOverlap);
+
+    if (logical_k > std::numeric_limits<size_t>::max() / (256u * sizeof(float)))
+        return reject(DerivedStorageError::ShapeUnsupported);
+    std::vector<float> tile;
+    try {
+        tile.resize(static_cast<size_t>(logical_k) * 256u);
+    } catch (const std::bad_alloc&) {
+        return reject(DerivedStorageError::ShapeUnsupported);
+    } catch (const std::length_error&) {
+        return reject(DerivedStorageError::ShapeUnsupported);
+    }
+    const size_t source_row_bytes = static_cast<size_t>(blocks_per_row * source_block_bytes);
+    std::atomic<bool> failed{false};
+    const uint32_t output_groups = static_cast<uint32_t>(logical_n / 256u);
+    for (uint32_t output_group = 0; output_group != output_groups; ++output_group) {
+        ThreadPool::get().parallel_for(256, [&](int lane) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            Tensor row;
+            row.type = source_format;
+            row.n_dims = 1;
+            row.dims[0] = logical_k;
+            row.data = source.data() +
+                (static_cast<size_t>(output_group) * 256u + static_cast<size_t>(lane)) *
+                    source_row_bytes;
+            dequantize(row, tile.data() + static_cast<size_t>(lane) * logical_k,
+                       static_cast<int>(logical_k));
+        });
+        ThreadPool::get().parallel_for(static_cast<int>(logical_k), [&](int column_value) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            const uint32_t column = static_cast<uint32_t>(column_value);
+            std::array<float, 256> values{};
+            std::array<float, 256> weights{};
+            for (uint32_t lane = 0; lane != 256u; ++lane)
+                values[lane] = tile[static_cast<size_t>(lane) * logical_k + column];
+            // A K-length activation statistic has one value per input column.
+            // A positive constant factor cancels in this column's least-squares
+            // fit; an unseen column uses a complete unweighted fit rather than
+            // deleting weights that may become active outside calibration.
+            weights.fill(importance[column] > 0.0f ? importance[column] : 1.0f);
+            const uint64_t group = static_cast<uint64_t>(output_group) * logical_k + column;
+            if (!quantize_affine_u2_block(
+                    values.data(), weights.data(),
+                    packed_weights.data() + static_cast<size_t>(group) * 64u,
+                    scales.data() + group, biases.data() + group))
+                failed.store(true, std::memory_order_relaxed);
+        });
+        if (failed.load(std::memory_order_relaxed))
+            return reject(DerivedStorageError::NonFiniteSource);
+    }
+
+    ColumnGroupedAffineUInt2SkipV1Storage candidate;
+    candidate.contract = contract;
+    candidate.planes = {packed_weights.data(), packed_weights.size(),
+                        scales.data(), scales.size(), biases.data(), biases.size()};
+    candidate.source_digest = digest_bytes(source);
+    candidate.provenance_digest = column_grouped_affine_u2_skip_provenance_digest(
+        source_format, logical_k, logical_n, importance);
+    candidate.storage_digest =
+        column_grouped_affine_uint2_skip_v1_storage_digest(candidate);
+    if (!column_grouped_affine_uint2_skip_v1_validate(
+            candidate, candidate.source_digest, candidate.provenance_digest,
+            &contract_error))
+        return reject(DerivedStorageError::IntegrityMismatch);
+    *storage = candidate;
     return true;
 }
 
@@ -1783,7 +1995,8 @@ static float dot_row_mlx(const float* x, const uint8_t* w,
 }
 
 void matmul_rows(const float* x, const Tensor& w, float* y, int M, int K, int N) {
-    if (w.type == GGMLType::MLX_AFFINE) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
+    if (w.type == GGMLType::GROUPED_AFFINE_U2_256) {
         int bits = w.mlx_bits;
         int gs = w.mlx_group_size;
         int epw = 32 / bits;
@@ -1836,9 +2049,218 @@ bool matmul_gpu_batch(const MatmulBatchSpec* specs, int n) {
     return true;
 }
 
+bool matmul_decode_ffn_moe(
+    const float* x_norm, const Tensor& ffn_gate, const Tensor& ffn_up,
+    const Tensor& ffn_down, float* xb, int H, int inter, bool swiglu,
+    const float* moe_in, const Tensor* moe_up_stack, const Tensor* moe_dn_stack,
+    const int* expert_ids, int n_exp, int exp_inter, const float* route_w,
+    float* moe_out) {
+    if (!metal_enabled()) return false;
+    return metal_decode_ffn_moe(x_norm, ffn_gate, ffn_up, ffn_down, xb,
+                                H, inter, swiglu, moe_in, moe_up_stack,
+                                moe_dn_stack, expert_ids, n_exp, exp_inter,
+                                route_w, moe_out);
+}
+
+bool matmul_gpu_begin(const MatmulBatchSpec* specs, int n) {
+    if (!metal_enabled()) return false;
+    return metal_gemv_begin(specs, n);
+}
+
+void matmul_gpu_end() {
+    metal_gemv_end();
+}
+
+void matmul_register_weights(const void* base, size_t size) {
+    if (!metal_enabled()) return;
+    metal_register_weights(base, size);
+}
+
+void matmul_gpu_pack(const Tensor& w, int K, int N) {
+    if (!metal_enabled()) return;
+    metal_pack_tensor(w, K, N);
+}
+
+bool matmul_gemm_batch(const MatmulBatchSpec* specs, int n) {
+    for (int i = 0; i < n; i++) {
+        if (specs[i].w && is_cpu_rejected_type(specs[i].w->type))
+            reject_cpu_execution(specs[i].w->type);
+    }
+    for (int i = 0; i < n; i++)
+        matmul_rows(specs[i].x, *specs[i].w, specs[i].y, 1, specs[i].K, specs[i].N);
+    return true;
+}
+
+void fused_moe_gemm_idx(const float* x, const Tensor& w, float* y,
+                        const int* expert_idx, int n_experts,
+                        int K, int N) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
+    // Fused MoE GEMV with indirect expert access. One parallel_for across
+    // all selected experts' columns. Activation quantized once.
+    ProfScope prof;
+    if (kernels::moe_gemv_fn moe = [] {
+        const char* off = std::getenv("LAPLACE_NOSIMD");
+        if (off && off[0] == '1') return static_cast<kernels::moe_gemv_fn>(nullptr);
+        return kernels::get_simd_moe_gemv();
+    }()) {
+        if (moe(x, w.data, w.type, expert_idx, n_experts, y, K, N)) return;
+    }
+    // Fallback: sequential matmul per expert.
+    for (int k = 0; k < n_experts; k++) {
+        int e = expert_idx[k];
+        size_t per_expert = static_cast<size_t>(N) * (static_cast<size_t>(K) / elements_per_block(w.type) * bytes_per_block(w.type));
+        Tensor view = w;
+        view.data = w.data + static_cast<size_t>(e) * per_expert;
+        matmul_row(x, view, y + static_cast<size_t>(k) * N, K, N);
+    }
+}
+
+void fused_moe_gemm_multi(const float* x, const Tensor& w, float* y,
+                          const int* expert_idx, int n_experts,
+                          int K, int N) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
+    // Fused MoE GEMV with per-expert activations. Each expert k has its
+    // own input at x[k * K]. One parallel_for across all experts' columns.
+    ProfScope prof;
+    if (kernels::moe_gemv_multi_fn moe = [] {
+        const char* off = std::getenv("LAPLACE_NOSIMD");
+        if (off && off[0] == '1') return static_cast<kernels::moe_gemv_multi_fn>(nullptr);
+        return kernels::get_simd_moe_gemv_multi();
+    }()) {
+        if (moe(x, w.data, w.type, expert_idx, n_experts, y, K, N)) return;
+    }
+    // Fallback: sequential matmul per expert.
+    for (int k = 0; k < n_experts; k++) {
+        int e = expert_idx[k];
+        size_t per_expert = static_cast<size_t>(N) * (static_cast<size_t>(K) / elements_per_block(w.type) * bytes_per_block(w.type));
+        Tensor view = w;
+        view.data = w.data + static_cast<size_t>(e) * per_expert;
+        matmul_row(x + static_cast<size_t>(k) * K, view, y + static_cast<size_t>(k) * N, K, N);
+    }
+}
+
+bool fused_moe_gate_up_geglu(const float* x, const Tensor& w, float* hidden,
+                             const int* expert_idx, int n_experts,
+                             int K, int hidden_dim,
+                             const uint8_t* const* bases) {
+    if (metal_enabled() && n_experts > 0 && n_experts <= 16) {
+        MatmulBatchSpec specs[16];
+        Tensor views[16];
+        std::vector<float> gate_up(static_cast<size_t>(n_experts) * 2 * hidden_dim);
+        size_t per = static_cast<size_t>(2 * hidden_dim) *
+                     (static_cast<size_t>(K) / elements_per_block(w.type) *
+                      bytes_per_block(w.type));
+        bool ok = true;
+        for (int k = 0; k < n_experts; k++) {
+            views[k] = w;
+            views[k].data = bases ? bases[k]
+                                  : w.data + static_cast<size_t>(expert_idx[k]) * per;
+            if (!views[k].data) { ok = false; break; }
+            specs[k] = {x, &views[k],
+                        gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim,
+                        K, 2 * hidden_dim};
+        }
+        if (ok && matmul_gpu_batch(specs, n_experts)) {
+            for (int k = 0; k < n_experts; k++) {
+                const float* gu = gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim;
+                float* dst = hidden + static_cast<size_t>(k) * hidden_dim;
+                for (int j = 0; j < hidden_dim; j++)
+                    dst[j] = geglu_product(gu[j], gu[hidden_dim + j]);
+            }
+            return true;
+        }
+    }
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
+    if (kernels::moe_gate_up_fn fn = [] {
+        const char* off = std::getenv("LAPLACE_NOSIMD");
+        if (off && off[0] == '1') return static_cast<kernels::moe_gate_up_fn>(nullptr);
+        return kernels::get_simd_moe_gate_up();
+    }()) {
+        if (fn(x, w.data, w.type, expert_idx, n_experts, hidden,
+               K, hidden_dim, bases)) return true;
+    }
+
+    std::vector<float> gate_up(static_cast<size_t>(n_experts) * 2 * hidden_dim);
+    if (bases) {
+        for (int k = 0; k < n_experts; k++) {
+            Tensor view = w;
+            view.data = bases[k];
+            matmul_row(x, view, gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim,
+                       K, 2 * hidden_dim);
+        }
+    } else {
+        fused_moe_gemm_idx(x, w, gate_up.data(), expert_idx, n_experts,
+                           K, 2 * hidden_dim);
+    }
+    for (int k = 0; k < n_experts; k++) {
+        const float* gu = gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim;
+        float* dst = hidden + static_cast<size_t>(k) * hidden_dim;
+        for (int j = 0; j < hidden_dim; j++)
+            dst[j] = geglu_product(gu[j], gu[hidden_dim + j]);
+    }
+    return true;
+}
+
+bool fused_moe_down_accumulate(const float* x, const Tensor& w,
+                               const int* expert_idx, const float* route_weight,
+                               int n_experts, int K, int N, float* output,
+                               const uint8_t* const* bases) {
+    if (metal_enabled() && n_experts > 0 && n_experts <= 16) {
+        MatmulBatchSpec specs[16];
+        Tensor views[16];
+        std::vector<float> expert_out(static_cast<size_t>(n_experts) * N);
+        size_t per = static_cast<size_t>(N) *
+                     (static_cast<size_t>(K) / elements_per_block(w.type) *
+                      bytes_per_block(w.type));
+        bool ok = true;
+        for (int k = 0; k < n_experts; k++) {
+            views[k] = w;
+            views[k].data = bases ? bases[k]
+                                  : w.data + static_cast<size_t>(expert_idx[k]) * per;
+            if (!views[k].data) { ok = false; break; }
+            specs[k] = {x + static_cast<size_t>(k) * K, &views[k],
+                        expert_out.data() + static_cast<size_t>(k) * N, K, N};
+        }
+        if (ok && matmul_gpu_batch(specs, n_experts)) {
+            for (int k = 0; k < n_experts; k++)
+                for (int j = 0; j < N; j++)
+                    output[j] += route_weight[k] *
+                        expert_out[static_cast<size_t>(k) * N + j];
+            return true;
+        }
+    }
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
+    if (kernels::moe_down_fn fn = [] {
+        const char* off = std::getenv("LAPLACE_NOSIMD");
+        if (off && off[0] == '1') return static_cast<kernels::moe_down_fn>(nullptr);
+        return kernels::get_simd_moe_down();
+    }()) {
+        if (fn(x, w.data, w.type, expert_idx, route_weight, n_experts,
+               output, K, N, bases)) return true;
+    }
+
+    std::vector<float> expert_out(static_cast<size_t>(n_experts) * N);
+    if (bases) {
+        for (int k = 0; k < n_experts; k++) {
+            Tensor view = w;
+            view.data = bases[k];
+            matmul_row(x + static_cast<size_t>(k) * K, view,
+                       expert_out.data() + static_cast<size_t>(k) * N, K, N);
+        }
+    } else {
+        fused_moe_gemm_multi(x, w, expert_out.data(), expert_idx, n_experts, K, N);
+    }
+    for (int k = 0; k < n_experts; k++)
+        for (int j = 0; j < N; j++)
+            output[j] += route_weight[k] *
+                expert_out[static_cast<size_t>(k) * N + j];
+    return true;
+}
+
 // ---------------- Dequantize (embeddings, verification) ---------------------
 
 void dequantize(const Tensor& w, float* dst, int n) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
     switch (w.type) {
         case GGMLType::F32: {
             const float* p = reinterpret_cast<const float*>(w.data);
