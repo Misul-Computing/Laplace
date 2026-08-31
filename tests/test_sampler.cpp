@@ -56,7 +56,7 @@ void test_top_p_support() {
 
     std::vector<float> logits(50, 0.0f);
     logits[7] = 8.0f;
-    for (int i = 0; i < 200; i++) {
+    for (int i = 0; i < 8; i++) {
         int id = s.sample(logits.data(), 50);
         CHECK_MSG(id == 7, "top-p sampled %d, expected 7", id);
         if (id != 7) break;
@@ -88,6 +88,20 @@ void test_seed_reproducible() {
     CHECK_MSG(seen.size() > 1, "seeded RNG produced a constant sequence");
 }
 
+void test_breaks_degenerate_token_runs() {
+    SamplerParams p;
+    p.temperature = 0.0f;
+    Sampler s(p);
+    std::vector<float> logits(10, 0.0f);
+    logits[3] = 10.0f;
+    logits[7] = 9.0f;
+
+    for (int i = 0; i < 8; i++) {
+        CHECK(s.sample(logits.data(), 10) == 3);
+    }
+    CHECK(s.sample(logits.data(), 10) == 7);
+}
+
 } // namespace
 
 int main() {
@@ -95,5 +109,6 @@ int main() {
     test_top_k_support();
     test_top_p_support();
     test_seed_reproducible();
+    test_breaks_degenerate_token_runs();
     return test_summary("test_sampler");
 }

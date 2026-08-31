@@ -1,0 +1,16 @@
+constexpr std::array<RuleTensorCoverage, 14> kTensorCoverage = {{
+    {0, "token_embd.weight", TensorRole::TokenEmbedding, {896, 151936}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 1, 1, {290}, 1},
+    {1, "blk.{d}.attn_norm.weight", TensorRole::AttentionNormWeight, {896, 0}, 1, ScalarType::F32, TensorTransformKind::Identity, 24, 12, {}, 0},
+    {2, "blk.{d}.ffn_down.weight", TensorRole::FfnDownWeight, {4864, 896}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 24, 12, {}, 0},
+    {3, "blk.{d}.ffn_gate.weight", TensorRole::FfnGateWeight, {896, 4864}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 24, 12, {}, 0},
+    {4, "blk.{d}.ffn_up.weight", TensorRole::FfnUpWeight, {896, 4864}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 24, 12, {}, 0},
+    {5, "blk.{d}.ffn_norm.weight", TensorRole::FfnNormWeight, {896, 0}, 1, ScalarType::F32, TensorTransformKind::Identity, 24, 12, {}, 0},
+    {6, "blk.{d}.attn_k.bias", TensorRole::KeyBias, {128, 0}, 1, ScalarType::F32, TensorTransformKind::Identity, 24, 12, {}, 0},
+    {7, "blk.{d}.attn_k.weight", TensorRole::KeyWeight, {896, 128}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 24, 12, {}, 0},
+    {8, "blk.{d}.attn_output.weight", TensorRole::AttentionOutputWeight, {896, 896}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 24, 12, {}, 0},
+    {9, "blk.{d}.attn_q.bias", TensorRole::QueryBias, {896, 0}, 1, ScalarType::F32, TensorTransformKind::Identity, 24, 12, {}, 0},
+    {10, "blk.{d}.attn_q.weight", TensorRole::QueryWeight, {896, 896}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 24, 12, {}, 0},
+    {11, "blk.{d}.attn_v.bias", TensorRole::ValueBias, {128, 0}, 1, ScalarType::F32, TensorTransformKind::Identity, 24, 12, {}, 0},
+    {12, "blk.{d}.attn_v.weight", TensorRole::ValueWeight, {896, 128}, 2, ScalarType::F16, TensorTransformKind::LogicalTranspose, 24, 12, {}, 0},
+    {289, "output_norm.weight", TensorRole::FinalNormWeight, {896, 0}, 1, ScalarType::F32, TensorTransformKind::Identity, 1, 1, {}, 0},
+}};

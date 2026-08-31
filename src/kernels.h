@@ -78,6 +78,19 @@ struct block_q5_K {            // 176 B, 256 elements
 };
 static_assert(sizeof(block_q5_K) == 176, "q5_K layout");
 
+struct block_iq2_xxs {         // 66 B, 256 elements
+    uint16_t d;
+    uint16_t qs[32];
+};
+static_assert(sizeof(block_iq2_xxs) == 66, "iq2_xxs layout");
+
+struct block_iq1_s {           // 50 B, 256 elements
+    uint16_t d;
+    uint8_t qs[32];
+    uint16_t qh[8];
+};
+static_assert(sizeof(block_iq1_s) == 50, "iq1_s layout");
+
 // Extract scale and min from the K-quant packed scales array.
 inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
     if (j < 4) {
@@ -113,15 +126,18 @@ using moe_gemv_multi_fn = bool (*)(const float* x, const uint8_t* w, GGMLType ty
 
 using moe_gate_up_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
                                 const int* expert_idx, int n_experts,
-                                float* hidden, int K, int hidden_dim);
+                                float* hidden, int K, int hidden_dim,
+                                const uint8_t* const* bases);
 
 using moe_down_fn = bool (*)(const float* x, const uint8_t* w, GGMLType type,
                              const int* expert_idx, const float* route_weight,
-                             int n_experts, float* output, int K, int N);
+                             int n_experts, float* output, int K, int N,
+                             const uint8_t* const* bases);
 
 // Returns the best GEMM entry point this build provides for the RUNNING
 // cpu, or nullptr when the CPU (or architecture) lacks the required
 // features.
+void set_gcd_gemm(bool on);
 gemm_fn get_simd_gemm();
 moe_gemv_fn get_simd_moe_gemv();
 moe_gemv_multi_fn get_simd_moe_gemv_multi();

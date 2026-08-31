@@ -23,6 +23,7 @@ public:
                        int M, int pos0, KVCache& kv, ModelBuffers* buf,
                        float* checkpoints) override;
     bool needs_shared_rope_table() const override { return false; }
+    bool supports_token_graph() const override { return true; }
 
 private:
     struct LayerTypeInfo {
@@ -30,12 +31,16 @@ private:
         int head_dim = 0;
         int n_kv_heads = 0;
         int n_q_heads = 0;
+        int intermediate = 0;
         int sliding_window = 0;
         int rope_dim = 0;
         float rope_base = 0.0f;
+        bool swiglu = false;
+        bool owns_kv = true;
     };
     TopologyPlan plan_;
     std::vector<LayerTypeInfo> layer_types_;
+    std::vector<int> kv_layer_idx_;
 
     // Proportional RoPE frequency factors for global layers.
     std::vector<float> rope_freqs_full_;  // [256]

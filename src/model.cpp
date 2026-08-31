@@ -9,9 +9,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <thread>
 
 #include "matmul.h"
 #include "ops.h"
+#include "token_graph_backend.h"
 #include "trace.h"
 #include "laplace_moe.h"
 #include "topology.h"
@@ -28,12 +30,16 @@ struct PhaseProf {
     bool on = std::getenv("LAPLACE_PROF") != nullptr;
     double fwd[9] = {};
     long   fwd_n[9] = {};
+    double lm_head = 0.0;
+    long   lm_n = 0;
     ~PhaseProf() {
         if (!on) return;
         for (int m = 1; m <= 8; m++) {
             if (fwd_n[m]) fprintf(stderr, "PROF forward_batch M=%d: %ld calls, %.1f ms avg\n",
                                   m, fwd_n[m], 1e3 * fwd[m] / fwd_n[m]);
         }
+        if (lm_n) fprintf(stderr, "PROF lm_head: %ld calls, %.1f ms avg\n",
+                          lm_n, 1e3 * lm_head / lm_n);
     }
 };
 PhaseProf g_pprof;
@@ -62,7 +68,7 @@ void Model::restore_ssm_state(const float* checkpoint) {
 
 bool Model::init(const GGUFContext& gguf) {
     const auto& m = gguf.metadata();
-    topology_ = {};
+    reset_load_attempt();
 
     LaplaceMoE::set_file_fd(gguf.fd());
     LaplaceMoE::set_mmap_base(gguf.file_data());
@@ -93,33 +99,76 @@ bool Model::init(const GGUFContext& gguf) {
         return false;
     }
 
-    // Token embedding + output head.
-    token_embd_  = gguf.find_tensor("token_embd.weight");
-    output_norm_ = gguf.find_tensor("output_norm.weight");
-    output_      = gguf.find_tensor("output.weight");
-    if (!token_embd_ || !output_norm_) {
-        fprintf(stderr, "model: missing token_embd or output_norm\n");
-        return false;
-    }
-    cfg_.vocab = static_cast<int>(token_embd_->dims[1]);
-    cfg_.hidden = static_cast<int>(token_embd_->dims[0]);
-    if (output_ && output_->dims[0] == (uint64_t)cfg_.vocab) {
-        cfg_.tied_lm_head = false;
-    } else {
-        output_ = token_embd_;  // tied
-        cfg_.tied_lm_head = true;
-    }
+    const auto load_shared_tensors = [&]() {
+        token_embd_  = gguf.find_tensor("token_embd.weight");
+        output_norm_ = gguf.find_tensor("output_norm.weight");
+        output_      = gguf.find_tensor("output.weight");
+        if (!token_embd_ || !output_norm_) {
+            fprintf(stderr, "model: missing token_embd or output_norm\n");
+            return false;
+        }
+        cfg_.vocab = static_cast<int>(token_embd_->dims[1]);
+        cfg_.hidden = static_cast<int>(token_embd_->dims[0]);
+        if (output_ && output_->dims[1] == (uint64_t)cfg_.vocab) {
+            cfg_.tied_lm_head = false;
+        } else {
+            output_ = token_embd_;
+            cfg_.tied_lm_head = true;
+        }
+        return true;
+    };
+    if (!load_shared_tensors()) return false;
 
     layers_.assign(cfg_.n_layers, {});
     is_attention_.assign(cfg_.n_layers, false);
     kv_layer_idx_.assign(cfg_.n_layers, -1);
     if (!arch_->load_weights(gguf, cfg_, &layers_, &is_attention_, &kv_layer_idx_)) {
         fprintf(stderr, "model: %s load_weights failed\n", arch_->name());
+        if (std::string(arch_->name()) == "adaptive") {
+            reset_load_attempt();
+            arch_ = create_arch(*arch_name);
+            if (arch_ && arch_->load_config(gguf, &cfg_) &&
+                load_shared_tensors()) {
+                layers_.assign(cfg_.n_layers, {});
+                is_attention_.assign(cfg_.n_layers, false);
+                kv_layer_idx_.assign(cfg_.n_layers, -1);
+                if (arch_->load_weights(gguf, cfg_, &layers_,
+                                        &is_attention_, &kv_layer_idx_)) {
+                    fprintf(stderr, "model: fell back to %s\n", arch_->name());
+                    auto t0 = std::chrono::steady_clock::now();
+                    plan_residency();
+                    fprintf(stderr, "[load] residency plan: %.1f ms\n",
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count());
+                    return true;
+                }
+            }
+        }
         return false;
     }
 
+    auto t0 = std::chrono::steady_clock::now();
     plan_residency();
+    fprintf(stderr, "[load] residency plan: %.1f ms\n",
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count());
     return true;
+}
+
+void Model::reset_load_attempt() {
+    cfg_ = {};
+    arch_.reset();
+    token_embd_ = nullptr;
+    output_norm_ = nullptr;
+    output_ = nullptr;
+    layers_.clear();
+    is_attention_.clear();
+    kv_layer_idx_.clear();
+    max_seq_ = 0;
+    max_batch_ = 1;
+    streaming_experts_ = false;
+    buffers_ = {};
+    topology_ = {};
 }
 
 std::vector<KVLayerConfig> Model::kv_layer_configs(
@@ -232,28 +281,21 @@ void Model::plan_residency() {
                         : 0;
     size_t total = dense_bytes + expert_bytes;
 
-    // For MoE models, prefer streaming when the expert portion is large
-    // (> 50% of total) even if everything would fit in budget. Pinning
-    // 16GB of experts leaves too little RAM for the OS page cache to
-    // manage KV cache and activations dynamically. Streaming lets the
-    // OS page cache keep the hot experts resident and evict cold ones.
+    // 26B experts fit the numeric budget but pinning all of them was
+    // measured slower than streaming (5.0 vs 9.6 tok/s decode, same
+    // command, this M5 Pro). Keep streaming when experts dominate.
     bool prefer_stream = has_moe && expert_bytes > total / 2
                          && expert_bytes > budget / 2;
 
     if (!has_moe || (total <= budget && !prefer_stream)) {
-        // Model fits: fault everything in with a sequential touch so
-        // the OS treats the pages as hot and keeps them resident.
+        // Model fits: fault everything in so the OS treats the pages as
+        // hot and keeps them resident. Touch ranges in parallel: a
+        // single-threaded walk serializes ~1M soft faults and dominates
+        // load time on multi-GB models.
         streaming_experts_ = false;
         auto fault_in = [](const Tensor* t) {
             if (!t || !t->data) return;
             (void)madvise(const_cast<uint8_t*>(t->data), t->nbytes(), MADV_WILLNEED);
-            const volatile uint8_t* p = t->data;
-            size_t sz = t->nbytes();
-            long ps = sysconf(_SC_PAGESIZE);
-            size_t page = ps > 0 ? static_cast<size_t>(ps) : 4096;
-            for (size_t off = 0; off + page <= sz; off += page)
-                (void)p[off];
-            if (sz) (void)p[sz - 1];
         };
         fault_in(token_embd_);
         fault_in(output_norm_);
@@ -275,7 +317,81 @@ void Model::plan_residency() {
             fault_in(W.moe_gate_up_exps);
             fault_in(W.moe_down_exps);
         }
-        fprintf(stderr, "residency: model %.2f GB fits in %.2f GB budget, pinning all weights\n",
+        {
+            // One contiguous work list, split into equal byte spans, one
+            // thread per span. Sequential order inside each span keeps
+            // NVMe readahead effective.
+            std::vector<std::pair<const uint8_t*, size_t>> ranges;
+            const auto push = [&](const Tensor* t) {
+                if (t && t->data && t->nbytes())
+                    ranges.emplace_back((const uint8_t*)t->data, t->nbytes());
+            };
+            push(token_embd_); push(output_norm_);
+            if (!cfg_.tied_lm_head) push(output_);
+            for (const auto& W : layers_) {
+                push(W.attn_norm); push(W.post_attn_norm);
+                push(W.ffn_norm); push(W.ffn_gate); push(W.ffn_up); push(W.ffn_down);
+                push(W.attn_q); push(W.attn_k); push(W.attn_v);
+                push(W.attn_q_bias); push(W.attn_k_bias); push(W.attn_v_bias);
+                push(W.attn_q_norm); push(W.attn_k_norm); push(W.attn_output);
+                push(W.attn_qkv); push(W.attn_gate);
+                push(W.ssm_a); push(W.ssm_conv1d); push(W.ssm_dt_bias);
+                push(W.ssm_alpha); push(W.ssm_beta); push(W.ssm_norm); push(W.ssm_out);
+                push(W.moe_gate_inp); push(W.moe_gate_inp_scale);
+                push(W.moe_down_exps_scale);
+                push(W.pre_ffw_norm_2); push(W.post_ffw_norm_1);
+                push(W.post_ffw_norm_2); push(W.post_ffw_norm);
+                push(W.layer_output_scale);
+                push(W.moe_gate_up_exps);
+                push(W.moe_down_exps);
+            }
+            size_t total_bytes = 0;
+            for (auto& r : ranges) total_bytes += r.second;
+            long ps = sysconf(_SC_PAGESIZE);
+            size_t page = ps > 0 ? static_cast<size_t>(ps) : 4096;
+            unsigned hw_threads = std::thread::hardware_concurrency();
+            int nthreads = (int)(hw_threads ? hw_threads : 8);
+            if (nthreads > 12) nthreads = 12;
+            if ((size_t)nthreads > ranges.size()) nthreads = (int)ranges.size();
+            if (nthreads < 1) nthreads = 1;
+            size_t per = total_bytes / (size_t)nthreads + 1;
+            std::vector<std::thread> workers;
+            // Per span: readahead hint, fault the pages in by touching,
+            // then wire immediately. Touching beats waiting on
+            // MADV_WILLNEED alone, which livelocks when free memory is
+            // smaller than the model: the kernel recycles early ranges
+            // while we wait for late ones.
+            auto lock_span = [&](size_t begin_byte, size_t end_byte) {
+                size_t seen = 0;
+                for (auto& r : ranges) {
+                    size_t rs = r.second;
+                    if (seen + rs <= begin_byte) { seen += rs; continue; }
+                    size_t lo = begin_byte > seen ? begin_byte - seen : 0;
+                    size_t hi = end_byte - seen < rs ? end_byte - seen : rs;
+                    if (hi > lo) {
+                        size_t alo = lo & ~(page - 1);
+                        (void)madvise(
+                            const_cast<uint8_t*>(r.first + alo), hi - alo,
+                            MADV_WILLNEED);
+                        const volatile uint8_t* p = r.first;
+                        for (size_t off = lo; off < hi; off += page)
+                            (void)p[off];
+                        (void)mlock(const_cast<uint8_t*>(r.first + alo),
+                                    hi - alo);
+                    }
+                    seen += rs;
+                    if (seen >= end_byte) break;
+                }
+            };
+            for (int i = 0; i < nthreads; i++) {
+                size_t b = (size_t)i * per;
+                size_t e = b + per;
+                if (e > total_bytes) e = total_bytes;
+                workers.emplace_back(lock_span, b, e);
+            }
+            for (auto& w : workers) w.join();
+        }
+        fprintf(stderr, "residency: model %.2f GB fits in %.2f GB budget, pinned all weights\n",
                 total / 1e9, budget / 1e9);
         LaplaceMoE::set_cache_budget(0);
         return;
@@ -308,6 +424,7 @@ void Model::plan_residency() {
         for (size_t off = 0; off + page <= sz; off += page)
             (void)p[off];
         if (sz) (void)p[sz - 1];
+        (void)mlock(const_cast<uint8_t*>(t->data), sz);
     };
     pin(token_embd_);
     pin(output_norm_);
@@ -326,20 +443,29 @@ void Model::plan_residency() {
         pin(W.pre_ffw_norm_2); pin(W.post_ffw_norm_1);
         pin(W.post_ffw_norm_2); pin(W.post_ffw_norm);
         pin(W.layer_output_scale);
-        // Expert tensors: leave at default madvise. The OS page cache
-        // manages residency. LaplaceMoE pages in the active experts per
-        // layer via MADV_WILLNEED. We do NOT use MADV_RANDOM here because
-        // the sequential per-expert access pattern benefits from OS
-        // readahead.
     }
-    fprintf(stderr, "residency: model %.2f GB exceeds %.2f GB budget, "
-                    "pinning %.2f GB dense, streaming %.2f GB experts\n",
-            total / 1e9, budget / 1e9, dense_bytes / 1e9, expert_bytes / 1e9);
+    // Expert GEMV reads the file map. First touch faults during compute.
+    // 4 GB is the seen-set budget for hit accounting, not a heap copy.
+    int top_k = cfg_.n_experts_used > 0 ? cfg_.n_experts_used : 1;
+    size_t active_bytes = 0;
+    for (const auto& W : layers_) {
+        if (W.moe_gate_up_exps)
+            active_bytes += LaplaceMoE::per_expert_bytes(W.moe_gate_up_exps) *
+                            static_cast<size_t>(top_k);
+        if (W.moe_down_exps)
+            active_bytes += LaplaceMoE::per_expert_bytes(W.moe_down_exps) *
+                            static_cast<size_t>(top_k);
+    }
     size_t free_after_dense = (budget > dense_bytes) ? budget - dense_bytes : 0;
-    size_t cache_budget = std::min(free_after_dense / 4, expert_bytes / 4);
-    LaplaceMoE::set_cache_budget(cache_budget);
-    fprintf(stderr, "residency: expert cache budget %.2f GB\n",
-            cache_budget / 1e9);
+    size_t cache_budget = 4ULL << 30;
+    if (cache_budget > free_after_dense) cache_budget = free_after_dense;
+    if (cache_budget < active_bytes) cache_budget = active_bytes;
+    fprintf(stderr, "residency: model %.2f GB exceeds %.2f GB budget, "
+                    "pinning %.2f GB dense, staging %.2f GB experts "
+                    "(working set %.2f GB, top-%d token = %.2f GB)\n",
+            total / 1e9, budget / 1e9, dense_bytes / 1e9, expert_bytes / 1e9,
+            cache_budget / 1e9, top_k, active_bytes / 1e9);
+    LaplaceMoE::set_cache_budget(cache_budget > 0 ? cache_budget : 1);
 #endif
 }
 
@@ -380,11 +506,11 @@ bool Model::reserve(int max_seq_len, int max_batch) {
     return true;
 }
 
-void Model::forward(int token, int pos, KVCache& kv, float* logits) {
-    forward_batch(&token, 1, pos, kv, logits, nullptr);
+bool Model::forward(int token, int pos, KVCache& kv, float* logits) {
+    return forward_batch(&token, 1, pos, kv, logits, nullptr);
 }
 
-void Model::forward_batch(const int* tokens, int M, int pos0, KVCache& kv,
+bool Model::forward_batch(const int* tokens, int M, int pos0, KVCache& kv,
                           float* logits, float* checkpoints) {
     PhaseTimer pt_fwd(&g_pprof.fwd[M <= 8 ? M : 8]);
     if (g_pprof.on && M <= 8) g_pprof.fwd_n[M]++;
@@ -406,13 +532,36 @@ void Model::forward_batch(const int* tokens, int M, int pos0, KVCache& kv,
     }
     if (M == 1) trace("input_embed", -1, buffers_.x.data(), H);
 
+    TokenGraphBackend& token_graph = token_graph_backend_
+        ? *token_graph_backend_ : metal_token_graph_backend();
+    ScopedTokenGraphBackend token_graph_scope(token_graph);
+    bool tok = false;
+    if (M == 1 && metal_token_ && arch_->supports_token_graph() &&
+        token_graph.available()) {
+        const int inter = cfg_.intermediate;
+        const int Hq = cfg_.n_q_heads;
+        const int Hk = cfg_.n_kv_heads;
+        const int Dh = cfg_.head_dim;
+        tok = token_graph.begin(H, inter, cfg_.expert_inter, cfg_.n_experts_used,
+                                cfg_.n_experts, Hq, Hk, Dh, max_seq_,
+                                cfg_.n_layers, pos0);
+        if (tok) token_graph.upload_x(buffers_.x.data(), H);
+    }
+
     // Each block is handled by the architecture implementation.
     LaplaceMoE::set_current_token(pos0);
     for (int i = 0; i < cfg_.n_layers; i++) {
         arch_->forward_layer(i, layers_[i], cfg_, M, pos0, kv, &buffers_, checkpoints);
-        if (M == 1) trace("post_ffn", i, buffers_.x.data(), H);
+        if (tok && !token_graph.active()) return false;
+        if (M == 1 && !(tok && token_graph.active()))
+            trace("post_ffn", i, buffers_.x.data(), H);
     }
-    LaplaceMoE::evict_cold(16);
+    // GPU LM is Task 5: only after a real-tensor microbench and Hello.
+    // Token graph copies residual back; CPU does final RMSNorm + LM head.
+    if (tok && token_graph.active() && !token_graph.end(buffers_.x.data(), H)) {
+        token_graph.abort();
+        return false;
+    }
 
     // Final norm + LM head for every position (the batched LM-head matmul is
     // the single biggest weight stream, amortized across all M tokens).
@@ -423,7 +572,11 @@ void Model::forward_batch(const int* tokens, int M, int pos0, KVCache& kv,
                      H, cfg_.rms_eps);
     }
     if (M == 1) trace("result_norm", -1, buffers_.x_norm.data(), H);
-    matmul_lm_head(buffers_.x_norm.data(), *output_, logits, M, H, cfg_.vocab);
+    {
+        PhaseTimer pt_lm(&g_pprof.lm_head);
+        if (g_pprof.on) g_pprof.lm_n++;
+        matmul_lm_head(buffers_.x_norm.data(), *output_, logits, M, H, cfg_.vocab);
+    }
 
     // Gemma4 final logit softcapping: logits = tanh(logits / cap) * cap
     if (cfg_.logit_softcap > 0.0f) {
@@ -432,6 +585,7 @@ void Model::forward_batch(const int* tokens, int M, int pos0, KVCache& kv,
         for (size_t j = 0; j < static_cast<size_t>(M) * cfg_.vocab; j++)
             logits[j] = std::tanh(logits[j] * inv_cap) * cap;
     }
+    return true;
 }
 
 } // namespace Laplace

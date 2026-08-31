@@ -67,6 +67,22 @@ bool Qwen3NextArch::load_config(const GGUFContext& gguf, ModelConfig* cfg) {
     cfg->ssm_inner_size    = static_cast<int>(meta_int(m, (A + "ssm.inner_size").c_str(), 2048));
     cfg->ssm_conv_kernel   = static_cast<int>(meta_int(m, (A + "ssm.conv_kernel").c_str(), 4));
     cfg->ssm_time_step_rank = static_cast<int>(meta_int(m, (A + "ssm.time_step_rank").c_str(), 16));
+    // Derived DeltaNet geometry. group_count is the k-head count,
+    // time_step_rank the v-head count, inner_size the value width.
+    cfg->ssm_key_dim       = cfg->ssm_group_count * cfg->ssm_state_size;
+    cfg->ssm_num_v_heads   = cfg->ssm_time_step_rank;
+    // Qwen3.5 uses interleaved MRoPE pairs (2p, 2p+1) with sections;
+    // plain qwen3next uses half-split pairs. Text-only positions make the
+    // sections collapse to standard per-pair frequencies.
+    if (*arch == "qwen35") cfg->rope_interleaved = true;
+
+    // NextN/MTP blocks sit at the END of the block list and are draft-head
+    // material, not part of the decoder stack (matches upstream: n_layer
+    // counts main plus MTP layers).
+    const int nextn = static_cast<int>(meta_int(m, (A + "nextn_predict_layers").c_str(), 0));
+    if (nextn > 0 && nextn < cfg->n_layers) {
+        cfg->n_layers -= nextn;
+    }
     return true;
 }
 
@@ -136,6 +152,54 @@ bool Qwen3NextArch::load_weights(const GGUFContext& gguf, const ModelConfig& cfg
             }
         } else if (L.ssm_a && L.ssm_conv1d && L.ssm_alpha && L.ssm_beta && L.ssm_out) {
             (*is_attention)[i] = false;
+            // Validate the DeltaNet geometry against actual tensor shapes.
+            // The in_proj holds [Q(key_dim) | K(key_dim) | V(inner)] and
+            // either a separate attn_gate (z) or a fused z tail.
+            if (!L.attn_qkv) {
+                fprintf(stderr, "qwen3next: ssm layer %d missing attn_qkv\n", i);
+                return false;
+            }
+            const uint64_t kd = static_cast<uint64_t>(cfg.ssm_key_dim);
+            const uint64_t vd = static_cast<uint64_t>(cfg.ssm_inner_size);
+            const uint64_t width = L.attn_qkv->dims[1];
+            const bool no_z = width == 2 * kd + vd;
+            const bool z_fused = width == 2 * (kd + vd);
+            if (!no_z && !z_fused) {
+                fprintf(stderr, "qwen3next: layer %d in_proj width %llu matches "
+                        "neither 2*key+val (%llu) nor 2*(key+val) (%llu)\n",
+                        i, (unsigned long long)width,
+                        (unsigned long long)(2 * kd + vd),
+                        (unsigned long long)(2 * (kd + vd)));
+                return false;
+            }
+            if (ssm_gate_fused_ < 0) {
+                ssm_gate_fused_ = z_fused ? 1 : 0;
+            } else if (ssm_gate_fused_ != (z_fused ? 1 : 0)) {
+                fprintf(stderr, "qwen3next: layer %d gate layout differs from "
+                        "earlier ssm layers\n", i);
+                return false;
+            }
+            const uint64_t value_heads =
+                static_cast<uint64_t>(cfg.ssm_num_v_heads);
+            if (L.ssm_conv1d->dims[1] != width ||
+                L.ssm_out->dims[0] != vd ||
+                L.attn_gate->dims[1] != vd ||
+                L.ssm_alpha->dims[1] != value_heads ||
+                L.ssm_beta->dims[1] != value_heads ||
+                (L.ssm_a->n_dims > 0 &&
+                 L.ssm_a->dims[0] != value_heads)) {
+                fprintf(stderr, "qwen3next: layer %d ssm shapes inconsistent "
+                        "(conv=%llu out_in=%llu gate=%llu a=%llu, expected "
+                        "conv=%llu out_in=%llu gate=%llu v_heads=%d)\n",
+                        i,
+                        (unsigned long long)L.ssm_conv1d->dims[1],
+                        (unsigned long long)L.ssm_out->dims[0],
+                        (unsigned long long)L.attn_gate->dims[1],
+                        (unsigned long long)L.ssm_alpha->dims[1],
+                        (unsigned long long)width, (unsigned long long)vd,
+                        (unsigned long long)vd, cfg.ssm_num_v_heads);
+                return false;
+            }
         } else {
             fprintf(stderr, "qwen3next: layer %d has neither full-attn nor SSM weights\n", i);
             return false;
@@ -159,16 +223,22 @@ void Qwen3NextArch::reserve(const ModelConfig& cfg, int max_seq, int max_batch,
     buf->ffn_up.assign(M * cfg.intermediate, 0.0f);
     buf->ffn_hidden.assign(M * cfg.intermediate, 0.0f);
 
-    // DeltaNet
-    buf->dnet_qkv.assign(M * 3 * cfg.ssm_inner_size, 0.0f);
-    buf->dnet_gate.assign(M * cfg.ssm_inner_size, 0.0f);
-    buf->dnet_b_proj.assign(M * cfg.ssm_group_count, 0.0f);
-    buf->dnet_a_proj.assign(M * cfg.ssm_group_count, 0.0f);
-    buf->dnet_o.assign(static_cast<size_t>(cfg.ssm_group_count) * cfg.ssm_state_size, 0.0f);
-    buf->dnet_normed.assign(M * cfg.ssm_inner_size, 0.0f);
+    // DeltaNet: qkv width is the in_proj width (q + k sections of key_dim
+    // plus a v section of inner_size, plus a z tail when fused); state,
+    // decay, and beta are per v-head.
+    const int kd = cfg.ssm_key_dim;
+    const int vd = cfg.ssm_inner_size;
+    const int vh = cfg.ssm_num_v_heads;
+    const int qkv_width = cfg.ssm_gate_fused ? 2 * (kd + vd) : 2 * kd + vd;
+    buf->dnet_qkv.assign(M * qkv_width, 0.0f);
+    buf->dnet_gate.assign(M * vd, 0.0f);
+    buf->dnet_b_proj.assign(M * vh, 0.0f);
+    buf->dnet_a_proj.assign(M * vh, 0.0f);
+    buf->dnet_o.assign(vh * cfg.ssm_state_size, 0.0f);
+    buf->dnet_normed.assign(M * vd, 0.0f);
 
-    buf->ssm_conv_state.assign(static_cast<size_t>(cfg.n_layers) * 3 * cfg.ssm_inner_size * (cfg.ssm_conv_kernel - 1), 0.0f);
-    buf->ssm_recurrent.assign(static_cast<size_t>(cfg.n_layers) * cfg.ssm_group_count * cfg.ssm_state_size * cfg.ssm_state_size, 0.0f);
+    buf->ssm_conv_state.assign(static_cast<size_t>(cfg.n_layers) * qkv_width * (cfg.ssm_conv_kernel - 1), 0.0f);
+    buf->ssm_recurrent.assign(static_cast<size_t>(cfg.n_layers) * vh * cfg.ssm_state_size * cfg.ssm_state_size, 0.0f);
 }
 
 void Qwen3NextArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
@@ -215,17 +285,28 @@ void Qwen3NextArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
         float* vp = vp_all + static_cast<size_t>(m) * kn;
 
         // Per-head QK-RMSNorm + partial RoPE (Q rows are strided when gated).
+        const bool rope_il = cfg.rope_interleaved;
         for (int h = 0; h < Hq; h++) {
             float* q = qp + h * q_stride;
             ops::rmsnorm_rows(q, qnw, q, 1, Dh, cfg.rms_eps);
-            ops::rope_apply(q, 1, Dh, buf->rope_pairs,
-                            buf->rope_cos.data() + static_cast<size_t>(pos) * buf->rope_pairs,
-                            buf->rope_sin.data() + static_cast<size_t>(pos) * buf->rope_pairs);
+            if (rope_il)
+                ops::rope_apply_interleaved(q, 1, Dh, buf->rope_pairs,
+                    buf->rope_cos.data() + static_cast<size_t>(pos) * buf->rope_pairs,
+                    buf->rope_sin.data() + static_cast<size_t>(pos) * buf->rope_pairs);
+            else
+                ops::rope_apply(q, 1, Dh, buf->rope_pairs,
+                    buf->rope_cos.data() + static_cast<size_t>(pos) * buf->rope_pairs,
+                    buf->rope_sin.data() + static_cast<size_t>(pos) * buf->rope_pairs);
         }
         ops::rmsnorm_rows(kp, knw, kp, Hk, Dh, cfg.rms_eps);
-        ops::rope_apply(kp, Hk, Dh, buf->rope_pairs,
-                        buf->rope_cos.data() + static_cast<size_t>(pos) * buf->rope_pairs,
-                        buf->rope_sin.data() + static_cast<size_t>(pos) * buf->rope_pairs);
+        if (rope_il)
+            ops::rope_apply_interleaved(kp, Hk, Dh, buf->rope_pairs,
+                buf->rope_cos.data() + static_cast<size_t>(pos) * buf->rope_pairs,
+                buf->rope_sin.data() + static_cast<size_t>(pos) * buf->rope_pairs);
+        else
+            ops::rope_apply(kp, Hk, Dh, buf->rope_pairs,
+                buf->rope_cos.data() + static_cast<size_t>(pos) * buf->rope_pairs,
+                buf->rope_sin.data() + static_cast<size_t>(pos) * buf->rope_pairs);
         if (M == 1) {
             trace("attn_q_roped", layer, qp, qn);
             trace("attn_k_roped", layer, kp, kn);
@@ -239,7 +320,9 @@ void Qwen3NextArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             kv.store_v(kvl, h, pos, vp + h * Dh);
         }
 
-        const bool laplace_fast = kv.mode() == KVCacheMode::LAPLACE;
+        const KVStorageKind storage = kv.storage_kind(kvl);
+        const bool laplace_fast = storage == KVStorageKind::Adaptive ||
+                                  storage == KVStorageKind::FixedQ4;
         const bool laplace_rotated = laplace_fast && kv.laplace_rotated();
         if (laplace_rotated) {
             for (int h = 0; h < Hq; h++) walsh_hadamard(qp + h * q_stride, Dh);
@@ -280,7 +363,7 @@ void Qwen3NextArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             continue;
         }
 
-        const bool fp32_fast = (kv.mode() == KVCacheMode::FP32);
+        const bool fp32_fast = storage == KVStorageKind::FP32;
 
         for (int kvh = 0; kvh < Hk; kvh++) {
             const int h0 = kvh * gqa;
@@ -342,10 +425,11 @@ void Qwen3NextArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
 void Qwen3NextArch::deltanet_batch(int layer, int M, const LayerWeights& W,
                                    const ModelConfig& cfg, ModelBuffers* buf,
                                    float* checkpoints) {
-    const int G = cfg.ssm_group_count;
+    const int vh = cfg.ssm_num_v_heads;
     const int D = cfg.ssm_state_size;
-    const int inner = cfg.ssm_inner_size;
-    const int conv_dim = 3 * inner;
+    const int vd = cfg.ssm_inner_size;
+    const int kd = cfg.ssm_key_dim;
+    const int qkv_width = cfg.ssm_gate_fused ? 2 * (kd + vd) : 2 * kd + vd;
     const int hist = cfg.ssm_conv_kernel - 1;
     const int H = cfg.hidden;
 
@@ -357,26 +441,49 @@ void Qwen3NextArch::deltanet_batch(int layer, int M, const LayerWeights& W,
     }
 
     // All four input projections, batched across tokens.
-    matmul_rows(buf->x_norm.data(), *W.attn_qkv,  buf->dnet_qkv.data(),    M, H, conv_dim);
-    matmul_rows(buf->x_norm.data(), *W.attn_gate, buf->dnet_gate.data(),   M, H, inner);
-    matmul_rows(buf->x_norm.data(), *W.ssm_beta,  buf->dnet_b_proj.data(), M, H, G);
-    matmul_rows(buf->x_norm.data(), *W.ssm_alpha, buf->dnet_a_proj.data(), M, H, G);
+    matmul_rows(buf->x_norm.data(), *W.attn_qkv,  buf->dnet_qkv.data(),    M, H, qkv_width);
+    if (!cfg.ssm_gate_fused)
+        matmul_rows(buf->x_norm.data(), *W.attn_gate, buf->dnet_gate.data(), M, H, vd);
+    matmul_rows(buf->x_norm.data(), *W.ssm_beta,  buf->dnet_b_proj.data(), M, H, vh);
+    matmul_rows(buf->x_norm.data(), *W.ssm_alpha, buf->dnet_a_proj.data(), M, H, vh);
+
+    // Differential-test dumps: inputs and weights of the recurrent core,
+    // first token of the first SSM layer only.
+    if (std::getenv("LAPLACE_TRACE_DUMP") && layer == 1 && !dnet_dumped_) {
+        dnet_dumped_ = true;
+        auto dump = [](const char* name, const void* p, size_t bytes) {
+            Laplace::trace_dump_file(name, p, bytes);
+        };
+        dump("x_norm.f32", buf->x_norm.data(), H * 4);
+        dump("qkv_proj.f32", buf->dnet_qkv.data(), qkv_width * 4);
+        dump("gate_proj.f32", buf->dnet_gate.data(), vd * 4);
+        dump("b_proj.f32", buf->dnet_b_proj.data(), vh * 4);
+        dump("a_proj.f32", buf->dnet_a_proj.data(), vh * 4);
+        dump("w_conv.f32", W.ssm_conv1d->data,
+             (size_t)qkv_width * cfg.ssm_conv_kernel * 4);
+        dump("w_A.f32", W.ssm_a->data, vh * 4);
+        dump("w_dt.f32", W.ssm_dt_bias->data, vh * 4);
+        dump("w_norm.f32", W.ssm_norm->data, D * 4);
+    }
 
     DeltaNetParams p;
-    p.G = G;
+    p.G = cfg.ssm_group_count;
     p.D = D;
-    p.inner = inner;
+    p.inner = vd;
+    p.num_v_heads = vh;
+    p.key_dim = kd;
     p.conv_kernel = cfg.ssm_conv_kernel;
-    p.conv_dim = conv_dim;
+    p.conv_dim = qkv_width;
+    p.gate_fused = cfg.ssm_gate_fused;
     p.A        = reinterpret_cast<const float*>(W.ssm_a->data);
     p.dt_bias  = reinterpret_cast<const float*>(W.ssm_dt_bias->data);
     p.ssm_norm = reinterpret_cast<const float*>(W.ssm_norm->data);
     p.conv_w   = reinterpret_cast<const float*>(W.ssm_conv1d->data);
 
-    const size_t conv_off = static_cast<size_t>(layer) * conv_dim * hist;
-    const size_t rec_off  = static_cast<size_t>(layer) * G * D * D;
-    const size_t conv_n   = static_cast<size_t>(conv_dim) * hist;
-    const size_t rec_n    = static_cast<size_t>(G) * D * D;
+    const size_t conv_off = static_cast<size_t>(layer) * qkv_width * hist;
+    const size_t rec_off  = static_cast<size_t>(layer) * vh * D * D;
+    const size_t conv_n   = static_cast<size_t>(qkv_width) * hist;
+    const size_t rec_n    = static_cast<size_t>(vh) * D * D;
 
     // Recurrent core runs per token (state is sequential); after each token,
     // optionally checkpoint this layer's state slice for speculative rollback.
@@ -393,23 +500,23 @@ void Qwen3NextArch::deltanet_batch(int layer, int M, const LayerWeights& W,
                     p,
                     buf->ssm_conv_state.data() + conv_off,
                     buf->ssm_recurrent.data()  + rec_off,
-                    buf->dnet_qkv.data()    + static_cast<size_t>(m) * conv_dim,
-                    buf->dnet_gate.data()   + static_cast<size_t>(m) * inner,
-                    buf->dnet_b_proj.data() + static_cast<size_t>(m) * G,
-                    buf->dnet_a_proj.data() + static_cast<size_t>(m) * G,
+                    buf->dnet_qkv.data()    + static_cast<size_t>(m) * qkv_width,
+                    buf->dnet_gate.data()   + static_cast<size_t>(m) * vd,
+                    buf->dnet_b_proj.data() + static_cast<size_t>(m) * vh,
+                    buf->dnet_a_proj.data() + static_cast<size_t>(m) * vh,
                     buf->dnet_o.data(),
-                    buf->dnet_normed.data() + static_cast<size_t>(m) * inner);
+                    buf->dnet_normed.data() + static_cast<size_t>(m) * vd);
             } else {
                 deltanet_token(
                     p,
                     buf->ssm_conv_state.data() + conv_off,
                     buf->ssm_recurrent.data()  + rec_off,
-                    buf->dnet_qkv.data()    + static_cast<size_t>(m) * conv_dim,
-                    buf->dnet_gate.data()   + static_cast<size_t>(m) * inner,
-                    buf->dnet_b_proj.data() + static_cast<size_t>(m) * G,
-                    buf->dnet_a_proj.data() + static_cast<size_t>(m) * G,
+                    buf->dnet_qkv.data()    + static_cast<size_t>(m) * qkv_width,
+                    buf->dnet_gate.data()   + static_cast<size_t>(m) * vd,
+                    buf->dnet_b_proj.data() + static_cast<size_t>(m) * vh,
+                    buf->dnet_a_proj.data() + static_cast<size_t>(m) * vh,
                     buf->dnet_o.data(),
-                    buf->dnet_normed.data() + static_cast<size_t>(m) * inner);
+                    buf->dnet_normed.data() + static_cast<size_t>(m) * vd);
             }
         }
         if (checkpoints) {
@@ -423,7 +530,7 @@ void Qwen3NextArch::deltanet_batch(int layer, int M, const LayerWeights& W,
     }
 
     // Output projection [M, inner] -> [M, hidden], batched.
-    matmul_rows(buf->dnet_normed.data(), *W.ssm_out, buf->xb.data(), M, inner, H);
+    matmul_rows(buf->dnet_normed.data(), *W.ssm_out, buf->xb.data(), M, vd, H);
 }
 
 void Qwen3NextArch::forward_layer(int layer, const LayerWeights& W, const ModelConfig& cfg,
@@ -432,10 +539,16 @@ void Qwen3NextArch::forward_layer(int layer, const LayerWeights& W, const ModelC
     const int H = cfg.hidden;
 
     // Mixer sub-block (full attention or DeltaNet).
+    static const bool skip_ssm =
+        std::getenv("LAPLACE_SKIP_SSM") != nullptr;
+    static const bool skip_attn =
+        std::getenv("LAPLACE_SKIP_ATTN") != nullptr;
     if (W.attn_q) {
-        attention_batch(layer, M, pos0, kv, W, cfg, buf);
+        if (!skip_attn) attention_batch(layer, M, pos0, kv, W, cfg, buf);
+        else buf->xb.assign(buf->xb.size(), 0.0f);
     } else {
-        deltanet_batch(layer, M, W, cfg, buf, checkpoints);
+        if (!skip_ssm) deltanet_batch(layer, M, W, cfg, buf, checkpoints);
+        else buf->xb.assign(buf->xb.size(), 0.0f);
     }
     if (M == 1) trace("mixer_out", layer, buf->xb.data(), H);
     for (size_t j = 0; j < static_cast<size_t>(M) * H; j++) buf->x[j] += buf->xb[j];

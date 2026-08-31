@@ -1,0 +1,916 @@
+#include <algorithm>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#include "program_ir.h"
+#include "test_util.h"
+
+using namespace Laplace;
+
+namespace {
+
+template <class T>
+concept HasOpaqueTarget = requires(T value) { value.opaque_target; };
+
+static_assert(!std::is_constructible_v<PrimitiveAttributes, std::string>);
+static_assert(!std::is_constructible_v<PrimitiveAttributes, std::string_view>);
+static_assert(!std::is_constructible_v<PrimitiveAttributes, const char*>);
+static_assert(!std::is_constructible_v<PrimitiveAttributes, std::vector<uint8_t>>);
+static_assert(!std::is_constructible_v<PrimitiveAttributes, void (*)()>);
+static_assert(!HasOpaqueTarget<Instruction>);
+
+DimensionExpr constant_dimension(uint64_t value) {
+    return {DimensionExpression::Constant, value, {}};
+}
+
+DimensionExpr parameter_dimension(uint32_t id) {
+    return {DimensionExpression::Parameter, id, {}};
+}
+
+ValueType scalar(ElementType type = ElementType::F32) {
+    return {type, {}};
+}
+
+ValueType tensor(std::initializer_list<uint64_t> dimensions,
+                 ElementType type = ElementType::F32) {
+    ValueType result;
+    result.element_type = type;
+    for (uint64_t dimension : dimensions) {
+        result.dimensions.push_back(constant_dimension(dimension));
+    }
+    return result;
+}
+
+TypedValue value(uint32_t id, ValueType type = scalar()) {
+    return {id, std::move(type)};
+}
+
+Instruction instruction(uint32_t id, Primitive primitive,
+                        std::vector<uint32_t> inputs,
+                        std::vector<TypedValue> outputs,
+                        PrimitiveAttributes attributes = NoAttributes{}) {
+    Instruction result;
+    result.id = id;
+    result.primitive = {primitive, 1, 0};
+    result.inputs = std::move(inputs);
+    result.outputs = std::move(outputs);
+    result.attributes = std::move(attributes);
+    return result;
+}
+
+Program one_function_program(uint32_t function_id, uint32_t region_id,
+                             std::vector<TypedValue> arguments,
+                             std::vector<Instruction> instructions,
+                             std::vector<uint32_t> yields,
+                             std::vector<ValueType> result_types) {
+    Region region;
+    region.id = region_id;
+    region.arguments = std::move(arguments);
+    region.instructions = std::move(instructions);
+    region.yields = std::move(yields);
+
+    Function function;
+    function.id = function_id;
+    function.entry_region_id = region_id;
+    function.regions.push_back(std::move(region));
+    function.result_types = std::move(result_types);
+
+    Program program;
+    program.functions.push_back(std::move(function));
+    for (uint32_t index = 0; index < program.functions.front().result_types.size(); ++index) {
+        program.exports.push_back(
+            {function_id, index, program.functions.front().result_types[index]});
+    }
+    return program;
+}
+
+const CompatibilityReport* rejection(const ProgramVerificationResult& result) {
+    return std::get_if<CompatibilityReport>(&result);
+}
+
+bool rejected_with(const Program& program, CompatibilityError code) {
+    const auto result = verify_and_canonicalize_program(program);
+    const CompatibilityReport* report = rejection(result);
+    return report != nullptr && report->code == code;
+}
+
+Program minimal_scalar_program() {
+    std::vector<Instruction> instructions;
+    instructions.push_back(instruction(
+        10, Primitive::Constant, {}, {value(100)}, ConstantAttributes{2}));
+    instructions.push_back(instruction(
+        20, Primitive::Constant, {}, {value(200)}, ConstantAttributes{3}));
+    instructions.push_back(instruction(
+        30, Primitive::Add, {100, 200}, {value(300)}));
+    return one_function_program(7, 9, {}, std::move(instructions), {300}, {scalar()});
+}
+
+void test_minimal_programs() {
+    const auto scalar_result = verify_and_canonicalize_program(minimal_scalar_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(scalar_result));
+
+    const ValueType matrix = tensor({3, 5});
+    Program tensor_program = one_function_program(
+        17, 23, {value(40, matrix), value(80, matrix)},
+        {instruction(99, Primitive::Add, {40, 80}, {value(120, matrix)})},
+        {120}, {matrix});
+    const auto tensor_result = verify_and_canonicalize_program(std::move(tensor_program));
+    CHECK(std::holds_alternative<VerifiedProgram>(tensor_result));
+}
+
+void test_unseen_repeated_graph_with_multiple_outputs() {
+    const ValueType matrix = tensor({2, 7});
+    std::vector<Instruction> instructions;
+    instructions.push_back(instruction(
+        1, Primitive::Add, {10, 20}, {value(30, matrix)}));
+    instructions.push_back(instruction(
+        2, Primitive::Multiply, {30, 20}, {value(40, matrix)}));
+    instructions.push_back(instruction(
+        3, Primitive::Add, {40, 30}, {value(50, matrix)}));
+    instructions.push_back(instruction(
+        4, Primitive::Multiply, {50, 40}, {value(60, matrix)}));
+    Program program = one_function_program(
+        3, 5, {value(10, matrix), value(20, matrix)}, std::move(instructions),
+        {50, 60}, {matrix, matrix});
+    const auto result = verify_and_canonicalize_program(std::move(program));
+    CHECK(std::holds_alternative<VerifiedProgram>(result));
+}
+
+void test_export_serialization_order_is_not_identity() {
+    const ValueType matrix = tensor({2, 3});
+    Program first = one_function_program(
+        3, 5, {value(10, matrix), value(20, matrix)},
+        {instruction(1, Primitive::Add, {10, 20}, {value(30, matrix)}),
+         instruction(2, Primitive::Multiply, {10, 20}, {value(40, matrix)})},
+        {30, 40}, {matrix, matrix});
+    Program second = first;
+    std::reverse(second.exports.begin(), second.exports.end());
+    const auto left = verify_and_canonicalize_program(std::move(first));
+    const auto right = verify_and_canonicalize_program(std::move(second));
+    CHECK(std::holds_alternative<VerifiedProgram>(left));
+    CHECK(std::holds_alternative<VerifiedProgram>(right));
+    if (std::holds_alternative<VerifiedProgram>(left) &&
+        std::holds_alternative<VerifiedProgram>(right)) {
+        CHECK(program_digest(std::get<VerifiedProgram>(left)) ==
+              program_digest(std::get<VerifiedProgram>(right)));
+    }
+}
+
+Program bounded_state_program() {
+    Region body;
+    body.id = 90;
+    body.arguments = {value(900, scalar(ElementType::U64)), value(901)};
+    body.instructions.push_back(instruction(
+        910, Primitive::Constant, {}, {value(902)}, ConstantAttributes{1}));
+    body.instructions.push_back(instruction(
+        920, Primitive::Add, {901, 902}, {value(903)}));
+    body.yields = {903};
+
+    Instruction read = instruction(
+        10, Primitive::StateRead, {}, {value(100)}, StateAttributes{70});
+    Instruction loop = instruction(
+        20, Primitive::BoundedLoop, {100}, {value(200)},
+        LoopAttributes{0, 4, 1});
+    loop.regions = {90};
+    Instruction write = instruction(
+        30, Primitive::StateWrite, {200}, {}, StateAttributes{70});
+    write.effect_predecessors = {10};
+
+    Region root;
+    root.id = 80;
+    root.instructions = {std::move(read), std::move(loop), std::move(write)};
+    root.yields = {200};
+
+    Function function;
+    function.id = 60;
+    function.entry_region_id = 80;
+    function.regions = {std::move(body), std::move(root)};
+    function.result_types = {scalar()};
+
+    Program program;
+    program.state_references.push_back({70, scalar(), 11, true});
+    program.functions.push_back(std::move(function));
+    program.exports.push_back({60, 0, scalar()});
+    return program;
+}
+
+void test_bounded_loop_and_state_edge() {
+    const auto result = verify_and_canonicalize_program(bounded_state_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(result));
+}
+
+Program permuted_graph(bool reverse) {
+    std::vector<Instruction> left;
+    left.push_back(instruction(
+        reverse ? 701 : 101, Primitive::Constant, {},
+        {value(reverse ? 710 : 110)}, ConstantAttributes{2}));
+    left.push_back(instruction(
+        reverse ? 702 : 102, Primitive::Constant, {},
+        {value(reverse ? 720 : 120)}, ConstantAttributes{3}));
+    left.push_back(instruction(
+        reverse ? 703 : 103, Primitive::Add,
+        {reverse ? 710u : 110u, reverse ? 720u : 120u},
+        {value(reverse ? 730 : 130)}));
+
+    std::vector<Instruction> right;
+    right.push_back(instruction(
+        reverse ? 801 : 201, Primitive::Constant, {},
+        {value(reverse ? 810 : 210)}, ConstantAttributes{4}));
+    right.push_back(instruction(
+        reverse ? 802 : 202, Primitive::Constant, {},
+        {value(reverse ? 820 : 220)}, ConstantAttributes{5}));
+    right.push_back(instruction(
+        reverse ? 803 : 203, Primitive::Add,
+        {reverse ? 810u : 210u, reverse ? 820u : 220u},
+        {value(reverse ? 830 : 230)}));
+
+    std::vector<Instruction> instructions;
+    if (reverse) {
+        instructions.insert(instructions.end(), right.begin(), right.end());
+        instructions.insert(instructions.end(), left.begin(), left.end());
+    } else {
+        instructions.insert(instructions.end(), left.begin(), left.end());
+        instructions.insert(instructions.end(), right.begin(), right.end());
+    }
+    instructions.push_back(instruction(
+        reverse ? 900 : 300, Primitive::Multiply,
+        {reverse ? 730u : 130u, reverse ? 830u : 230u},
+        {value(reverse ? 910 : 310)}));
+    return one_function_program(reverse ? 51 : 1, reverse ? 61 : 2, {},
+                                std::move(instructions),
+                                {reverse ? 910u : 310u}, {scalar()});
+}
+
+void test_canonical_digest_ignores_local_ids_and_independent_order() {
+    const auto first = verify_and_canonicalize_program(permuted_graph(false));
+    const auto second = verify_and_canonicalize_program(permuted_graph(true));
+    CHECK(std::holds_alternative<VerifiedProgram>(first));
+    CHECK(std::holds_alternative<VerifiedProgram>(second));
+    if (const auto* a = std::get_if<VerifiedProgram>(&first)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&second)) {
+            CHECK(program_digest(*a) == program_digest(*b));
+        }
+    }
+}
+
+Program parameter_order_program(bool reverse_declarations) {
+    ValueType shaped = scalar();
+    shaped.dimensions = {parameter_dimension(11), parameter_dimension(22)};
+    Program program = one_function_program(
+        1, 2, {value(10, shaped), value(20, shaped)},
+        {instruction(3, Primitive::Add, {10, 20}, {value(30, shaped)})},
+        {30}, {shaped});
+    if (reverse_declarations) {
+        program.dimension_parameters = {{22, 3, 9}, {11, 1, 5}};
+    } else {
+        program.dimension_parameters = {{11, 1, 5}, {22, 3, 9}};
+    }
+    return program;
+}
+
+Program state_order_program(bool reverse_declarations) {
+    Region region;
+    region.id = 2;
+    region.arguments = {value(10), value(20)};
+    region.instructions = {
+        instruction(30, Primitive::StateWrite, {10}, {}, StateAttributes{100}),
+        instruction(40, Primitive::StateWrite, {20}, {}, StateAttributes{200}),
+    };
+    region.instructions.back().effect_predecessors = {30};
+    region.yields = {10};
+
+    Function function;
+    function.id = 1;
+    function.entry_region_id = 2;
+    function.regions = {std::move(region)};
+    function.result_types = {scalar()};
+
+    Program program;
+    if (reverse_declarations) {
+        program.state_references = {
+            {200, scalar(), UINT32_MAX, true},
+            {100, scalar(), UINT32_MAX, true},
+        };
+    } else {
+        program.state_references = {
+            {100, scalar(), UINT32_MAX, true},
+            {200, scalar(), UINT32_MAX, true},
+        };
+    }
+    program.functions = {std::move(function)};
+    program.exports = {{1, 0, scalar()}};
+    return program;
+}
+
+void test_declaration_storage_order_is_not_semantic() {
+    const auto dimensions_a =
+        verify_and_canonicalize_program(parameter_order_program(false));
+    const auto dimensions_b =
+        verify_and_canonicalize_program(parameter_order_program(true));
+    CHECK(std::holds_alternative<VerifiedProgram>(dimensions_a));
+    CHECK(std::holds_alternative<VerifiedProgram>(dimensions_b));
+    if (const auto* a = std::get_if<VerifiedProgram>(&dimensions_a)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&dimensions_b)) {
+            CHECK(program_digest(*a) == program_digest(*b));
+        }
+    }
+
+    const auto states_a = verify_and_canonicalize_program(state_order_program(false));
+    const auto states_b = verify_and_canonicalize_program(state_order_program(true));
+    CHECK(std::holds_alternative<VerifiedProgram>(states_a));
+    CHECK(std::holds_alternative<VerifiedProgram>(states_b));
+    if (const auto* a = std::get_if<VerifiedProgram>(&states_a)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&states_b)) {
+            CHECK(program_digest(*a) == program_digest(*b));
+        }
+    }
+}
+
+void test_state_relation_is_semantic() {
+    Program distinct = state_order_program(false);
+    distinct.state_references[0].alias_group = 5;
+    distinct.state_references[1].alias_group = 6;
+
+    Program shared = state_order_program(false);
+    shared.state_references[0].alias_group = 5;
+    shared.state_references[1].alias_group = 5;
+
+    const auto distinct_result = verify_and_canonicalize_program(std::move(distinct));
+    const auto shared_result = verify_and_canonicalize_program(std::move(shared));
+    CHECK(std::holds_alternative<VerifiedProgram>(distinct_result));
+    CHECK(std::holds_alternative<VerifiedProgram>(shared_result));
+    if (const auto* a = std::get_if<VerifiedProgram>(&distinct_result)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&shared_result)) {
+            CHECK(program_digest(*a) != program_digest(*b));
+        }
+    }
+
+}
+
+Program effect_predecessor_order_program(bool reverse) {
+    Region region;
+    region.id = 2;
+    region.arguments = {value(1), value(2), value(3)};
+    region.instructions = {
+        instruction(10, Primitive::StateWrite, {1}, {}, StateAttributes{100}),
+        instruction(20, Primitive::StateWrite, {2}, {}, StateAttributes{200}),
+        instruction(30, Primitive::StateWrite, {3}, {}, StateAttributes{300}),
+    };
+    region.instructions.back().effect_predecessors =
+        reverse ? std::vector<uint32_t>{20, 10}
+                : std::vector<uint32_t>{10, 20};
+    region.yields = {1};
+
+    Function function;
+    function.id = 1;
+    function.entry_region_id = 2;
+    function.regions = {std::move(region)};
+    function.result_types = {scalar()};
+
+    Program program;
+    program.state_references = {
+        {100, scalar(), UINT32_MAX, true},
+        {200, scalar(), UINT32_MAX, true},
+        {300, scalar(), UINT32_MAX, true},
+    };
+    program.functions = {std::move(function)};
+    program.exports = {{1, 0, scalar()}};
+    return program;
+}
+
+Program loop_effect_placement_program(bool inside_loop) {
+    Region body;
+    body.id = 90;
+    body.arguments = {value(900, scalar(ElementType::U64)), value(901)};
+    if (inside_loop) {
+        body.instructions = {
+            instruction(910, Primitive::Constant, {}, {value(902)},
+                        ConstantAttributes{5}),
+            instruction(920, Primitive::StateWrite, {902}, {},
+                        StateAttributes{70}),
+        };
+    }
+    body.yields = {901};
+
+    Instruction loop = instruction(20, Primitive::BoundedLoop, {100}, {value(200)},
+                                   LoopAttributes{0, 4, 1});
+    loop.regions = {90};
+    Region root;
+    root.id = 80;
+    root.arguments = {value(100)};
+    root.instructions = {std::move(loop)};
+    if (!inside_loop) {
+        root.instructions.push_back(instruction(
+            910, Primitive::Constant, {}, {value(902)}, ConstantAttributes{5}));
+        root.instructions.push_back(instruction(
+            920, Primitive::StateWrite, {902}, {}, StateAttributes{70}));
+    }
+    root.yields = {200};
+
+    Function function;
+    function.id = 60;
+    function.entry_region_id = 80;
+    function.regions = {std::move(body), std::move(root)};
+    function.result_types = {scalar()};
+
+    Program program;
+    program.state_references = {{70, scalar(), UINT32_MAX, true}};
+    program.functions = {std::move(function)};
+    program.exports = {{60, 0, scalar()}};
+    return program;
+}
+
+void test_effect_sets_and_control_containment() {
+    const auto effects_a =
+        verify_and_canonicalize_program(effect_predecessor_order_program(false));
+    const auto effects_b =
+        verify_and_canonicalize_program(effect_predecessor_order_program(true));
+    CHECK(std::holds_alternative<VerifiedProgram>(effects_a));
+    CHECK(std::holds_alternative<VerifiedProgram>(effects_b));
+    if (const auto* a = std::get_if<VerifiedProgram>(&effects_a)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&effects_b)) {
+            CHECK(program_digest(*a) == program_digest(*b));
+        }
+    }
+
+    Program tagged_aliases = effect_predecessor_order_program(false);
+    tagged_aliases.state_references[1].alias_group = 0x80000000u;
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(std::move(tagged_aliases))));
+
+    const auto inside =
+        verify_and_canonicalize_program(loop_effect_placement_program(true));
+    const auto outside =
+        verify_and_canonicalize_program(loop_effect_placement_program(false));
+    CHECK(std::holds_alternative<VerifiedProgram>(inside));
+    CHECK(std::holds_alternative<VerifiedProgram>(outside));
+    if (const auto* a = std::get_if<VerifiedProgram>(&inside)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&outside)) {
+            CHECK(program_digest(*a) != program_digest(*b));
+        }
+    }
+
+    Program ambiguous = effect_predecessor_order_program(false);
+    ambiguous.functions.front().regions.front().instructions[1].inputs = {1};
+    CHECK(rejected_with(ambiguous, CompatibilityError::IR_STATE_INVALID));
+
+    Program explicitly_chained = effect_predecessor_order_program(false);
+    auto& effects = explicitly_chained.functions.front().regions.front().instructions;
+    effects[1].inputs = {1};
+    effects[1].effect_predecessors = {10};
+    effects[2].effect_predecessors = {20};
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(std::move(explicitly_chained))));
+}
+
+Program constant_program(ElementType type, uint64_t bits) {
+    const ValueType result_type = scalar(type);
+    return one_function_program(
+        1, 2, {},
+        {instruction(3, Primitive::Constant, {}, {value(4, result_type)},
+                     ConstantAttributes{bits})},
+        {4}, {result_type});
+}
+
+Program dependency_chain_program(uint32_t instruction_count) {
+    Region region;
+    region.id = 1;
+    region.arguments = {value(1, scalar(ElementType::U64))};
+    region.instructions.reserve(instruction_count);
+    uint32_t previous = 1;
+    for (uint32_t index = 0; index < instruction_count; ++index) {
+        const uint32_t output_id = index + 2;
+        region.instructions.push_back(instruction(
+            10000 + index, Primitive::Add, {previous, 1},
+            {value(output_id, scalar(ElementType::U64))}));
+        previous = output_id;
+    }
+    region.yields = {previous};
+
+    Function function;
+    function.id = 1;
+    function.entry_region_id = 1;
+    function.regions = {std::move(region)};
+    function.result_types = {scalar(ElementType::U64)};
+
+    Program program;
+    program.functions = {std::move(function)};
+    program.exports = {{1, 0, scalar(ElementType::U64)}};
+    return program;
+}
+
+Program nested_loop_program(uint32_t instruction_count) {
+    Function function;
+    function.id = 1;
+    function.entry_region_id = 1;
+    function.regions.resize(instruction_count + 1);
+    for (uint32_t depth = 0; depth <= instruction_count; ++depth) {
+        Region& region = function.regions[depth];
+        region.id = depth + 1;
+        if (depth == 0) {
+            region.arguments = {value(1, scalar(ElementType::U64))};
+        } else {
+            region.arguments = {
+                value(100000 + depth * 2, scalar(ElementType::U64)),
+                value(100001 + depth * 2, scalar(ElementType::U64)),
+            };
+        }
+        const uint32_t carried = depth == 0 ? 1 : 100001 + depth * 2;
+        if (depth == instruction_count) {
+            region.yields = {carried};
+            continue;
+        }
+        Instruction loop = instruction(
+            10000 + depth, Primitive::BoundedLoop, {carried},
+            {value(200000 + depth, scalar(ElementType::U64))},
+            LoopAttributes{0, 1, 1});
+        loop.regions = {depth + 2};
+        region.instructions = {std::move(loop)};
+        region.yields = {200000 + depth};
+    }
+    function.result_types = {scalar(ElementType::U64)};
+
+    Program program;
+    program.functions = {std::move(function)};
+    program.exports = {{1, 0, scalar(ElementType::U64)}};
+    return program;
+}
+
+Program state_effect_chain_program(uint32_t instruction_count) {
+    Region region;
+    region.id = 1;
+    region.arguments = {value(1, scalar(ElementType::U64))};
+    region.instructions.reserve(instruction_count);
+    for (uint32_t index = 0; index < instruction_count; ++index) {
+        Instruction write = instruction(10000 + index, Primitive::StateWrite,
+                                        {1}, {}, StateAttributes{9});
+        if (index != 0) write.effect_predecessors = {9999 + index};
+        region.instructions.push_back(std::move(write));
+    }
+    region.yields = {1};
+
+    Function function;
+    function.id = 1;
+    function.entry_region_id = 1;
+    function.regions = {std::move(region)};
+    function.result_types = {scalar(ElementType::U64)};
+
+    Program program;
+    program.state_references = {
+        {9, scalar(ElementType::U64), 7, true},
+    };
+    program.functions = {std::move(function)};
+    program.exports = {{1, 0, scalar(ElementType::U64)}};
+    return program;
+}
+
+void test_constant_storage_widths() {
+    for (const auto [type, bits] : {
+             std::pair{ElementType::I1, uint64_t{1}},
+             std::pair{ElementType::F16, uint64_t{UINT16_MAX}},
+             std::pair{ElementType::I32, uint64_t{UINT32_MAX}},
+             std::pair{ElementType::U32, uint64_t{UINT32_MAX}},
+             std::pair{ElementType::F32, uint64_t{UINT32_MAX}},
+             std::pair{ElementType::U64, UINT64_MAX},
+         }) {
+        CHECK(std::holds_alternative<VerifiedProgram>(
+            verify_and_canonicalize_program(constant_program(type, bits))));
+    }
+    for (const auto [type, bits] : {
+             std::pair{ElementType::I1, uint64_t{2}},
+             std::pair{ElementType::F16, uint64_t{1} << 16},
+             std::pair{ElementType::I32, uint64_t{1} << 32},
+             std::pair{ElementType::U32, uint64_t{1} << 32},
+             std::pair{ElementType::F32, uint64_t{1} << 32},
+         }) {
+        CHECK(rejected_with(constant_program(type, bits),
+                            CompatibilityError::IR_CONSTRAINT_FAILED));
+    }
+}
+
+void test_loop_overflow_model() {
+    Program wrapping_increment = bounded_state_program();
+    auto& rejected = std::get<LoopAttributes>(
+        wrapping_increment.functions.front().regions[1].instructions[1].attributes);
+    rejected.lower = UINT64_MAX - 1;
+    rejected.upper = UINT64_MAX;
+    rejected.step = 2;
+    CHECK(rejected_with(wrapping_increment, CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program exact_final_increment = bounded_state_program();
+    auto& accepted = std::get<LoopAttributes>(
+        exact_final_increment.functions.front().regions[1].instructions[1].attributes);
+    accepted.lower = UINT64_MAX - 2;
+    accepted.upper = UINT64_MAX;
+    accepted.step = 2;
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(std::move(exact_final_increment))));
+}
+
+void test_dependency_depth_is_bounded() {
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(dependency_chain_program(4096))));
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(nested_loop_program(4096))));
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(state_effect_chain_program(4096))));
+    CHECK(rejected_with(dependency_chain_program(4097),
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program split_limit = dependency_chain_program(2048);
+    Program split_second = dependency_chain_program(2048);
+    split_second.functions.front().id = 2;
+    split_second.exports.front().function_id = 2;
+    split_limit.functions.push_back(std::move(split_second.functions.front()));
+    split_limit.exports.push_back(std::move(split_second.exports.front()));
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(std::move(split_limit))));
+
+    Program split_over = dependency_chain_program(2048);
+    Program split_over_second = dependency_chain_program(2049);
+    split_over_second.functions.front().id = 2;
+    split_over_second.exports.front().function_id = 2;
+    split_over.functions.push_back(std::move(split_over_second.functions.front()));
+    split_over.exports.push_back(std::move(split_over_second.exports.front()));
+    CHECK(rejected_with(split_over, CompatibilityError::IR_CONSTRAINT_FAILED));
+}
+
+uint64_t evaluate_scalar(const Program& program) {
+    const Region& region = program.functions.front().regions.front();
+    std::unordered_map<uint32_t, uint64_t> values;
+    for (const Instruction& item : region.instructions) {
+        switch (item.primitive.code) {
+        case Primitive::Constant:
+            values[item.outputs.front().id] =
+                std::get<ConstantAttributes>(item.attributes).bits;
+            break;
+        case Primitive::Add:
+            values[item.outputs.front().id] = values[item.inputs[0]] + values[item.inputs[1]];
+            break;
+        case Primitive::Multiply:
+            values[item.outputs.front().id] = values[item.inputs[0]] * values[item.inputs[1]];
+            break;
+        default:
+            break;
+        }
+    }
+    return values.at(region.yields.front());
+}
+
+Program rewired_graph(bool use_second_constant) {
+    Program program = minimal_scalar_program();
+    Function& function = program.functions.front();
+    Region& region = function.regions.front();
+    Instruction& multiply = region.instructions.back();
+    multiply.primitive.code = Primitive::Multiply;
+    multiply.inputs = {100, use_second_constant ? 200u : 100u};
+    region.yields = {300, 200};
+    function.result_types = {scalar(), scalar()};
+    program.exports.push_back({function.id, 1, scalar()});
+    return program;
+}
+
+void test_edges_change_digest_and_result() {
+    const Program first_program = rewired_graph(false);
+    const Program second_program = rewired_graph(true);
+    CHECK(evaluate_scalar(first_program) == 4);
+    CHECK(evaluate_scalar(second_program) == 6);
+    const auto first = verify_and_canonicalize_program(first_program);
+    const auto second = verify_and_canonicalize_program(second_program);
+    CHECK(std::holds_alternative<VerifiedProgram>(first));
+    CHECK(std::holds_alternative<VerifiedProgram>(second));
+    if (const auto* a = std::get_if<VerifiedProgram>(&first)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&second)) {
+            CHECK(program_digest(*a) != program_digest(*b));
+        }
+    }
+}
+
+Program sharing_program(bool shared) {
+    std::vector<Instruction> instructions;
+    instructions.push_back(instruction(
+        1, Primitive::Constant, {}, {value(10)}, ConstantAttributes{2}));
+    if (!shared) {
+        instructions.push_back(instruction(
+            2, Primitive::Constant, {}, {value(20)}, ConstantAttributes{2}));
+    }
+    instructions.push_back(instruction(
+        3, Primitive::Add, {10, shared ? 10u : 20u}, {value(30)}));
+    return one_function_program(1, 2, {}, std::move(instructions), {30}, {scalar()});
+}
+
+Program partial_export_program(bool shared_second_result) {
+    Region region;
+    region.id = 2;
+    region.arguments = {value(10), value(20)};
+    region.yields = {10, shared_second_result ? 10u : 20u};
+
+    Function function;
+    function.id = 1;
+    function.entry_region_id = 2;
+    function.regions = {std::move(region)};
+    function.result_types = {scalar(), scalar()};
+
+    Program program;
+    program.functions = {std::move(function)};
+    program.exports = {{1, 0, scalar()}};
+    return program;
+}
+
+void test_sharing_is_part_of_canonical_identity() {
+    const auto shared = verify_and_canonicalize_program(sharing_program(true));
+    const auto duplicated = verify_and_canonicalize_program(sharing_program(false));
+    CHECK(std::holds_alternative<VerifiedProgram>(shared));
+    CHECK(std::holds_alternative<VerifiedProgram>(duplicated));
+    if (const auto* a = std::get_if<VerifiedProgram>(&shared)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&duplicated)) {
+            CHECK(program_digest(*a) != program_digest(*b));
+        }
+    }
+
+    const auto distinct_result =
+        verify_and_canonicalize_program(partial_export_program(false));
+    const auto shared_result =
+        verify_and_canonicalize_program(partial_export_program(true));
+    CHECK(std::holds_alternative<VerifiedProgram>(distinct_result));
+    CHECK(std::holds_alternative<VerifiedProgram>(shared_result));
+    if (const auto* a = std::get_if<VerifiedProgram>(&distinct_result)) {
+        if (const auto* b = std::get_if<VerifiedProgram>(&shared_result)) {
+            CHECK(program_digest(*a) != program_digest(*b));
+        }
+    }
+}
+
+void test_rejections() {
+    Program use_before_definition = minimal_scalar_program();
+    auto& use_before_instructions =
+        use_before_definition.functions.front().regions.front().instructions;
+    std::swap(use_before_instructions[1], use_before_instructions[2]);
+    CHECK(rejected_with(use_before_definition, CompatibilityError::IR_REFERENCE_INVALID));
+
+    Program invalid_dominance = bounded_state_program();
+    Region& invalid_root = invalid_dominance.functions.front().regions[1];
+    invalid_root.instructions.push_back(
+        instruction(40, Primitive::Add, {903, 200}, {value(300)}));
+    invalid_root.yields = {300};
+    CHECK(rejected_with(invalid_dominance, CompatibilityError::IR_REFERENCE_INVALID));
+
+    Program implicit_capture = bounded_state_program();
+    Region& capture_body = implicit_capture.functions.front().regions.front();
+    capture_body.instructions.back().inputs.front() = 100;
+    CHECK(rejected_with(implicit_capture, CompatibilityError::IR_REFERENCE_INVALID));
+
+    Program unresolved_dimension = minimal_scalar_program();
+    ValueType unresolved = tensor({1});
+    unresolved.dimensions = {parameter_dimension(77)};
+    unresolved_dimension.functions.front().regions.front().instructions.front().outputs.front().type =
+        unresolved;
+    CHECK(rejected_with(unresolved_dimension, CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Region alias_region;
+    alias_region.id = 4;
+    alias_region.arguments = {value(1)};
+    alias_region.instructions = {
+        instruction(10, Primitive::StateWrite, {1}, {}, StateAttributes{10}),
+        instruction(20, Primitive::StateWrite, {1}, {}, StateAttributes{20}),
+    };
+    Function alias_function;
+    alias_function.id = 3;
+    alias_function.entry_region_id = 4;
+    alias_function.regions = {std::move(alias_region)};
+    Program unsafe_alias;
+    unsafe_alias.state_references = {
+        {10, scalar(), 5, true},
+        {20, scalar(), 5, true},
+    };
+    unsafe_alias.functions.push_back(std::move(alias_function));
+    CHECK(rejected_with(unsafe_alias, CompatibilityError::IR_STATE_INVALID));
+
+    Program unordered_effects = state_order_program(false);
+    unordered_effects.functions.front().regions.front().instructions.back()
+        .effect_predecessors.clear();
+    CHECK(rejected_with(unordered_effects, CompatibilityError::IR_STATE_INVALID));
+
+    Program unbounded = bounded_state_program();
+    auto& loop_attributes = std::get<LoopAttributes>(
+        unbounded.functions.front().regions[1].instructions[1].attributes);
+    loop_attributes.upper = UINT64_MAX;
+    CHECK(rejected_with(unbounded, CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program effect_cycle = bounded_state_program();
+    Region& cycle_root = effect_cycle.functions.front().regions[1];
+    cycle_root.instructions[0].effect_predecessors = {30};
+    CHECK(rejected_with(effect_cycle, CompatibilityError::IR_STATE_INVALID));
+
+    Program unknown_version = minimal_scalar_program();
+    unknown_version.functions.front().regions.front().instructions.back().primitive.major = 2;
+    CHECK(rejected_with(unknown_version, CompatibilityError::IR_VERSION_UNSUPPORTED));
+
+    Program unknown_primitive = minimal_scalar_program();
+    unknown_primitive.functions.front().regions.front().instructions.back().primitive.code =
+        static_cast<Primitive>(UINT16_MAX);
+    CHECK(rejected_with(unknown_primitive, CompatibilityError::IR_VERSION_UNSUPPORTED));
+
+    Program invalid_element = minimal_scalar_program();
+    invalid_element.functions.front().regions.front().instructions.front().outputs.front()
+        .type.element_type = static_cast<ElementType>(UINT8_MAX);
+    CHECK(rejected_with(invalid_element, CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program dead_instruction = minimal_scalar_program();
+    dead_instruction.functions.front().regions.front().instructions.push_back(instruction(
+        40, Primitive::Constant, {}, {value(400)}, ConstantAttributes{9}));
+    CHECK(rejected_with(dead_instruction, CompatibilityError::IR_REFERENCE_INVALID));
+
+    Program dead_function = minimal_scalar_program();
+    Function unused;
+    unused.id = 50;
+    unused.entry_region_id = 60;
+    unused.regions.push_back({60, {}, {}, {}});
+    dead_function.functions.push_back(std::move(unused));
+    CHECK(rejected_with(dead_function, CompatibilityError::IR_REFERENCE_INVALID));
+
+    Program unused_dimension = minimal_scalar_program();
+    unused_dimension.dimension_parameters = {{50, 1, 4}};
+    CHECK(rejected_with(unused_dimension, CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program unused_state = minimal_scalar_program();
+    unused_state.state_references = {{50, scalar(), UINT32_MAX, true}};
+    CHECK(rejected_with(unused_state, CompatibilityError::IR_STATE_INVALID));
+}
+
+void test_structural_wire_roundtrip() {
+    auto verified = verify_and_canonicalize_program(bounded_state_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    const ProgramDigest expected =
+        program_digest(std::get<VerifiedProgram>(verified));
+    const auto wire = encode_program_wire(std::get<VerifiedProgram>(verified));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(wire)) return;
+    const auto& bytes = std::get<std::vector<uint8_t>>(wire);
+    const auto decoded = decode_program_wire(bytes);
+    CHECK(std::holds_alternative<VerifiedProgram>(decoded));
+    if (const auto* roundtrip = std::get_if<VerifiedProgram>(&decoded))
+        CHECK(program_digest(*roundtrip) == expected);
+
+    auto trailing = bytes;
+    trailing.push_back(0);
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        decode_program_wire(trailing)));
+    auto bad_magic = bytes;
+    bad_magic.front() ^= 1;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        decode_program_wire(bad_magic)));
+    auto bad_version = bytes;
+    bad_version[8] = 2;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        decode_program_wire(bad_version)));
+
+    Program reordered = minimal_scalar_program();
+    std::swap(reordered.functions.front().regions.front().instructions[0],
+              reordered.functions.front().regions.front().instructions[1]);
+    auto reordered_verified = verify_and_canonicalize_program(std::move(reordered));
+    CHECK(std::holds_alternative<VerifiedProgram>(reordered_verified));
+    if (std::holds_alternative<VerifiedProgram>(reordered_verified)) {
+        const auto reordered_wire = encode_program_wire(
+            std::get<VerifiedProgram>(reordered_verified));
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(reordered_wire));
+        if (std::holds_alternative<std::vector<uint8_t>>(reordered_wire)) {
+            const auto reordered_decoded = decode_program_wire(
+                std::get<std::vector<uint8_t>>(reordered_wire));
+            CHECK(std::holds_alternative<VerifiedProgram>(reordered_decoded));
+            if (const auto* roundtrip =
+                    std::get_if<VerifiedProgram>(&reordered_decoded))
+                CHECK(program_digest(*roundtrip) ==
+                      program_digest(std::get<VerifiedProgram>(
+                          reordered_verified)));
+        }
+    }
+}
+
+} // namespace
+
+int main() {
+    test_minimal_programs();
+    test_unseen_repeated_graph_with_multiple_outputs();
+    test_export_serialization_order_is_not_identity();
+    test_bounded_loop_and_state_edge();
+    test_canonical_digest_ignores_local_ids_and_independent_order();
+    test_declaration_storage_order_is_not_semantic();
+    test_state_relation_is_semantic();
+    test_effect_sets_and_control_containment();
+    test_constant_storage_widths();
+    test_loop_overflow_model();
+    test_dependency_depth_is_bounded();
+    test_edges_change_digest_and_result();
+    test_sharing_is_part_of_canonical_identity();
+    test_rejections();
+    test_structural_wire_roundtrip();
+    return test_summary("test_program_ir");
+}

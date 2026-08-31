@@ -12,11 +12,13 @@ struct LayerTopology {
     int n_q_heads = 0;
     int n_kv_heads = 0;
     int head_dim = 0;
+    int intermediate = 0;
     int sliding_window = 0;
     int rope_dim = 0;
     float rope_base = 0.0f;
     bool shared_kv = false;
     bool moe = false;
+    bool swiglu = false;
 };
 
 struct TopologyPlan {

@@ -105,13 +105,11 @@ private:
             int cur_active = pool.active_count();
             CoreMode cur_mode = pool.core_mode();
 
-            // Mode switch: Hybrid on battery, Performance on AC.
-            // Skip if LAPLACE_ECORES is set (manual mode control).
+            // Stay on Performance unless LAPLACE_ECORES is set.
             if (manual_mode_) {
                 cur_mode = pool.core_mode();
             } else {
-                CoreMode target_mode = (ps.on_battery && topo_.e_cores > 0)
-                    ? CoreMode::Hybrid : CoreMode::Performance;
+                CoreMode target_mode = CoreMode::Performance;
                 if (target_mode != cur_mode) {
                     pool.set_core_mode(target_mode);
                     cur_mode = target_mode;
@@ -162,7 +160,8 @@ private:
                 probe_cooldown_ <= 0) {
                 bool can_probe_up = !ps.on_battery
                     && cur_active < max_threads_;
-                bool can_probe_down = ps.on_battery && cur_active > 2;
+                bool can_probe_down = ps.on_battery &&
+                    cur_mode == CoreMode::Ecore && cur_active > 2;
                 if (can_probe_up || can_probe_down) {
                     int delta = ps.on_battery ? -1 : +1;
                     probing = true;

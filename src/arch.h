@@ -79,6 +79,8 @@ public:
                                KVCache& kv, ModelBuffers* buf,
                                float* checkpoints) = 0;
     virtual bool needs_shared_rope_table() const { return true; }
+    // A decode graph may begin only when this executor can submit every layer.
+    virtual bool supports_token_graph() const { return false; }
 };
 
 // Static factory: maps general.architecture strings to implementations.

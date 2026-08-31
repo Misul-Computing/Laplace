@@ -16,6 +16,7 @@ namespace Laplace {
     extern bool metal_available();
     extern bool metal_gemv(const float* x, const Tensor& w, float* y, int K, int N);
     extern bool metal_gemm(const float* x, const Tensor& w, float* y, int M, int K, int N);
+    extern void metal_register_weights(const void* base, size_t size);
 }
 
 static void rng_fill(float* v, int n, unsigned seed) {
@@ -77,6 +78,7 @@ int main() {
         Tensor wt; wt.type = sz.type; wt.n_dims = 2; wt.dims[0] = K; wt.dims[1] = N; wt.data = storage.data();
         if (sz.type == GGMLType::F32) memcpy(storage.data(), w.data(), (size_t)K*N*4);
         else if (sz.type == GGMLType::Q4_K) pack_q4_K(w.data(), K, N, storage.data());
+        metal_register_weights(storage.data(), storage.size());
 
         // Warmup CPU
         setenv("LAPLACE_NOMETAL", "1", 1);

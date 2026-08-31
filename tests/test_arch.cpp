@@ -172,6 +172,81 @@ void test_topology_uses_features_not_architecture_name() {
     std::remove("test_topology.gguf");
 }
 
+void test_topology_broadcasts_scalar_kv_and_all_global() {
+    // Llama/Smol fingerprint: scalar kv heads, no sliding pattern.
+    gguf_writer::Writer w;
+    w.kv_str("general.architecture", "llama");
+    w.kv_u32("llama.block_count", 2);
+    w.kv_u32("llama.embedding_length", 32);
+    w.kv_u32("llama.feed_forward_length", 48);
+    w.kv_u32("llama.context_length", 2048);
+    w.kv_u32("llama.attention.head_count", 4);
+    w.kv_u32("llama.attention.key_length", 8);
+    w.kv_u32("llama.attention.head_count_kv", 2);
+    CHECK(w.write_file("test_llama_topo.gguf"));
+
+    GGUFContext gguf;
+    CHECK(gguf.open("test_llama_topo.gguf"));
+    TopologyPlan plan;
+    std::string error;
+    CHECK_MSG(synthesize_topology(gguf, &plan, &error), "%s", error.c_str());
+    CHECK(plan.layers.size() == 2);
+    CHECK(plan.embed_scale == 1.0f);
+    CHECK(plan.logit_softcap == 0.0f);
+    if (plan.layers.size() == 2) {
+        CHECK(plan.layers[0].n_kv_heads == 2);
+        CHECK(plan.layers[1].n_kv_heads == 2);
+        CHECK(plan.layers[0].sliding_window == 0);
+        CHECK(plan.layers[1].sliding_window == 0);
+        CHECK(plan.layers[0].swiglu);
+        CHECK(plan.layers[0].intermediate == 48);
+    }
+    std::remove("test_llama_topo.gguf");
+}
+
+void test_topology_e2b_scalar_kv_and_ffn_array() {
+    gguf_writer::Writer w;
+    w.kv_str("general.architecture", "gemma4");
+    w.kv_u32("gemma4.block_count", 2);
+    w.kv_u32("gemma4.embedding_length", 32);
+    w.kv_arr_u32("gemma4.feed_forward_length", {48, 96});
+    w.kv_u32("gemma4.context_length", 2048);
+    w.kv_u32("gemma4.attention.head_count", 4);
+    w.kv_u32("gemma4.attention.key_length", 16);
+    w.kv_u32("gemma4.attention.key_length_swa", 8);
+    w.kv_u32("gemma4.attention.head_count_kv", 1);
+    w.kv_u32("gemma4.attention.sliding_window", 64);
+    w.kv_arr_u32("gemma4.attention.sliding_window_pattern", {1, 0});
+    w.kv_f32("gemma4.final_logit_softcapping", 30.0f);
+    gguf_writer::TensorDecl rope;
+    rope.name = "rope_freqs.weight";
+    rope.dims = {4};
+    rope.type = 0;
+    rope.data.assign(16, 0);
+    w.add_tensor(std::move(rope));
+    CHECK(w.write_file("test_e2b_topo.gguf"));
+
+    GGUFContext gguf;
+    CHECK(gguf.open("test_e2b_topo.gguf"));
+    TopologyPlan plan;
+    std::string error;
+    CHECK_MSG(synthesize_topology(gguf, &plan, &error), "%s", error.c_str());
+    CHECK(plan.layers.size() == 2);
+    CHECK(plan.embed_scale > 1.0f);
+    CHECK(plan.logit_softcap == 30.0f);
+    if (plan.layers.size() == 2) {
+        CHECK(plan.layers[0].n_kv_heads == 1);
+        CHECK(plan.layers[1].n_kv_heads == 1);
+        CHECK(plan.layers[0].sliding_window == 64);
+        CHECK(plan.layers[1].sliding_window == 0);
+        CHECK(plan.layers[0].intermediate == 48);
+        CHECK(plan.layers[1].intermediate == 96);
+        CHECK(!plan.layers[0].swiglu);
+    }
+    CHECK(plan.intermediate == 96);
+    std::remove("test_e2b_topo.gguf");
+}
+
 // Phi3's RMSNorm uses the gain+1 trick: y = x / sqrt(mean(x^2) + eps)
 // * (1 + w).  The standard rmsnorm doesn't match this; verify our
 // rmsnorm_phi3 against a hand-rolled reference.
@@ -344,6 +419,8 @@ int main() {
     test_rope_roundtrip();
     test_factory();
     test_topology_uses_features_not_architecture_name();
+    test_topology_broadcasts_scalar_kv_and_all_global();
+    test_topology_e2b_scalar_kv_and_ffn_array();
     test_deltanet_wh_parity();
     return test_summary("test_arch");
 }

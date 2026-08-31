@@ -1,0 +1,94 @@
+# Mechanical product boundary. This is the current Apple product link closure,
+# including linked static-library sources. It is intentionally catalog-bearing
+# until the category-free runtime replaces the transitional product paths.
+set(LAPLACE_PRODUCT_TARGETS
+    laplace
+    laplace_metal_pipeline_transaction
+    laplace_product_metal_execution
+)
+
+set(LAPLACE_PRODUCT_SOURCES
+    src/main.cpp
+    src/codec_binding.cpp
+    src/generation_loop.cpp
+    src/product_package.cpp
+    src/gguf_product_compiler.cpp
+    src/normalized_gguf_product_compiler.cpp
+    src/mlx_package.cpp
+    src/normalized_source_evidence.cpp
+    src/gguf_normalized_source_adapter.cpp
+    src/mlx_normalized_source_adapter.cpp
+    src/safetensors_adapter.cpp
+    src/safetensors.cpp
+    src/artifact_index.cpp
+    src/artifact_set.cpp
+    src/canonical_metal.cpp
+    src/compatibility_report.cpp
+    src/compat_rule.cpp
+    src/product_authority.cpp
+    src/execution_plan.cpp
+    src/physical_codec.cpp
+    src/gguf_index.cpp
+    src/mmap.cpp
+    src/gguf.cpp
+    src/matmul.cpp
+    src/matmul_simd.cpp
+    src/column_grouped_u2_atlas.cpp
+    src/column_grouped_affine_uint2_skip.cpp
+    src/token_program.cpp
+    src/sampler.cpp
+    src/semantic_model.cpp
+    src/semantic_dispatch_program.cpp
+    src/bound_dispatch_requirements.cpp
+    src/closed_v1_source_schema.cpp
+    src/source_schema.cpp
+    src/source_compiler_graph_proof.cpp
+    src/program_ir.cpp
+    src/physical_program.cpp
+    src/physical_program_package.cpp
+    src/program_state.cpp
+    src/container_schema_program.cpp
+    src/semantic_manifest.cpp
+    src/token_contract.cpp
+    src/sparse_selector_coeff.cpp
+    src/runtime_session.cpp
+    src/session_resources.mm
+    src/state_abi.cpp
+    src/metal.mm
+    src/metal_pipeline_transaction.mm
+    src/product_metal_execution.cpp
+    src/product_metal_codec_capabilities.cpp
+    src/structural_metal_compiler.cpp
+    src/normalized_codec_program.cpp
+    src/metal_codec_capability.cpp
+    src/metal_library_source_catalog.mm
+    src/codec_certificate.cpp
+)
+
+# Transitional correctness or research inventory. These sources may be linked
+# by focused qualification targets, never by the product executable or its
+# linked product libraries.
+set(LAPLACE_QUALIFICATION_ONLY_SOURCES
+    src/codec_program.cpp
+    src/gguf_import.cpp
+    src/metal_capability_snapshot.mm
+    src/model.cpp
+    src/token_graph_backend.cpp
+    src/topology.cpp
+    src/ops.cpp
+    src/laplace_arch.cpp
+    src/arch_qwen3next.cpp
+    src/arch_llama.cpp
+    src/arch_phi3.cpp
+    src/arch_adaptive.cpp
+    src/laplace_moe.cpp
+    src/sparse_ffn_bank.cpp
+    src/ssm.cpp
+    src/kvcache.cpp
+    src/laplace_kv.cpp
+    src/laplace_kv_adaptive.cpp
+    src/laplace_kv_q4.cpp
+    src/column_grouped_q4.cpp
+    src/column_grouped_affine_lowbit.cpp
+    src/trellis_codec.cpp
+)

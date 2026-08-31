@@ -3,10 +3,13 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
+#include <span>
 #include <string>
 #include <variant>
 #include <vector>
 
+#include "artifact_set.h"
 #include "mmap.h"
 #include "tensor.h"
 
@@ -37,6 +40,14 @@ struct GGUFTensorInfo {
     uint64_t offset = 0;  // relative to start of tensor data section
 };
 
+struct GGUFMetadataEntry {
+    std::string key;
+    MetaValue value;
+    uint32_t value_type = 0;
+    uint64_t source_offset = 0;
+    uint64_t source_length = 0;
+};
+
 class GGUFContext {
 public:
     GGUFContext() = default;
@@ -46,9 +57,16 @@ public:
     GGUFContext& operator=(const GGUFContext&) = delete;
 
     bool open(const char* path);
+    // Retains the validated package owner for the lifetime of every tensor
+    // view returned by this context.
+    bool parse(const PackageView& package);
+    // Explicitly borrowed entry point for parser-only callers. The caller
+    // must keep bytes alive until close() or the next parse/open call.
+    bool parse_borrowed(std::span<const uint8_t> bytes);
     void close();
 
     const std::map<std::string, MetaValue>& metadata() const { return metadata_; }
+    const std::vector<GGUFMetadataEntry>& metadata_entries() const { return metadata_entries_; }
     const std::vector<GGUFTensorInfo>& tensor_infos() const { return tensor_infos_; }
     const std::vector<Tensor>& tensors() const { return tensors_; }
 
@@ -65,14 +83,17 @@ public:
     const std::string& path() const { return path_; }
 
 private:
+    bool parse_bytes(const uint8_t* bytes, size_t size);
     MappedFile file_;
     std::map<std::string, MetaValue> metadata_;
+    std::vector<GGUFMetadataEntry> metadata_entries_;
     std::vector<GGUFTensorInfo> tensor_infos_;
     std::vector<Tensor> tensors_;
     uint64_t data_section_offset_ = 0;
     uint64_t alignment_ = 32;
     uint32_t version_ = 0;
     std::string path_;
+    std::optional<PackageView> package_owner_;
 };
 
 // Convenience accessors (tolerate multiple integer widths)

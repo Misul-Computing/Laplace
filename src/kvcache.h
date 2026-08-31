@@ -6,7 +6,7 @@
 #include <memory>
 #include <vector>
 
-#include "laplace_kv.h"
+#include "laplace_kv_adaptive.h"
 #include "laplace_kv_q4.h"
 
 namespace Laplace {
@@ -16,6 +16,13 @@ enum class KVCacheMode {
     FP16,
     LAPLACE,
     LAPLACE_Q4,
+};
+
+enum class KVStorageKind {
+    FP32,
+    FP16,
+    Adaptive,
+    FixedQ4,
 };
 
 struct KVLayerConfig {
@@ -35,6 +42,8 @@ public:
 
     KVCacheMode mode() const { return mode_; }
     KVCacheMode mode(int layer) const;
+    KVStorageKind storage_kind() const;
+    KVStorageKind storage_kind(int layer) const;
     int capacity() const { return capacity_; }
     int capacity(int layer) const;
     int n_layers() const { return n_layers_; }
@@ -92,6 +101,11 @@ public:
     uint64_t stream_calls() const;
     uint64_t archive_read_bytes() const;
     uint64_t archive_write_bytes() const;
+    uint64_t q4_tiles() const;
+    uint64_t k8_tiles() const;
+    uint64_t fp16_tiles() const;
+    LaplaceKVAdaptiveFormat tile_format(
+        int layer, int head, int tile) const;
     void set_streaming(bool enabled) { streaming_ = enabled; }
 #if defined(LAPLACE_KV_CAPTURE)
     bool set_research_bfp3();
@@ -105,6 +119,7 @@ public:
                                int tail_value_bits = 0);
 #endif
     size_t encoded_bytes(int n_tokens) const;
+    size_t logical_scalars(int n_tokens) const;
     size_t storage_bytes() const;
     size_t archive_read_buffer_bytes() const;
     size_t archive_bytes() const;
@@ -119,7 +134,7 @@ private:
     std::vector<float> v32_;
     std::vector<uint16_t> k16_;
     std::vector<uint16_t> v16_;
-    std::unique_ptr<LaplaceKV> laplace_;
+    std::unique_ptr<LaplaceKVAdaptive> laplace_;
     std::unique_ptr<LaplaceKVQ4> laplace_q4_;
     std::vector<std::unique_ptr<KVCache>> layer_caches_;
     std::vector<KVLayerConfig> layer_configs_;

@@ -13,6 +13,7 @@
 #include "matmul.h"
 #include "model.h"
 #include "ops.h"
+#include "token_graph_backend.h"
 #include "laplace_moe.h"
 #include "threadpool.h"
 
@@ -47,12 +48,12 @@ struct KernelProf {
     void maybe_print() {
         if (!on) return;
         if (++tokens % 30 != 0) return;
-        fprintf(stderr, "\n=== PROF adaptive per-kernel (last 100 decode tokens) ===\n");
+        fprintf(stderr, "\n=== PROF adaptive per-kernel (last 30 decode tokens) ===\n");
         double total = 0.0;
         for (int i = 0; i < NK; i++) {
             if (cnt[i] == 0) continue;
             double avg_ms = 1e3 * acc[i] / cnt[i];
-            double per_tok_ms = 1e3 * acc[i] / 100.0;
+            double per_tok_ms = 1e3 * acc[i] / 30.0;
             fprintf(stderr, "  %-20s %7.3f ms/call  %8.3f ms/tok  (%ld calls)\n",
                     names[i], avg_ms, per_tok_ms, cnt[i]);
             total += per_tok_ms;
@@ -113,6 +114,9 @@ bool AdaptiveArch::load_config(const GGUFContext& gguf, ModelConfig* cfg) {
         output.n_kv_heads = source.n_kv_heads;
         output.head_dim = source.head_dim;
         output.sliding_window = source.sliding_window;
+        output.intermediate = source.intermediate > 0
+            ? source.intermediate : plan_.intermediate;
+        output.swiglu = source.swiglu;
         output.rope_dim = source.rope_dim;
         output.rope_base = source.rope_base;
         cfg->n_q_heads = std::max(cfg->n_q_heads, source.n_q_heads);
@@ -133,6 +137,8 @@ bool AdaptiveArch::load_weights(const GGUFContext& gguf, const ModelConfig& cfg,
     layers->assign(cfg.n_layers, {});
     is_attention->assign(cfg.n_layers, true);
     kv_layer_idx->assign(cfg.n_layers, -1);
+    kv_layer_idx_.assign(cfg.n_layers, -1);
+    int last_kv_owner = -1;
 
     // Load the shared rope_freqs tensor for global layers (p-RoPE).
     const Tensor* rope_freqs = gguf.find_tensor("rope_freqs.weight");
@@ -172,11 +178,26 @@ bool AdaptiveArch::load_weights(const GGUFContext& gguf, const ModelConfig& cfg,
         L.post_ffw_norm      = gguf.find_tensor((p + "post_ffw_norm.weight").c_str());
         L.layer_output_scale = gguf.find_tensor((p + "layer_output_scale.weight").c_str());
 
-        (*kv_layer_idx)[i] = i;
+        if (L.attn_k) {
+            last_kv_owner = i;
+            (*kv_layer_idx)[i] = i;
+            kv_layer_idx_[i] = i;
+            layer_types_[i].owns_kv = true;
+        } else if (last_kv_owner >= 0) {
+            const LayerWeights& src = (*layers)[last_kv_owner];
+            L.attn_k = src.attn_k;
+            L.attn_v = src.attn_v;
+            L.attn_k_norm = src.attn_k_norm;
+            (*kv_layer_idx)[i] = (*kv_layer_idx)[last_kv_owner];
+            kv_layer_idx_[i] = kv_layer_idx_[last_kv_owner];
+            layer_types_[i].owns_kv = false;
+        } else {
+            fprintf(stderr, "adaptive: layer %d has no K and no earlier KV owner\n", i);
+            return false;
+        }
 
         if (!L.attn_norm || !L.attn_q || !L.attn_k || !L.attn_output ||
-            !L.attn_q_norm || !L.attn_k_norm || !L.ffn_norm ||
-            !L.ffn_gate || !L.ffn_up || !L.ffn_down) {
+            !L.ffn_norm || !L.ffn_gate || !L.ffn_up || !L.ffn_down) {
             fprintf(stderr, "adaptive: layer %d missing core tensors\n", i);
             return false;
         }
@@ -238,11 +259,16 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
     const int Hq = lti.n_q_heads;
     const int Hk = lti.n_kv_heads;
     const int Dh = lti.head_dim;
-    const int Dh_store = kv.head_dim(layer);
+    const int cache =
+        (layer >= 0 && layer < static_cast<int>(kv_layer_idx_.size()) &&
+         kv_layer_idx_[layer] >= 0)
+            ? kv_layer_idx_[layer] : layer;
+    const int Dh_store = kv.head_dim(cache);
     const int gqa = Hq / Hk;
-    // Adaptive uses attention scale = 1.0 (no 1/sqrt(d_k) scaling).
-    // Q and K are already RMSNormed, so their dot product is bounded.
-    const float scale = 1.0f;
+    // Gemma files RMSNorm Q/K so scale 1. Llama files do not; use 1/sqrt(d).
+    const float scale = (W.attn_q_norm && W.attn_k_norm)
+        ? 1.0f
+        : 1.0f / std::sqrt(static_cast<float>(Dh));
     const int max_seq = static_cast<int>(buf->attn_logits.size()) / cfg.n_q_heads;
     const int swa_window = lti.sliding_window;
     const bool use_v_proj = (W.attn_v != nullptr);
@@ -272,21 +298,24 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             qkv[nqkv++] = {xn, W.attn_k, kp, cfg.hidden, kn};
             if (use_v_proj)
                 qkv[nqkv++] = {xn, W.attn_v, vp, cfg.hidden, kn};
-            matmul_gemm_batch(qkv, nqkv);
+            if (!matmul_gpu_batch(qkv, nqkv))
+                matmul_gemm_batch(qkv, nqkv);
             if (!use_v_proj)
                 std::memcpy(vp, kp, static_cast<size_t>(kn) * sizeof(float));
         }
 
-        // Q/K per-head RMSNorm (with scale weight)
+        // Q/K per-head RMSNorm when those tensors exist (Gemma). Llama files
+        // have no q/k norm tensors.
         {
             KTimer _t(KernelProf::k_qk_norm);
-            const float* qnw = reinterpret_cast<const float*>(W.attn_q_norm->data);
-            ops::rmsnorm_rows(qp, qnw, qp, Hq, Dh, cfg.rms_eps);
-            const float* knw = reinterpret_cast<const float*>(W.attn_k_norm->data);
-            ops::rmsnorm_rows(kp, knw, kp, Hk, Dh, cfg.rms_eps);
-            // V norm: RMSNorm without scale weight (always, even when V=K)
-            for (int h = 0; h < Hk; h++)
-                rmsnorm_no_scale(vp + h * Dh, vp + h * Dh, Dh, cfg.rms_eps);
+            if (W.attn_q_norm && W.attn_k_norm) {
+                const float* qnw = reinterpret_cast<const float*>(W.attn_q_norm->data);
+                ops::rmsnorm_rows(qp, qnw, qp, Hq, Dh, cfg.rms_eps);
+                const float* knw = reinterpret_cast<const float*>(W.attn_k_norm->data);
+                ops::rmsnorm_rows(kp, knw, kp, Hk, Dh, cfg.rms_eps);
+                for (int h = 0; h < Hk; h++)
+                    rmsnorm_no_scale(vp + h * Dh, vp + h * Dh, Dh, cfg.rms_eps);
+            }
         }
 
         // RoPE on Q and K only (not V)
@@ -311,12 +340,14 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             ops::rope_apply(kp, Hk, Dh, pairs, cosines, sines);
         }
 
-        // Store K/V in KV cache (pad to Dh_store if sliding layer)
+        // Store K/V only on the owning layer. Shared-KV layers reuse cache.
         {
             KTimer _t(KernelProf::k_kv_store);
-            for (int h = 0; h < Hk; h++) {
-                kv.store_k(layer, h, pos, kp + h * Dh);
-                kv.store_v(layer, h, pos, vp + h * Dh);
+            if (lti.owns_kv) {
+                for (int h = 0; h < Hk; h++) {
+                    kv.store_k(cache, h, pos, kp + h * Dh);
+                    kv.store_v(cache, h, pos, vp + h * Dh);
+                }
             }
         }
 
@@ -330,16 +361,16 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             int end = pos + 1;
             float* ao = buf->attn_out.data() + static_cast<size_t>(m) * Hq * Dh;
 
-            const KVCacheMode layer_mode = kv.mode(layer);
-            const bool ring = kv.ring(layer);
+            const KVStorageKind storage = kv.storage_kind(cache);
+            const bool ring = kv.ring(cache);
             const bool fp32_fast =
-                layer_mode == KVCacheMode::FP32 && !ring;
+                storage == KVStorageKind::FP32 && !ring;
             const bool laplace_fast =
-                (layer_mode == KVCacheMode::LAPLACE ||
-                 layer_mode == KVCacheMode::LAPLACE_Q4) && !ring;
+                (storage == KVStorageKind::Adaptive ||
+                 storage == KVStorageKind::FixedQ4) && !ring;
 
             if (laplace_fast) {
-                const bool rotated = kv.laplace_rotated(layer);
+                const bool rotated = kv.laplace_rotated(cache);
                 static thread_local std::vector<float> query_wh, output_wh;
                 size_t scratch_size = static_cast<size_t>(Hq) * Dh_store;
                 query_wh.assign(scratch_size, 0.0f);
@@ -366,7 +397,7 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
                 ThreadPool::get().parallel_for(Hk, [&](int kvh) {
                     int h0 = kvh * gqa;
                     kv.attention_batch_all_wh(
-                        layer, kvh, gqa, ends.data() + h0,
+                        cache, kvh, gqa, ends.data() + h0,
                         queries.data() + h0, scale, outputs.data() + h0,
                         start);
                     for (int hi = 0; hi < gqa; hi++) {
@@ -387,7 +418,7 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
                     float key[512];
                     float value[512];
                     for (int t = start; t < end; ++t) {
-                        kv.load_k(layer, kvh, t, key);
+                        kv.load_k(cache, kvh, t, key);
                         for (int hi = 0; hi < gqa; ++hi) {
                             const int h = h0 + hi;
                             const float* qh = qp + h * Dh;
@@ -415,7 +446,7 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
                         }
                     }
                     for (int t = start; t < end; ++t) {
-                        kv.load_v(layer, kvh, t, value);
+                        kv.load_v(cache, kvh, t, value);
                         for (int hi = 0; hi < gqa; ++hi) {
                             const int h = h0 + hi;
                             const float weight =
@@ -433,10 +464,10 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
                 // gqa query heads sharing it.
                 ThreadPool::get().parallel_for(Hk, [&](int kvh) {
                     const int h0 = kvh * gqa;
-                    const float* Kbase = fp32_fast ? kv.head_k(layer, kvh) : nullptr;
-                    const float* Vbase = fp32_fast ? kv.head_v(layer, kvh) : nullptr;
-                    const uint16_t* Kbase16 = fp32_fast ? nullptr : kv.head_k16(layer, kvh);
-                    const uint16_t* Vbase16 = fp32_fast ? nullptr : kv.head_v16(layer, kvh);
+                    const float* Kbase = fp32_fast ? kv.head_k(cache, kvh) : nullptr;
+                    const float* Vbase = fp32_fast ? kv.head_v(cache, kvh) : nullptr;
+                    const uint16_t* Kbase16 = fp32_fast ? nullptr : kv.head_k16(cache, kvh);
+                    const uint16_t* Vbase16 = fp32_fast ? nullptr : kv.head_v16(cache, kvh);
 
                     // QK^T: stream contiguous K, fused FP16 dot (no FP32 materialization).
                     for (int t = start; t < end; t++) {
@@ -493,7 +524,8 @@ void AdaptiveArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
         if (M == 1) {
             MatmulBatchSpec oproj = {buf->attn_out.data(), W.attn_output, buf->xb.data(),
                                      Hq * Dh, cfg.hidden};
-            matmul_gemm_batch(&oproj, 1);
+            if (!matmul_gpu_batch(&oproj, 1))
+                matmul_gemm_batch(&oproj, 1);
         } else {
             matmul_rows(buf->attn_out.data(), *W.attn_output, buf->xb.data(),
                         M, Hq * Dh, cfg.hidden);
@@ -560,48 +592,58 @@ void AdaptiveArch::moe_ffn(const LayerWeights& W, const ModelConfig& cfg,
             down_scale = reinterpret_cast<const float*>(W.moe_down_exps_scale->data);
         }
 
-        // Expert input: pre_ffw_norm_2(residual)
+        const uint8_t* up_bases[16] = {};
+        const uint8_t* dn_bases[16] = {};
+        int local[16];
+        const Tensor* up_w = W.moe_gate_up_exps;
+        const Tensor* dn_w = W.moe_down_exps;
+        const int* gemv_idx = top_idx;
+        const uint8_t* const* up_b = nullptr;
+        const uint8_t* const* dn_b = nullptr;
+        if (LaplaceMoE::streaming_enabled()) {
+            int order[16];
+            for (int k = 0; k < top_k; k++) order[k] = k;
+            std::sort(order, order + top_k, [&](int a, int b) {
+                return top_idx[a] < top_idx[b];
+            });
+            int sorted_idx[16];
+            float sorted_w[16];
+            for (int t = 0; t < top_k; t++) {
+                sorted_idx[t] = top_idx[order[t]];
+                sorted_w[t] = top_w[order[t]];
+            }
+            for (int k = 0; k < top_k; k++) {
+                top_idx[k] = sorted_idx[k];
+                top_w[k] = sorted_w[k];
+                local[k] = k;
+            }
+            gemv_idx = local;
+            up_b = up_bases;
+            dn_b = dn_bases;
+            LaplaceMoE::load_experts(*W.moe_gate_up_exps, top_idx, top_k,
+                                     nullptr, up_bases);
+            LaplaceMoE::load_experts(*W.moe_down_exps, top_idx, top_k,
+                                     nullptr, dn_bases);
+        }
         {
             KTimer _t(KernelProf::k_moe_pre_norm);
             const float* pn2w = reinterpret_cast<const float*>(W.pre_ffw_norm_2->data);
             ops::rmsnorm(x, pn2w, moe_in, H, cfg.rms_eps);
         }
-
-        {
-            KTimer _t(KernelProf::k_moe_prefetch_gu);
-            if (LaplaceMoE::streaming_enabled()) {
-                LaplaceMoE::acquire(W.moe_gate_up_exps, top_idx, top_k);
-            }
-        }
-
-        ExpertAcquireTicket down_ticket;
         {
             KTimer _t(KernelProf::k_moe_gate_up);
-
-            if (LaplaceMoE::streaming_enabled()) {
-                KTimer _t2(KernelProf::k_moe_prefetch_dn);
-                down_ticket =
-                    LaplaceMoE::prefetch(W.moe_down_exps, top_idx, top_k);
-            }
-
             fused_moe_gate_up_geglu(
-                moe_in, *W.moe_gate_up_exps, hidden_bufs.data(),
-                top_idx, top_k, H, exp_inter);
-
-            if (LaplaceMoE::streaming_enabled()) {
-                KTimer _t2(KernelProf::k_moe_gate_wait);
-                LaplaceMoE::wait(down_ticket);
-            }
+                moe_in, *up_w, hidden_bufs.data(),
+                gemv_idx, top_k, H, exp_inter, up_b);
         }
-
         float route_weight[16];
         for (int k = 0; k < top_k; k++)
             route_weight[k] = top_w[k] * down_scale[top_idx[k]];
         {
             KTimer _t(KernelProf::k_moe_down);
             fused_moe_down_accumulate(
-                hidden_bufs.data(), *W.moe_down_exps, top_idx,
-                route_weight, top_k, exp_inter, H, out);
+                hidden_bufs.data(), *dn_w, gemv_idx,
+                route_weight, top_k, exp_inter, H, out, dn_b);
         }
     }
 }
@@ -615,6 +657,92 @@ void AdaptiveArch::forward_layer(int layer, const LayerWeights& W, const ModelCo
 
     // Token boundary: trigger per-100-token report when layer wraps to 0.
     if (layer == 0) g_kprof.maybe_print();
+
+    TokenGraphBackend& token_graph = active_token_graph_backend();
+    if (M == 1 && token_graph.active()) {
+        if (layer == 0 && pos0 > 0 && metal_tok_kv_needs_seed()) {
+            static thread_local std::vector<float> kpack, vpack;
+            std::vector<char> seen(cfg.n_layers, 0);
+            for (int i = 0; i < cfg.n_layers; i++) {
+                if (!layer_types_[i].owns_kv) continue;
+                int cid = (i < (int)kv_layer_idx_.size() && kv_layer_idx_[i] >= 0)
+                    ? kv_layer_idx_[i] : i;
+                if (cid < 0 || cid >= cfg.n_layers || seen[cid]) continue;
+                seen[cid] = 1;
+                const int Hk = layer_types_[i].n_kv_heads;
+                const int Dh = layer_types_[i].head_dim;
+                const int kn = Hk * Dh;
+                if ((int)kpack.size() < kn) {
+                    kpack.resize(kn);
+                    vpack.resize(kn);
+                }
+                for (int t = 0; t < pos0; t++) {
+                    for (int h = 0; h < Hk; h++) {
+                        kv.load_k(cid, h, t, kpack.data() + h * Dh);
+                        kv.load_v(cid, h, t, vpack.data() + h * Dh);
+                    }
+                    metal_tok_import_kv(cid, t, kpack.data(), vpack.data(), kn);
+                }
+            }
+        }
+        MetalTokLayer L;
+        L.attn_norm = W.attn_norm;
+        L.attn_q = W.attn_q;
+        L.attn_k = W.attn_k;
+        L.attn_v = W.attn_v;
+        L.attn_o = W.attn_output;
+        L.q_norm = W.attn_q_norm;
+        L.k_norm = W.attn_k_norm;
+        L.post_attn_norm = W.post_attn_norm;
+        L.ffn_norm = W.ffn_norm;
+        L.ffn_gate = W.ffn_gate;
+        L.ffn_up = W.ffn_up;
+        L.ffn_down = W.ffn_down;
+        L.moe_gate = W.moe_gate_inp;
+        L.moe_gate_scale = W.moe_gate_inp_scale;
+        L.moe_up = W.moe_gate_up_exps;
+        L.moe_dn = W.moe_down_exps;
+        L.moe_dn_scale = W.moe_down_exps_scale;
+        L.pre_ffw_2 = W.pre_ffw_norm_2;
+        L.post_ffw_1 = W.post_ffw_norm_1;
+        L.post_ffw_2 = W.post_ffw_norm_2;
+        L.post_ffw = W.post_ffw_norm;
+        L.out_scale = W.layer_output_scale;
+        L.rope_freqs = rope_freqs_full_.empty() ? nullptr : rope_freqs_full_.data();
+        L.n_rope_freqs = (int)rope_freqs_full_.size();
+        L.H = H;
+        L.inter = lti.intermediate > 0 ? lti.intermediate : cfg.intermediate;
+        L.exp_inter = cfg.expert_inter;
+        L.n_experts = cfg.n_experts;
+        L.n_used = cfg.n_experts_used;
+        L.Hq = lti.n_q_heads;
+        L.Hk = lti.n_kv_heads;
+        L.Dh = lti.head_dim;
+        L.rope_dim = lti.rope_dim;
+        L.window = lti.sliding_window;
+        L.cache_id = (layer >= 0 && layer < (int)kv_layer_idx_.size() &&
+                      kv_layer_idx_[layer] >= 0)
+            ? kv_layer_idx_[layer] : layer;
+        L.rope_base = lti.rope_base;
+        L.attention_scale = 1.0f / std::sqrt(static_cast<float>(L.Dh));
+        L.rms_eps = cfg.rms_eps;
+        L.swiglu = lti.swiglu;
+        L.owns_kv = lti.owns_kv;
+        L.is_global = lti.is_global;
+        if (token_graph.layer(L)) {
+            static const bool tok_timing =
+                std::getenv("LAPLACE_TOK_TIMING") != nullptr;
+            if (tok_timing) {
+                double ms = 0;
+                metal_tok_flush(&ms);
+                fprintf(stderr, "[tok-timing] layer %d: %.3f ms\n", layer, ms);
+            }
+            return;
+        }
+        fprintf(stderr, "[metal] tok_layer %d failed\n", layer);
+        token_graph.abort();
+        return;
+    }
 
     // Pre-attention RMSNorm
     {
@@ -630,14 +758,16 @@ void AdaptiveArch::forward_layer(int layer, const LayerWeights& W, const ModelCo
     // Attention sub-block
     attention_batch(layer, M, pos0, kv, W, lti, cfg, buf);
 
-    // Post-attention norm on attention output, then residual add
+    // Post-attention norm on attention output when present, then residual.
     {
         KTimer _t(KernelProf::k_post_attn_norm);
         for (int m = 0; m < M; m++) {
-            ops::rmsnorm(buf->xb.data() + static_cast<size_t>(m) * H,
-                         reinterpret_cast<const float*>(W.post_attn_norm->data),
-                         buf->xb.data() + static_cast<size_t>(m) * H,
-                         H, cfg.rms_eps);
+            if (W.post_attn_norm) {
+                ops::rmsnorm(buf->xb.data() + static_cast<size_t>(m) * H,
+                             reinterpret_cast<const float*>(W.post_attn_norm->data),
+                             buf->xb.data() + static_cast<size_t>(m) * H,
+                             H, cfg.rms_eps);
+            }
             for (int j = 0; j < H; j++)
                 buf->x[static_cast<size_t>(m) * H + j] += buf->xb[static_cast<size_t>(m) * H + j];
         }
@@ -647,6 +777,7 @@ void AdaptiveArch::forward_layer(int layer, const LayerWeights& W, const ModelCo
     const bool has_moe = (W.moe_gate_inp != nullptr);
 
     // Dense FFN: ffn_norm(attn_out) -> gate/up -> geglu -> down
+    const int inter = lti.intermediate > 0 ? lti.intermediate : cfg.intermediate;
     {
         KTimer _t(KernelProf::k_ffn_norm);
         for (int m = 0; m < M; m++) {
@@ -656,38 +787,127 @@ void AdaptiveArch::forward_layer(int layer, const LayerWeights& W, const ModelCo
                          H, cfg.rms_eps);
         }
     }
+
+    bool gpu_ffn_moe = false;
+    if (M == 1 && has_moe && W.ffn_gate && W.ffn_up && W.ffn_down &&
+        W.moe_gate_up_exps && W.moe_down_exps && matmul_gpu_available()) {
+        const int n_exp = cfg.n_experts;
+        const int top_k = cfg.n_experts_used;
+        const int exp_inter = cfg.expert_inter;
+        const float inv_sqrt_h = 1.0f / std::sqrt(static_cast<float>(H));
+        static thread_local std::vector<float> rtmp, moe_in_buf;
+        if ((int)rtmp.size() < H) rtmp.resize(H);
+        if ((int)moe_in_buf.size() < H) moe_in_buf.resize(H);
+        float* tmp = rtmp.data();
+        rmsnorm_no_scale(buf->x.data(), tmp, H, cfg.rms_eps);
+        const float* gate_scale =
+            reinterpret_cast<const float*>(W.moe_gate_inp_scale->data);
+        for (int i = 0; i < H; i++) tmp[i] *= gate_scale[i] * inv_sqrt_h;
+        float* logits = buf->moe_router_logits.data();
+        MatmulBatchSpec router_spec = {tmp, W.moe_gate_inp, logits, H, n_exp};
+        matmul_gemm_batch(&router_spec, 1);
+        float maxl = logits[0];
+        for (int e = 1; e < n_exp; e++) if (logits[e] > maxl) maxl = logits[e];
+        float suml = 0.0f;
+        for (int e = 0; e < n_exp; e++) {
+            logits[e] = std::exp(logits[e] - maxl);
+            suml += logits[e];
+        }
+        for (int e = 0; e < n_exp; e++) logits[e] /= suml;
+        int top_idx[16];
+        float top_w[16];
+        for (int k = 0; k < top_k; k++) {
+            int best = 0;
+            for (int e = 1; e < n_exp; e++) if (logits[e] > logits[best]) best = e;
+            top_idx[k] = best;
+            top_w[k] = logits[best];
+            logits[best] = -1e30f;
+        }
+        float wsum = 0.0f;
+        for (int k = 0; k < top_k; k++) wsum += top_w[k];
+        for (int k = 0; k < top_k; k++) top_w[k] /= wsum;
+        const float* down_scale =
+            reinterpret_cast<const float*>(W.moe_down_exps_scale->data);
+        const uint8_t* up_bases[16] = {};
+        const uint8_t* dn_bases[16] = {};
+        if (LaplaceMoE::streaming_enabled()) {
+            int order[16];
+            for (int k = 0; k < top_k; k++) order[k] = k;
+            std::sort(order, order + top_k, [&](int a, int b) {
+                return top_idx[a] < top_idx[b];
+            });
+            int sorted_idx[16];
+            float sorted_w[16];
+            for (int t = 0; t < top_k; t++) {
+                sorted_idx[t] = top_idx[order[t]];
+                sorted_w[t] = top_w[order[t]];
+            }
+            for (int k = 0; k < top_k; k++) {
+                top_idx[k] = sorted_idx[k];
+                top_w[k] = sorted_w[k];
+            }
+            LaplaceMoE::load_experts(*W.moe_gate_up_exps, top_idx, top_k,
+                                     nullptr, up_bases);
+            LaplaceMoE::load_experts(*W.moe_down_exps, top_idx, top_k,
+                                     nullptr, dn_bases);
+        }
+        ops::rmsnorm(buf->x.data(),
+                     reinterpret_cast<const float*>(W.pre_ffw_norm_2->data),
+                     moe_in_buf.data(), H, cfg.rms_eps);
+        float route_w[16];
+        for (int k = 0; k < top_k; k++)
+            route_w[k] = top_w[k] * down_scale[top_idx[k]];
+        (void)up_bases;
+        (void)dn_bases;
+        gpu_ffn_moe = matmul_decode_ffn_moe(
+            buf->x_norm.data(), *W.ffn_gate, *W.ffn_up, *W.ffn_down,
+            buf->xb.data(), H, inter, lti.swiglu,
+            moe_in_buf.data(), W.moe_gate_up_exps, W.moe_down_exps,
+            top_idx, top_k, exp_inter, route_w,
+            buf->moe_expert_out.data());
+    }
+
+    if (!gpu_ffn_moe) {
     {
         KTimer _t(KernelProf::k_ffn_gate_up);
         if (M == 1) {
             MatmulBatchSpec ffn[2] = {
-                {buf->x_norm.data(), W.ffn_gate, buf->ffn_gate.data(), H, cfg.intermediate},
-                {buf->x_norm.data(), W.ffn_up,   buf->ffn_up.data(),   H, cfg.intermediate},
+                {buf->x_norm.data(), W.ffn_gate, buf->ffn_gate.data(), H, inter},
+                {buf->x_norm.data(), W.ffn_up,   buf->ffn_up.data(),   H, inter},
             };
-            matmul_gemm_batch(ffn, 2);
+            if (!matmul_gpu_batch(ffn, 2))
+                matmul_gemm_batch(ffn, 2);
         } else {
-            matmul_rows(buf->x_norm.data(), *W.ffn_gate, buf->ffn_gate.data(), M, H, cfg.intermediate);
-            matmul_rows(buf->x_norm.data(), *W.ffn_up,   buf->ffn_up.data(),   M, H, cfg.intermediate);
+            matmul_rows(buf->x_norm.data(), *W.ffn_gate, buf->ffn_gate.data(), M, H, inter);
+            matmul_rows(buf->x_norm.data(), *W.ffn_up,   buf->ffn_up.data(),   M, H, inter);
         }
     }
     {
         KTimer _t(KernelProf::k_geglu_dense);
-        ops::geglu(buf->ffn_gate.data(), buf->ffn_up.data(), buf->ffn_hidden.data(),
-                   M * cfg.intermediate);
+        if (lti.swiglu) {
+            ops::swiglu(buf->ffn_gate.data(), buf->ffn_up.data(), buf->ffn_hidden.data(),
+                        M * inter);
+        } else {
+            ops::geglu(buf->ffn_gate.data(), buf->ffn_up.data(), buf->ffn_hidden.data(),
+                       M * inter);
+        }
     }
-
     {
         KTimer _t(KernelProf::k_ffn_down);
         if (M == 1) {
             MatmulBatchSpec dproj = {buf->ffn_hidden.data(), W.ffn_down, buf->xb.data(),
-                                     cfg.intermediate, H};
-            matmul_gemm_batch(&dproj, 1);
+                                     inter, H};
+            if (!matmul_gpu_batch(&dproj, 1))
+                matmul_gemm_batch(&dproj, 1);
         } else {
-            matmul_rows(buf->ffn_hidden.data(), *W.ffn_down, buf->xb.data(), M, cfg.intermediate, H);
+            matmul_rows(buf->ffn_hidden.data(), *W.ffn_down, buf->xb.data(), M, inter, H);
         }
     }
+    if (has_moe)
+        moe_ffn(W, cfg, M, buf->x.data(), buf);
+    } // !gpu_ffn_moe
 
     if (has_moe) {
-        // Post-norm on dense FFN output
         {
             KTimer _t(KernelProf::k_post_ffw_norm_1);
             for (int m = 0; m < M; m++) {
@@ -697,8 +917,6 @@ void AdaptiveArch::forward_layer(int layer, const LayerWeights& W, const ModelCo
                              H, cfg.rms_eps);
             }
         }
-        // MoE: router operates on x (the residual), expert input is pre_ffw_norm_2(x)
-        moe_ffn(W, cfg, M, buf->x.data(), buf);
 
         // Post-norm on MoE output
         {
@@ -729,14 +947,11 @@ void AdaptiveArch::forward_layer(int layer, const LayerWeights& W, const ModelCo
         }
     }
 
-    // Residual add: x = attn_out + ffn_out
     {
         KTimer _t(KernelProf::k_residual_add);
         for (size_t j = 0; j < static_cast<size_t>(M) * H; j++)
             buf->x[j] += buf->xb[j];
     }
-
-    // Layer output scale
     if (W.layer_output_scale) {
         KTimer _t(KernelProf::k_layer_out_scale);
         float s = reinterpret_cast<const float*>(W.layer_output_scale->data)[0];

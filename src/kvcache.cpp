@@ -533,7 +533,7 @@ bool KVCache::init(int n_layers, int n_kv_heads, int head_dim, int capacity,
         return laplace_q4_->init(
             n_layers, n_kv_heads, head_dim, capacity, streaming_);
     }
-    laplace_ = std::make_unique<LaplaceKV>();
+    laplace_ = std::make_unique<LaplaceKVAdaptive>();
     return laplace_->init(
         n_layers, n_kv_heads, head_dim, capacity, streaming_);
 }
@@ -614,6 +614,18 @@ KVCacheMode KVCache::mode(int layer) const {
     return cache ? cache->mode() : mode_;
 }
 
+KVStorageKind KVCache::storage_kind() const {
+    if (laplace_) return KVStorageKind::Adaptive;
+    if (laplace_q4_) return KVStorageKind::FixedQ4;
+    return mode_ == KVCacheMode::FP32 ? KVStorageKind::FP32
+                                      : KVStorageKind::FP16;
+}
+
+KVStorageKind KVCache::storage_kind(int layer) const {
+    const KVCache* cache = layer_cache(layer);
+    return cache ? cache->storage_kind() : storage_kind();
+}
+
 int KVCache::capacity(int layer) const {
     const KVCache* cache = layer_cache(layer);
     return cache ? cache->capacity() : capacity_;
@@ -684,6 +696,37 @@ uint64_t KVCache::archive_write_bytes() const {
     return total;
 }
 
+uint64_t KVCache::q4_tiles() const {
+    if (layer_caches_.empty()) return laplace_ ? laplace_->q4_tiles() : 0;
+    uint64_t total = 0;
+    for (const auto& cache : layer_caches_) total += cache->q4_tiles();
+    return total;
+}
+
+uint64_t KVCache::k8_tiles() const {
+    if (layer_caches_.empty()) return laplace_ ? laplace_->k8_tiles() : 0;
+    uint64_t total = 0;
+    for (const auto& cache : layer_caches_) total += cache->k8_tiles();
+    return total;
+}
+
+uint64_t KVCache::fp16_tiles() const {
+    if (layer_caches_.empty()) return laplace_ ? laplace_->fp16_tiles() : 0;
+    uint64_t total = 0;
+    for (const auto& cache : layer_caches_) total += cache->fp16_tiles();
+    return total;
+}
+
+LaplaceKVAdaptiveFormat KVCache::tile_format(
+        int layer, int head, int tile) const {
+    if (const KVCache* cache = layer_cache(layer)) {
+        return cache->tile_format(0, head, tile);
+    }
+    return laplace_
+         ? laplace_->tile_format(layer, head, tile)
+         : LaplaceKVAdaptiveFormat::MUTABLE;
+}
+
 size_t KVCache::encoded_bytes(int n_tokens) const {
     if (!layer_caches_.empty()) {
         size_t total = 0;
@@ -699,6 +742,19 @@ size_t KVCache::encoded_bytes(int n_tokens) const {
                          ? sizeof(uint16_t) : sizeof(float);
     return static_cast<size_t>(n_layers_) * n_kv_heads_ * tokens
          * head_dim_ * 2 * element_bytes;
+}
+
+size_t KVCache::logical_scalars(int n_tokens) const {
+    if (!layer_caches_.empty()) {
+        size_t total = 0;
+        for (const auto& cache : layer_caches_) {
+            total += cache->logical_scalars(n_tokens);
+        }
+        return total;
+    }
+    int tokens = std::clamp(n_tokens, 0, capacity_);
+    return static_cast<size_t>(n_layers_) * n_kv_heads_ * tokens
+         * head_dim_ * 2;
 }
 
 size_t KVCache::storage_bytes() const {
@@ -1150,13 +1206,15 @@ const uint16_t* KVCache::head_k16(int layer, int head) const {
     if (const KVCache* cache = layer_cache(layer)) {
         return cache->head_k16(0, head);
     }
-    return k16_.data() + slot_index(layer, head, 0);
+    return storage_kind() == KVStorageKind::FP16
+        ? k16_.data() + slot_index(layer, head, 0) : nullptr;
 }
 const uint16_t* KVCache::head_v16(int layer, int head) const {
     if (const KVCache* cache = layer_cache(layer)) {
         return cache->head_v16(0, head);
     }
-    return v16_.data() + slot_index(layer, head, 0);
+    return storage_kind() == KVStorageKind::FP16
+        ? v16_.data() + slot_index(layer, head, 0) : nullptr;
 }
 
 } // namespace Laplace

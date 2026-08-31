@@ -162,9 +162,11 @@ void Phi3Arch::forward_layer(int layer, const LayerWeights& W, const ModelConfig
     //    variant is downloaded.
     const float scale = 1.0f / std::sqrt(static_cast<float>(Dh));
     const int max_seq = static_cast<int>(buf->attn_logits.size()) / cfg.n_q_heads;
-    const bool laplace_fast = kv.mode() == KVCacheMode::LAPLACE;
+    const KVStorageKind storage = kv.storage_kind();
+    const bool laplace_fast = storage == KVStorageKind::Adaptive ||
+                              storage == KVStorageKind::FixedQ4;
     const bool laplace_rotated = laplace_fast && kv.laplace_rotated();
-    const bool fp32_fast = kv.mode() == KVCacheMode::FP32;
+    const bool fp32_fast = storage == KVStorageKind::FP32;
 
     for (int m = 0; m < M; m++) {
         const int pos = pos0 + m;

@@ -1,20 +1,19 @@
-// laplace_moe.cpp - Mac M-series SSD expert streaming
+// laplace_moe.cpp - GEMV from the file map; WILLNEED on first touch
 #include "laplace_moe.h"
 
 #include <algorithm>
-#include <cerrno>
+#include <atomic>
 #include <climits>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
-#include <deque>
-#include <memory>
+#include <cstring>
 #include <mutex>
-#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #ifdef __APPLE__
+#include <fcntl.h>
 #include <sys/mman.h>
 #endif
 
@@ -25,131 +24,105 @@ namespace Laplace {
 bool LaplaceMoE::streaming_enabled_ = false;
 
 struct ExpertAcquireState {
-    std::mutex mutex;
-    std::condition_variable complete;
     ExpertAcquireStats stats;
     int pending = 0;
 };
 
 namespace {
-int g_file_fd = -1;
+int g_direct_fd = -1;
 const uint8_t* g_mmap_base = nullptr;
 int g_io_threads = 4;
-const size_t IO_CHUNK = 1 << 20;
 
-struct ExpertIoJob {
-    const Tensor* tensor = nullptr;
-    int expert = 0;
-    size_t bytes = 0;
-    std::shared_ptr<ExpertAcquireState> state;
+struct Key {
+    const Tensor* tensor;
+    int id;
+    bool operator==(const Key& o) const {
+        return tensor == o.tensor && id == o.id;
+    }
 };
 
-void read_expert(const ExpertIoJob& job, std::vector<uint8_t>* scratch) {
-    const uint8_t* source = LaplaceMoE::expert_data(
-        job.tensor, job.expert);
-    if (g_file_fd >= 0 && g_mmap_base &&
-        source >= g_mmap_base) {
-        const off_t file_offset =
-            static_cast<off_t>(source - g_mmap_base);
-        scratch->resize(std::min(IO_CHUNK, job.bytes));
-        size_t offset = 0;
-        while (offset < job.bytes) {
-            const size_t count =
-                std::min(scratch->size(), job.bytes - offset);
-            const ssize_t result = pread(
-                g_file_fd, scratch->data(), count,
-                file_offset + static_cast<off_t>(offset));
-            if (result > 0) {
-                offset += static_cast<size_t>(result);
-            } else if (result < 0 && errno == EINTR) {
-                continue;
-            } else {
-                break;
-            }
-        }
-        return;
+struct KeyHash {
+    size_t operator()(const Key& k) const {
+        return std::hash<const Tensor*>{}(k.tensor) ^
+               (static_cast<size_t>(k.id) * 0x9e3779b97f4a7c15ull);
     }
+};
 
-    const long page_result = sysconf(_SC_PAGESIZE);
-    const size_t page =
-        page_result > 0 ? static_cast<size_t>(page_result) : 4096;
-    const volatile uint8_t* bytes = source;
-    for (size_t offset = 0; offset < job.bytes; offset += page) {
-        (void)bytes[offset];
+std::unordered_set<Key, KeyHash> g_seen;
+std::mutex g_mu;
+size_t g_budget = 0;
+int g_current_token = 0;
+std::atomic<size_t> g_hits{0};
+std::atomic<size_t> g_misses{0};
+std::atomic<size_t> g_bytes{0};
+
+struct PackedView {
+    std::vector<uint8_t> data;
+};
+std::unordered_map<const Tensor*, PackedView> g_views;
+
+struct StageReport {
+    ~StageReport() {
+        const size_t hits = g_hits.load();
+        const size_t misses = g_misses.load();
+        const size_t bytes = g_bytes.load();
+        if (hits + misses == 0) return;
+        fprintf(stderr, "moe-stage: %zu hits, %zu misses, %.2f GB advised\n",
+                hits, misses, bytes / 1e9);
     }
-    if (job.bytes) (void)bytes[job.bytes - 1];
+};
+StageReport g_stage_report;
+
+void close_direct_fd() {
+    if (g_direct_fd >= 0) {
+        ::close(g_direct_fd);
+        g_direct_fd = -1;
+    }
 }
 
-class ExpertIoPool {
-public:
-    ExpertIoPool() {
-        const int count = std::clamp(g_io_threads, 1, 32);
-        workers_.reserve(count);
-        for (int i = 0; i < count; ++i) {
-            workers_.emplace_back([this] { worker(); });
-        }
+void advise_slice(const Tensor* tensor, int expert) {
+#ifdef __APPLE__
+    if (!tensor || !tensor->data || expert < 0) return;
+    if (tensor->n_dims < 3 ||
+        static_cast<uint64_t>(expert) >= tensor->dims[2]) return;
+    const uint8_t* p = LaplaceMoE::expert_data(tensor, expert);
+    const size_t n = LaplaceMoE::per_expert_bytes(tensor);
+    (void)madvise(const_cast<uint8_t*>(p), n, MADV_WILLNEED);
+    if (g_direct_fd >= 0 && g_mmap_base && p >= g_mmap_base) {
+        struct radvisory ra;
+        ra.ra_offset = static_cast<off_t>(p - g_mmap_base);
+        ra.ra_count = n > static_cast<size_t>(INT_MAX)
+                          ? INT_MAX
+                          : static_cast<int>(n);
+        (void)fcntl(g_direct_fd, F_RDADVISE, &ra);
     }
+#else
+    (void)tensor;
+    (void)expert;
+#endif
+}
 
-    ~ExpertIoPool() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-        }
-        ready_.notify_all();
-        for (std::thread& worker : workers_) worker.join();
-    }
-
-    void submit(ExpertIoJob job) {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            jobs_.push_back(std::move(job));
-        }
-        ready_.notify_one();
-    }
-
-    int worker_count() const {
-        return static_cast<int>(workers_.size());
-    }
-
-private:
-    void worker() {
-        std::vector<uint8_t> scratch;
-        while (true) {
-            ExpertIoJob job;
-            {
-                std::unique_lock<std::mutex> lock(mutex_);
-                ready_.wait(lock, [&] {
-                    return stopping_ || !jobs_.empty();
-                });
-                if (stopping_ && jobs_.empty()) return;
-                job = std::move(jobs_.front());
-                jobs_.pop_front();
-            }
-            read_expert(job, &scratch);
-            {
-                std::lock_guard<std::mutex> lock(job.state->mutex);
-                job.state->stats.bytes_read += job.bytes;
-                job.state->pending--;
-            }
-            job.state->complete.notify_all();
-        }
-    }
-
-    mutable std::mutex mutex_;
-    std::condition_variable ready_;
-    std::deque<ExpertIoJob> jobs_;
-    std::vector<std::thread> workers_;
-    bool stopping_ = false;
-};
-
-ExpertIoPool& io_pool() {
-    static ExpertIoPool pool;
-    return pool;
+void fill_dest(Tensor* dest, const Tensor& src, uint8_t* data, int n) {
+    dest->name = src.name;
+    dest->type = src.type;
+    dest->n_dims = 3;
+    dest->dims[0] = src.dims[0];
+    dest->dims[1] = src.dims[1];
+    dest->dims[2] = static_cast<uint64_t>(n);
+    dest->dims[3] = 0;
+    dest->data = data;
+    dest->scales = src.scales;
+    dest->biases = src.biases;
+    dest->mlx_bits = src.mlx_bits;
+    dest->mlx_group_size = src.mlx_group_size;
 }
 } // namespace
 
 void LaplaceMoE::set_file_fd(int fd) {
-    g_file_fd = fd;
+    close_direct_fd();
+#ifdef __APPLE__
+    if (fd >= 0) g_direct_fd = ::dup(fd);
+#endif
     if (const char* env = std::getenv("LAPLACE_IO_THREADS")) {
         int n = std::atoi(env);
         if (n > 0 && n <= 32) g_io_threads = n;
@@ -160,22 +133,7 @@ void LaplaceMoE::set_mmap_base(const uint8_t* base) {
     g_mmap_base = base;
 }
 
-namespace {
-struct CacheEntry {
-    size_t bytes = 0;
-    int last_accessed = 0;
-    bool locked = false;
-};
-std::unordered_map<const uint8_t*, std::unordered_map<int, CacheEntry>> g_cache;
-size_t g_budget = 0;
-size_t g_usage = 0;
-int g_current_token = 0;
-std::mutex g_cache_mutex;
-bool g_mlock_ok = true;
-} // namespace
-
 size_t LaplaceMoE::per_expert_bytes(const Tensor* tensor) {
-    // 3D tensor: dims[2] is the expert count. Each expert is dims[0]*dims[1].
     if (tensor->n_dims < 3) return tensor->nbytes();
     return tensor->nbytes() / tensor->dims[2];
 }
@@ -184,70 +142,92 @@ const uint8_t* LaplaceMoE::expert_data(const Tensor* tensor, int expert_idx) {
     return tensor->data + static_cast<size_t>(expert_idx) * per_expert_bytes(tensor);
 }
 
+void LaplaceMoE::drop_mmap(const Tensor* tensor) {
+#ifdef __APPLE__
+    if (!tensor || !tensor->data) return;
+    const size_t n = tensor->nbytes();
+    if (n == 0) return;
+    (void)madvise(const_cast<uint8_t*>(tensor->data), n, MADV_DONTNEED);
+#else
+    (void)tensor;
+#endif
+}
+
+void LaplaceMoE::hint(const Tensor* tensor, int expert_idx) {
+    advise_slice(tensor, expert_idx);
+}
+
+ExpertAcquireStats LaplaceMoE::load_experts(
+        const Tensor& src, const int* ids, int n, Tensor* dest,
+        const uint8_t** bases) {
+    ExpertAcquireStats stats;
+    if (dest) *dest = Tensor{};
+    if (!src.data || !ids || n <= 0 || src.n_dims < 3 || src.dims[2] == 0)
+        return stats;
+
+    const size_t bytes = per_expert_bytes(&src);
+    std::vector<const uint8_t*> got(static_cast<size_t>(n), nullptr);
+
+    for (int i = 0; i < n; ++i) {
+        const int id = ids[i];
+        if (id < 0 || static_cast<uint64_t>(id) >= src.dims[2]) {
+            stats.invalid++;
+            continue;
+        }
+        stats.requested++;
+        const uint8_t* p = expert_data(&src, id);
+        got[static_cast<size_t>(i)] = p;
+
+        bool hit = false;
+        if (g_budget > 0) {
+            std::lock_guard<std::mutex> lock(g_mu);
+            Key key{&src, id};
+            hit = !g_seen.insert(key).second;
+        }
+        if (hit) {
+            stats.hits++;
+        } else {
+            stats.misses++;
+            stats.bytes_read += bytes;
+            advise_slice(&src, id);
+        }
+    }
+
+    g_hits += static_cast<size_t>(stats.hits);
+    g_misses += static_cast<size_t>(stats.misses);
+    g_bytes += stats.bytes_read;
+
+    if (bases) {
+        for (int i = 0; i < n; ++i) bases[i] = got[static_cast<size_t>(i)];
+    }
+    if (dest) {
+        PackedView& view = g_views[&src];
+        view.data.resize(static_cast<size_t>(n) * bytes);
+        for (int i = 0; i < n; ++i) {
+            if (!got[static_cast<size_t>(i)]) continue;
+            std::memcpy(view.data.data() + static_cast<size_t>(i) * bytes,
+                        got[static_cast<size_t>(i)], bytes);
+        }
+        fill_dest(dest, src, view.data.data(), n);
+    }
+    return stats;
+}
+
 ExpertAcquireTicket LaplaceMoE::prefetch(
         const Tensor* tensor, const int* expert_idx, int n) {
     auto state = std::make_shared<ExpertAcquireState>();
-    if (!tensor || !tensor->data || !expert_idx || n <= 0 ||
-        tensor->n_dims < 3 || tensor->dims[2] == 0) {
+    if (!tensor) {
         state->stats.invalid = std::max(n, 0);
         return ExpertAcquireTicket(std::move(state));
     }
-
-    const size_t bytes = per_expert_bytes(tensor);
-    std::vector<ExpertIoJob> jobs;
-    for (int i = 0; i < n; ++i) {
-        const int id = expert_idx[i];
-        if (id < 0 || static_cast<uint64_t>(id) >= tensor->dims[2]) {
-            state->stats.invalid++;
-            continue;
-        }
-        state->stats.requested++;
-
-        bool resident = false;
-        {
-            std::lock_guard<std::mutex> lock(g_cache_mutex);
-            auto tensor_it = g_cache.find(tensor->data);
-            if (tensor_it != g_cache.end()) {
-                auto expert_it = tensor_it->second.find(id);
-                resident = expert_it != tensor_it->second.end() &&
-                           expert_it->second.locked;
-                if (resident) {
-                    expert_it->second.last_accessed = g_current_token;
-                }
-            }
-        }
-        if (resident) {
-            state->stats.hits++;
-            continue;
-        }
-
-        touch_expert(tensor, id);
-        {
-            std::lock_guard<std::mutex> lock(g_cache_mutex);
-            auto tensor_it = g_cache.find(tensor->data);
-            if (tensor_it != g_cache.end()) {
-                auto expert_it = tensor_it->second.find(id);
-                resident = expert_it != tensor_it->second.end() &&
-                           expert_it->second.locked;
-            }
-        }
-        state->stats.misses++;
-        if (!resident) {
-            jobs.push_back({tensor, id, bytes, state});
-        }
-    }
-    state->pending = static_cast<int>(jobs.size());
-    for (ExpertIoJob& job : jobs) io_pool().submit(std::move(job));
+    Tensor dest;
+    state->stats = load_experts(*tensor, expert_idx, n, &dest, nullptr);
+    state->pending = 0;
     return ExpertAcquireTicket(std::move(state));
 }
 
-ExpertAcquireStats LaplaceMoE::wait(
-        const ExpertAcquireTicket& ticket) {
+ExpertAcquireStats LaplaceMoE::wait(const ExpertAcquireTicket& ticket) {
     if (!ticket.state_) return {};
-    std::unique_lock<std::mutex> lock(ticket.state_->mutex);
-    ticket.state_->complete.wait(lock, [&] {
-        return ticket.state_->pending == 0;
-    });
     return ticket.state_->stats;
 }
 
@@ -257,98 +237,26 @@ ExpertAcquireStats LaplaceMoE::acquire(
 }
 
 int LaplaceMoE::io_worker_count() {
-    return io_pool().worker_count();
+    return g_io_threads;
 }
 
 void LaplaceMoE::set_cache_budget(size_t bytes) {
-    std::lock_guard<std::mutex> lock(g_cache_mutex);
+    std::lock_guard<std::mutex> lock(g_mu);
     g_budget = bytes;
+    if (bytes == 0) g_seen.clear();
 }
 
 void LaplaceMoE::set_current_token(int n) {
-    std::lock_guard<std::mutex> lock(g_cache_mutex);
     g_current_token = n;
 }
 
 void LaplaceMoE::touch_expert(const Tensor* tensor, int expert_idx) {
-#ifdef __APPLE__
-    if (!tensor || !tensor->data) return;
-    if (g_budget == 0 || !g_mlock_ok) return;
-
-    size_t sz = per_expert_bytes(tensor);
-    const uint8_t* key = tensor->data;
-
-    std::lock_guard<std::mutex> lock(g_cache_mutex);
-
-    auto& experts = g_cache[key];
-    auto it = experts.find(expert_idx);
-    if (it == experts.end()) {
-        it = experts.emplace(expert_idx, CacheEntry{sz, g_current_token, false}).first;
-    }
-    CacheEntry& entry = it->second;
-    entry.last_accessed = g_current_token;
-
-    if (entry.locked) return;
-
-    while (g_usage + sz > g_budget) {
-        const uint8_t* lru_key = nullptr;
-        int lru_idx = -1;
-        int lru_time = INT_MAX;
-        for (auto& [tk, exps] : g_cache) {
-            for (auto& [idx, e] : exps) {
-                if (e.locked && e.last_accessed < lru_time) {
-                    lru_time = e.last_accessed;
-                    lru_key = tk;
-                    lru_idx = idx;
-                }
-            }
-        }
-        if (lru_key == nullptr) break;
-
-        CacheEntry& lru = g_cache[lru_key][lru_idx];
-        const uint8_t* ptr = lru_key + static_cast<size_t>(lru_idx) * lru.bytes;
-        if (munlock(const_cast<uint8_t*>(ptr), lru.bytes) != 0)
-            perror("laplace-moe: munlock (evict)");
-        lru.locked = false;
-        g_usage -= lru.bytes;
-    }
-
-    if (g_usage + sz > g_budget) return;
-
-    const uint8_t* ptr = key + static_cast<size_t>(expert_idx) * sz;
-    if (mlock(const_cast<uint8_t*>(ptr), sz) != 0) {
-        fprintf(stderr, "laplace-moe: mlock failed (%zu bytes), disabling expert cache\n", sz);
-        g_mlock_ok = false;
-        return;
-    }
-    entry.locked = true;
-    g_usage += sz;
-#else
-    (void)tensor; (void)expert_idx;
-#endif
+    (void)tensor;
+    (void)expert_idx;
 }
 
 void LaplaceMoE::evict_cold(int k_tokens) {
-#ifdef __APPLE__
-    if (g_budget == 0 || !g_mlock_ok) return;
-
-    std::lock_guard<std::mutex> lock(g_cache_mutex);
-    int threshold = g_current_token - k_tokens;
-
-    for (auto& [key, experts] : g_cache) {
-        for (auto& [idx, entry] : experts) {
-            if (entry.locked && entry.last_accessed < threshold) {
-                const uint8_t* ptr = key + static_cast<size_t>(idx) * entry.bytes;
-                if (munlock(const_cast<uint8_t*>(ptr), entry.bytes) != 0)
-                    perror("laplace-moe: munlock (cold)");
-                entry.locked = false;
-                g_usage -= entry.bytes;
-            }
-        }
-    }
-#else
     (void)k_tokens;
-#endif
 }
 
 } // namespace Laplace

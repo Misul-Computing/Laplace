@@ -87,6 +87,12 @@ int main() {
     }
 
     {
+        KVCache fixed_q4;
+        CHECK(fixed_q4.init(1, 1, 32, 128, KVCacheMode::LAPLACE_Q4));
+        CHECK(fixed_q4.storage_kind() == KVStorageKind::FixedQ4);
+    }
+
+    {
         KVCache layered;
         std::vector<KVLayerConfig> layers = {
             {2, 8, 4, 4, KVCacheMode::FP32},
@@ -124,15 +130,8 @@ int main() {
         KVCache laplace;
         CHECK(laplace.init(1, 1, dim, context, KVCacheMode::LAPLACE));
         CHECK(!laplace.laplace_rotated());
-        size_t tile_bytes = LaplaceKVTile::storage_words(dim)
-                          * sizeof(uint32_t);
         CHECK(laplace.encoded_bytes(0) == 0);
         CHECK(laplace.encoded_bytes(1) == 2 * dim * sizeof(float) + 1);
-        CHECK(laplace.encoded_bytes(64) == tile_bytes + 1);
-        CHECK(laplace.encoded_bytes(65)
-              == tile_bytes + 2 * dim * sizeof(float) + 2);
-        CHECK(laplace.encoded_bytes(context)
-              == 2 * tile_bytes + 2 * 2 * dim * sizeof(float) + 3);
         std::mt19937 rng(77);
         std::vector<float> keys(static_cast<size_t>(context) * dim);
         std::vector<float> values(keys.size());
@@ -144,6 +143,29 @@ int main() {
             laplace.store_k(0, 0, token, key.data());
             laplace.store_v(0, 0, token, value.data());
         }
+        const int sealed = context / LaplaceKVAdaptive::kTokens;
+        const int tail = context % LaplaceKVAdaptive::kTokens;
+        CHECK(laplace.q4_tiles() + laplace.k8_tiles() +
+              laplace.fp16_tiles() == sealed);
+        size_t one_tile =
+            laplace.tile_format(0, 0, 0) ==
+                    LaplaceKVAdaptiveFormat::K4_V2
+                ? LaplaceKVQ4Tile::storage_words(dim) * sizeof(uint32_t)
+                : laplace.tile_format(0, 0, 0) ==
+                          LaplaceKVAdaptiveFormat::K8_V6
+                    ? 2 * LaplaceKVTile::storage_words(dim) *
+                          sizeof(uint32_t)
+                    : static_cast<size_t>(
+                          LaplaceKVAdaptive::kTokens) * dim *
+                          sizeof(uint32_t);
+        CHECK(laplace.encoded_bytes(context) ==
+              static_cast<size_t>(sealed) * one_tile +
+              static_cast<size_t>(tail) * 2 * dim * sizeof(float) +
+              static_cast<size_t>(
+                  (context + LaplaceKVAdaptive::kTokens - 1) /
+                  LaplaceKVAdaptive::kTokens));
+        CHECK(laplace.logical_scalars(context) ==
+              static_cast<size_t>(context) * dim * 2);
 
         for (int token : {0, 63, 64, 129}) {
             std::vector<float> loaded(dim);

@@ -214,5 +214,23 @@ void rope_apply(float* qk, int n_heads, int head_dim, int rope_pairs,
 #endif
 }
 
+// Interleaved-pair rotary: pair p rotates dims (2p, 2p+1). Used by
+// Qwen3.5-style MRoPE where sections partition consecutive pairs.
+void rope_apply_interleaved(float* qk, int n_heads, int head_dim,
+                            int rope_pairs, const float* cos_ptr,
+                            const float* sin_ptr) {
+    for (int h = 0; h < n_heads; h++) {
+        float* v = qk + (size_t)h * head_dim;
+        for (int p = 0; p < rope_pairs; p++) {
+            float c = cos_ptr[p];
+            float s = sin_ptr[p];
+            float a = v[2 * p];
+            float b = v[2 * p + 1];
+            v[2 * p]     = a * c - b * s;
+            v[2 * p + 1] = a * s + b * c;
+        }
+    }
+}
+
 } // namespace ops
 } // namespace Laplace

@@ -17,8 +17,16 @@
 #include "threadpool.h"
 #include "fp16.h"
 
+#if defined(__APPLE__)
+#include <dispatch/dispatch.h>
+#endif
+
 namespace Laplace {
 namespace kernels {
+
+thread_local bool g_gcd_gemm = false;
+
+void set_gcd_gemm(bool on) { g_gcd_gemm = on; }
 
 namespace {
 
@@ -40,7 +48,13 @@ inline float hsum_f32x4(float32x4_t v) {
 // fp16 -> fp32 via the software conversion in fp16.h. Called once per block
 // (32 or 256 elements), so the cost is negligible vs the dot product itself.
 inline float fp16_scale(uint16_t h) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+    __fp16 x;
+    std::memcpy(&x, &h, sizeof(x));
+    return static_cast<float>(x);
+#else
     return fp16_to_fp32(h);
+#endif
 }
 
 // 16 signed int8 dot 16 signed int8 -> 4 x int32 (each lane sums 4 products).
@@ -159,6 +173,32 @@ float dot_row_q8_0_int_neon(const ActQ8* xa, const uint8_t* row, int K) {
     return hsum_f32x4(vaddq_f32(acc0, acc1));
 }
 
+void dot2_row_q8_0_int_neon(const ActQ8* xa, const uint8_t* row0,
+                            size_t rb, int K, float out[2]) {
+    const block_q8_0* w0 = reinterpret_cast<const block_q8_0*>(row0);
+    const block_q8_0* w1 = reinterpret_cast<const block_q8_0*>(row0 + rb);
+    float32x4_t a00 = vdupq_n_f32(0), a01 = vdupq_n_f32(0);
+    float32x4_t a10 = vdupq_n_f32(0), a11 = vdupq_n_f32(0);
+    const int n_blocks = K / 32;
+    for (int b = 0; b < n_blocks; b++) {
+        int8x16_t xv0 = vld1q_s8(xa[b].qs);
+        int8x16_t xv1 = vld1q_s8(xa[b].qs + 16);
+        float xd = xa[b].d;
+        float s0 = fp16_scale(w0[b].d) * xd;
+        float s1 = fp16_scale(w1[b].d) * xd;
+        a00 = vfmaq_f32(a00, vdupq_n_f32(s0),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w0[b].qs), xv0)));
+        a01 = vfmaq_f32(a01, vdupq_n_f32(s0),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w0[b].qs + 16), xv1)));
+        a10 = vfmaq_f32(a10, vdupq_n_f32(s1),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w1[b].qs), xv0)));
+        a11 = vfmaq_f32(a11, vdupq_n_f32(s1),
+                        vcvtq_f32_s32(dot16_i8(vld1q_s8(w1[b].qs + 16), xv1)));
+    }
+    out[0] = hsum_f32x4(vaddq_f32(a00, a01));
+    out[1] = hsum_f32x4(vaddq_f32(a10, a11));
+}
+
 float dot_row_q4_0_int_neon(const ActQ8* xa, const uint8_t* row, int K) {
     const block_q4_0* w = reinterpret_cast<const block_q4_0*>(row);
     const int n_blocks = K / 32;
@@ -239,6 +279,7 @@ float dot_row_q4_k_int_neon(const ActQ8* xa, const uint8_t* row, int K) {
         float dmin = fp16_scale(blk.dmin);
         const uint8_t* q = blk.qs;
         int is = 0;
+#pragma clang loop unroll(full)
         for (int jb = 0; jb < 4; jb++) {           // 4 chunks of 64 elements
             uint8_t sc, m;
             get_scale_min_k4(is + 0, blk.scales, &sc, &m);
@@ -298,40 +339,41 @@ float dot_row_q6_k_int_neon(const ActQ8* xa, const uint8_t* row, int K) {
         const int8_t*  sc = blk.scales;
         const ActQ8*   xb = xa + b * 8;
         for (int half = 0; half < 2; half++) {
+            uint8x16_t q0 = vld1q_u8(ql);
+            uint8x16_t q1 = vld1q_u8(ql + 16);
+            uint8x16_t q2 = vld1q_u8(ql + 32);
+            uint8x16_t q3 = vld1q_u8(ql + 48);
+            uint8x16_t hlo = vld1q_u8(qh);
+            uint8x16_t hhi = vld1q_u8(qh + 16);
+            uint8x16_t lo_g[4] = {
+                vandq_u8(q0, m4),
+                vandq_u8(q2, m4),
+                vandq_u8(vshrq_n_u8(q0, 4), m4),
+                vandq_u8(vshrq_n_u8(q2, 4), m4),
+            };
+            uint8x16_t hi_g[4] = {
+                vandq_u8(q1, m4),
+                vandq_u8(q3, m4),
+                vandq_u8(vshrq_n_u8(q1, 4), m4),
+                vandq_u8(vshrq_n_u8(q3, 4), m4),
+            };
             for (int g = 0; g < 4; g++) {
-                uint8x16_t lo0, lo1;
-                if (g == 0 || g == 2) {
-                    lo0 = vld1q_u8(ql);
-                    lo1 = vld1q_u8(ql + 16);
-                } else {
-                    lo0 = vld1q_u8(ql + 32);
-                    lo1 = vld1q_u8(ql + 48);
-                }
-                if (g >= 2) {
-                    lo0 = vshrq_n_u8(lo0, 4);
-                    lo1 = vshrq_n_u8(lo1, 4);
-                }
-                lo0 = vandq_u8(lo0, m4);
-                lo1 = vandq_u8(lo1, m4);
                 int8x16_t neg_shift = vdupq_n_s8(static_cast<int8_t>(-(2 * g)));
-                uint8x16_t h0 = vandq_u8(vshlq_u8(vld1q_u8(qh),      neg_shift), m2);
-                uint8x16_t h1 = vandq_u8(vshlq_u8(vld1q_u8(qh + 16), neg_shift), m2);
+                uint8x16_t h0 = vandq_u8(vshlq_u8(hlo, neg_shift), m2);
+                uint8x16_t h1 = vandq_u8(vshlq_u8(hhi, neg_shift), m2);
                 int8x16_t w0 = vsubq_s8(
-                    vreinterpretq_s8_u8(vorrq_u8(lo0, vshlq_n_u8(h0, 4))), b32);
+                    vreinterpretq_s8_u8(vorrq_u8(lo_g[g], vshlq_n_u8(h0, 4))), b32);
                 int8x16_t w1 = vsubq_s8(
-                    vreinterpretq_s8_u8(vorrq_u8(lo1, vshlq_n_u8(h1, 4))), b32);
-
+                    vreinterpretq_s8_u8(vorrq_u8(hi_g[g], vshlq_n_u8(h1, 4))), b32);
                 const ActQ8& a = xb[half * 4 + g];
                 int8x16_t xv0 = vld1q_s8(a.qs);
                 int8x16_t xv1 = vld1q_s8(a.qs + 16);
-                int32x4_t p0 = dot16_i8(w0, xv0);
-                int32x4_t p1 = dot16_i8(w1, xv1);
-                float32x4_t pf0 = vcvtq_f32_s32(p0);
-                float32x4_t pf1 = vcvtq_f32_s32(p1);
                 float scale0 = d * a.d * static_cast<float>(sc[2 * g]);
                 float scale1 = d * a.d * static_cast<float>(sc[2 * g + 1]);
-                acc0 = vfmaq_f32(acc0, vdupq_n_f32(scale0), pf0);
-                acc1 = vfmaq_f32(acc1, vdupq_n_f32(scale1), pf1);
+                acc0 = vfmaq_f32(acc0, vdupq_n_f32(scale0),
+                                 vcvtq_f32_s32(dot16_i8(w0, xv0)));
+                acc1 = vfmaq_f32(acc1, vdupq_n_f32(scale1),
+                                 vcvtq_f32_s32(dot16_i8(w1, xv1)));
             }
             ql += 64;
             qh += 32;
@@ -411,9 +453,8 @@ void quantize_act_q8_neon(const float* x, int K, ActQ8* out) {
 
 // ---------------- GEMM row loops --------------------------------------------
 // Quantize all activation rows once,
-// then parallelize across output columns (N). The 4-row micro-kernels are
-// omitted (DOT4 = nullptr); the single-row path is correct, just not optimal
-// for batched matmuls.
+// then parallelize across output columns (N). 4-wide and 2-wide GEMV
+// were measured slower on this 26B decode than the single-row path.
 
 const ActQ8* quantize_all(const float* x, int M, int K) {
     static thread_local std::vector<ActQ8> scratch;
@@ -434,11 +475,14 @@ void gemm_int(const float* x, const uint8_t* data, float* y,
               int M, int K, int N, size_t rb) {
     const ActQ8* xa = quantize_all(x, M, K);
     const int bpr = K / 32;
-    constexpr int N_DST = 2;
+    // Wide N (LM head) must not spawn one task per two columns.
+    const int grain = N >= 8192 ? 128 : 2;
     auto body = [&](int b) {
-        const int j0 = b * N_DST;
-        const int j_end = j0 + N_DST < N ? j0 + N_DST : N;
+        const int j0 = b * grain;
+        const int j_end = j0 + grain < N ? j0 + grain : N;
         for (int j = j0; j < j_end; j++) {
+            if (j + 1 < N)
+                __builtin_prefetch(data + static_cast<size_t>(j + 1) * rb, 0, 3);
             const uint8_t* row = data + static_cast<size_t>(j) * rb;
             for (int m = 0; m < M; m++) {
                 y[static_cast<size_t>(m) * N + j] =
@@ -446,8 +490,16 @@ void gemm_int(const float* x, const uint8_t* data, float* y,
             }
         }
     };
-    const int n_blocks = (N + N_DST - 1) / N_DST;
-    if (M > 1 || N >= 128) {
+    const int n_blocks = (N + grain - 1) / grain;
+    if (g_gcd_gemm) {
+#if defined(__APPLE__)
+        dispatch_apply(static_cast<size_t>(n_blocks),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                       ^(size_t b) { body(static_cast<int>(b)); });
+#else
+        for (int b = 0; b < n_blocks; b++) body(b);
+#endif
+    } else if (M > 1 || N >= 128) {
         ThreadPool::get().parallel_for(n_blocks, body);
     } else {
         for (int b = 0; b < n_blocks; b++) body(b);
@@ -457,10 +509,10 @@ void gemm_int(const float* x, const uint8_t* data, float* y,
 template <dot_f_fn DOT>
 void gemm_f(const float* x, const uint8_t* data, float* y,
             int M, int K, int N, size_t rb) {
-    constexpr int N_DST = 2;
+    const int grain = N >= 8192 ? 128 : 2;
     auto body = [&](int b) {
-        const int j0 = b * N_DST;
-        const int j_end = j0 + N_DST < N ? j0 + N_DST : N;
+        const int j0 = b * grain;
+        const int j_end = j0 + grain < N ? j0 + grain : N;
         for (int j = j0; j < j_end; j++) {
             const uint8_t* row = data + static_cast<size_t>(j) * rb;
             for (int m = 0; m < M; m++) {
@@ -469,8 +521,16 @@ void gemm_f(const float* x, const uint8_t* data, float* y,
             }
         }
     };
-    const int n_blocks = (N + N_DST - 1) / N_DST;
-    if (M > 1 || N >= 128) {
+    const int n_blocks = (N + grain - 1) / grain;
+    if (g_gcd_gemm) {
+#if defined(__APPLE__)
+        dispatch_apply(static_cast<size_t>(n_blocks),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0),
+                       ^(size_t b) { body(static_cast<int>(b)); });
+#else
+        for (int b = 0; b < n_blocks; b++) body(b);
+#endif
+    } else if (M > 1 || N >= 128) {
         ThreadPool::get().parallel_for(n_blocks, body);
     } else {
         for (int b = 0; b < n_blocks; b++) body(b);
@@ -479,6 +539,7 @@ void gemm_f(const float* x, const uint8_t* data, float* y,
 
 bool gemm_simd(const float* x, const uint8_t* w, GGMLType type,
                float* y, int M, int K, int N) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
     switch (type) {
         case GGMLType::Q8_0: gemm_int<dot_row_q8_0_int_neon>(x, w, y, M, K, N, rb); return true;
@@ -580,6 +641,7 @@ bool moe_gemv_multi_f(const float* x, const uint8_t* w, GGMLType type,
 bool moe_gemv_simd(const float* x, const uint8_t* w, GGMLType type,
                    const int* expert_idx, int n_experts,
                    float* y, int K, int N) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
     switch (type) {
         case GGMLType::Q8_0: return moe_gemv_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
         case GGMLType::Q4_0: return moe_gemv_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
@@ -598,6 +660,7 @@ bool moe_gemv_simd(const float* x, const uint8_t* w, GGMLType type,
 bool moe_gemv_multi_simd(const float* x, const uint8_t* w, GGMLType type,
                          const int* expert_idx, int n_experts,
                          float* y, int K, int N) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
     switch (type) {
         case GGMLType::Q8_0: return moe_gemv_multi_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
         case GGMLType::Q4_0: return moe_gemv_multi_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, n_experts, y, K, N);
@@ -620,10 +683,17 @@ inline float geglu_product(float gate, float up) {
     return 0.5f * gate * (1.0f + std::tanh(c * (gate + c2 * gate3))) * up;
 }
 
+inline const uint8_t* exp_ptr(const uint8_t* w, const uint8_t* const* bases,
+                              const int* expert_idx, int k, size_t per_expert) {
+    return bases ? bases[k]
+                 : w + static_cast<size_t>(expert_idx[k]) * per_expert;
+}
+
 template <dot_int_fn DOT>
 bool moe_gate_up_int(const float* x, const uint8_t* w, GGMLType type,
                      const int* expert_idx, int n_experts,
-                     float* hidden, int K, int hidden_dim) {
+                     float* hidden, int K, int hidden_dim,
+                     const uint8_t* const* bases) {
     const ActQ8* xa = quantize_all(x, 1, K);
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
                       bytes_per_block(type);
@@ -631,7 +701,11 @@ bool moe_gate_up_int(const float* x, const uint8_t* w, GGMLType type,
     auto body = [&](int idx) {
         int k = idx / hidden_dim;
         int j = idx % hidden_dim;
-        const uint8_t* base = w + static_cast<size_t>(expert_idx[k]) * per_expert;
+        const uint8_t* base = exp_ptr(w, bases, expert_idx, k, per_expert);
+        if (j + 1 < hidden_dim) {
+            __builtin_prefetch(base + static_cast<size_t>(j + 1) * rb, 0, 3);
+            __builtin_prefetch(base + static_cast<size_t>(hidden_dim + j + 1) * rb, 0, 3);
+        }
         float gate = DOT(xa, base + static_cast<size_t>(j) * rb, K);
         float up = DOT(xa, base + static_cast<size_t>(hidden_dim + j) * rb, K);
         hidden[static_cast<size_t>(k) * hidden_dim + j] =
@@ -644,14 +718,15 @@ bool moe_gate_up_int(const float* x, const uint8_t* w, GGMLType type,
 template <dot_f_fn DOT>
 bool moe_gate_up_f(const float* x, const uint8_t* w, GGMLType type,
                    const int* expert_idx, int n_experts,
-                   float* hidden, int K, int hidden_dim) {
+                   float* hidden, int K, int hidden_dim,
+                   const uint8_t* const* bases) {
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
                       bytes_per_block(type);
     const size_t per_expert = static_cast<size_t>(2 * hidden_dim) * rb;
     auto body = [&](int idx) {
         int k = idx / hidden_dim;
         int j = idx % hidden_dim;
-        const uint8_t* base = w + static_cast<size_t>(expert_idx[k]) * per_expert;
+        const uint8_t* base = exp_ptr(w, bases, expert_idx, k, per_expert);
         float gate = DOT(x, base + static_cast<size_t>(j) * rb, K);
         float up = DOT(x, base + static_cast<size_t>(hidden_dim + j) * rb, K);
         hidden[static_cast<size_t>(k) * hidden_dim + j] =
@@ -664,7 +739,8 @@ bool moe_gate_up_f(const float* x, const uint8_t* w, GGMLType type,
 template <dot_int_fn DOT>
 bool moe_down_int(const float* x, const uint8_t* w, GGMLType type,
                   const int* expert_idx, const float* route_weight,
-                  int n_experts, float* output, int K, int N) {
+                  int n_experts, float* output, int K, int N,
+                  const uint8_t* const* bases) {
     const ActQ8* xa = quantize_all(x, n_experts, K);
     const int blocks_per_row = K / 32;
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
@@ -674,7 +750,7 @@ bool moe_down_int(const float* x, const uint8_t* w, GGMLType type,
         float sum = 0.0f;
         for (int k = 0; k < n_experts; k++) {
             const uint8_t* row =
-                w + static_cast<size_t>(expert_idx[k]) * per_expert +
+                exp_ptr(w, bases, expert_idx, k, per_expert) +
                 static_cast<size_t>(j) * rb;
             sum += route_weight[k] * DOT(xa + k * blocks_per_row, row, K);
         }
@@ -684,10 +760,43 @@ bool moe_down_int(const float* x, const uint8_t* w, GGMLType type,
     return true;
 }
 
+bool moe_down_q8_0_int2(const float* x, const uint8_t* w,
+                        const int* expert_idx, const float* route_weight,
+                        int n_experts, float* output, int K, int N,
+                        const uint8_t* const* bases) {
+    if (N < 2 || (N & 1) != 0)
+        return moe_down_int<dot_row_q8_0_int_neon>(
+            x, w, GGMLType::Q8_0, expert_idx, route_weight, n_experts,
+            output, K, N, bases);
+    const ActQ8* xa = quantize_all(x, n_experts, K);
+    const int blocks_per_row = K / 32;
+    const size_t rb = static_cast<size_t>(K) / elements_per_block(GGMLType::Q8_0) *
+                      bytes_per_block(GGMLType::Q8_0);
+    const size_t per_expert = static_cast<size_t>(N) * rb;
+    auto body = [&](int t) {
+        const int j = t * 2;
+        float sum0 = 0, sum1 = 0;
+        for (int k = 0; k < n_experts; k++) {
+            const uint8_t* row =
+                exp_ptr(w, bases, expert_idx, k, per_expert) +
+                static_cast<size_t>(j) * rb;
+            float tmp[2];
+            dot2_row_q8_0_int_neon(xa + k * blocks_per_row, row, rb, K, tmp);
+            sum0 += route_weight[k] * tmp[0];
+            sum1 += route_weight[k] * tmp[1];
+        }
+        output[j] += sum0;
+        output[j + 1] += sum1;
+    };
+    ThreadPool::get().parallel_for(N / 2, body);
+    return true;
+}
+
 template <dot_f_fn DOT>
 bool moe_down_f(const float* x, const uint8_t* w, GGMLType type,
                 const int* expert_idx, const float* route_weight,
-                int n_experts, float* output, int K, int N) {
+                int n_experts, float* output, int K, int N,
+                const uint8_t* const* bases) {
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) *
                       bytes_per_block(type);
     const size_t per_expert = static_cast<size_t>(N) * rb;
@@ -695,7 +804,7 @@ bool moe_down_f(const float* x, const uint8_t* w, GGMLType type,
         float sum = 0.0f;
         for (int k = 0; k < n_experts; k++) {
             const uint8_t* row =
-                w + static_cast<size_t>(expert_idx[k]) * per_expert +
+                exp_ptr(w, bases, expert_idx, k, per_expert) +
                 static_cast<size_t>(j) * rb;
             sum += route_weight[k] *
                 DOT(x + static_cast<size_t>(k) * K, row, K);
@@ -708,36 +817,40 @@ bool moe_down_f(const float* x, const uint8_t* w, GGMLType type,
 
 bool moe_gate_up_simd(const float* x, const uint8_t* w, GGMLType type,
                       const int* expert_idx, int n_experts,
-                      float* hidden, int K, int hidden_dim) {
+                      float* hidden, int K, int hidden_dim,
+                      const uint8_t* const* bases) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
     switch (type) {
-        case GGMLType::Q8_0: return moe_gate_up_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
-        case GGMLType::Q4_0: return moe_gate_up_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
-        case GGMLType::Q5_0: return moe_gate_up_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
-        case GGMLType::Q4_K: return moe_gate_up_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
-        case GGMLType::Q6_K: return moe_gate_up_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
-        case GGMLType::F32: return moe_gate_up_f<dot_row_f32_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
+        case GGMLType::Q8_0: return moe_gate_up_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q4_0: return moe_gate_up_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q5_0: return moe_gate_up_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q4_K: return moe_gate_up_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::Q6_K: return moe_gate_up_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
+        case GGMLType::F32: return moe_gate_up_f<dot_row_f32_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-        case GGMLType::F16: return moe_gate_up_f<dot_row_f16_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
+        case GGMLType::F16: return moe_gate_up_f<dot_row_f16_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
 #endif
-        case GGMLType::BF16: return moe_gate_up_f<dot_row_bf16_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim);
+        case GGMLType::BF16: return moe_gate_up_f<dot_row_bf16_neon>(x, w, type, expert_idx, n_experts, hidden, K, hidden_dim, bases);
         default: return false;
     }
 }
 
 bool moe_down_simd(const float* x, const uint8_t* w, GGMLType type,
                    const int* expert_idx, const float* route_weight,
-                   int n_experts, float* output, int K, int N) {
+                   int n_experts, float* output, int K, int N,
+                   const uint8_t* const* bases) {
+    if (type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256) return false;
     switch (type) {
-        case GGMLType::Q8_0: return moe_down_int<dot_row_q8_0_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
-        case GGMLType::Q4_0: return moe_down_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
-        case GGMLType::Q5_0: return moe_down_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
-        case GGMLType::Q4_K: return moe_down_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
-        case GGMLType::Q6_K: return moe_down_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
-        case GGMLType::F32: return moe_down_f<dot_row_f32_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
+        case GGMLType::Q8_0: return moe_down_q8_0_int2(x, w, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q4_0: return moe_down_int<dot_row_q4_0_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q5_0: return moe_down_int<dot_row_q5_0_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q4_K: return moe_down_int<dot_row_q4_k_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::Q6_K: return moe_down_int<dot_row_q6_k_int_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
+        case GGMLType::F32: return moe_down_f<dot_row_f32_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
 #if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
-        case GGMLType::F16: return moe_down_f<dot_row_f16_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
+        case GGMLType::F16: return moe_down_f<dot_row_f16_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
 #endif
-        case GGMLType::BF16: return moe_down_f<dot_row_bf16_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N);
+        case GGMLType::BF16: return moe_down_f<dot_row_bf16_neon>(x, w, type, expert_idx, route_weight, n_experts, output, K, N, bases);
         default: return false;
     }
 }
@@ -766,6 +879,7 @@ moe_down_fn get_simd_moe_down() {
 namespace Laplace {
 namespace kernels {
 
+void set_gcd_gemm(bool) {}
 gemm_fn get_simd_gemm() { return nullptr; }
 moe_gemv_fn get_simd_moe_gemv() { return nullptr; }
 moe_gemv_multi_fn get_simd_moe_gemv_multi() { return nullptr; }

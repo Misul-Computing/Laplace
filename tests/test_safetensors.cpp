@@ -7,9 +7,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
+#include <span>
 #include <string>
 #include <vector>
+#include <variant>
 
 #include "safetensors.h"
 #include "tensor.h"
@@ -19,6 +22,13 @@
 using namespace Laplace;
 
 namespace {
+
+template <typename T>
+T load_unaligned(const void* bytes, size_t index) {
+    T value{};
+    std::memcpy(&value, static_cast<const uint8_t*>(bytes) + index * sizeof(T), sizeof(T));
+    return value;
+}
 
 // ---- synthetic .safetensors file writer ----
 
@@ -91,6 +101,48 @@ bool write_index_json(const std::string& path,
     size_t n = fwrite(json.data(), 1, json.size(), f);
     fclose(f);
     return n == json.size();
+}
+
+std::vector<uint8_t> wire_file(const std::string& header,
+                               const std::vector<uint8_t>& payload = {}) {
+    std::vector<uint8_t> bytes(8);
+    uint64_t n = header.size();
+    for (size_t i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(n >> (8 * i));
+    bytes.insert(bytes.end(), header.begin(), header.end());
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    return bytes;
+}
+
+std::vector<uint8_t> wire_preamble(uint64_t n) {
+    std::vector<uint8_t> bytes(8);
+    for (size_t i = 0; i < 8; ++i) bytes[i] = static_cast<uint8_t>(n >> (8 * i));
+    return bytes;
+}
+
+struct ParsedWire {
+    std::vector<uint8_t> bytes;
+    SafeTensorsParseResult result;
+
+    explicit ParsedWire(std::vector<uint8_t> input)
+        : bytes(std::move(input)), result(parse_safetensors(bytes)) {}
+};
+
+const SafeTensorsFile* parsed_file(const SafeTensorsParseResult& result) {
+    return std::get_if<SafeTensorsFile>(&result);
+}
+
+void expect_wire_error(const std::vector<uint8_t>& bytes, SafeTensorsError expected) {
+    const SafeTensorsParseResult result = parse_safetensors(bytes);
+    const auto* error = std::get_if<SafeTensorsParseError>(&result);
+    CHECK(error != nullptr);
+    if (error) {
+        if (error->code != expected) {
+            fprintf(stderr, "wire error mismatch: expected %u, got %u\n",
+                    static_cast<unsigned>(expected), static_cast<unsigned>(error->code));
+        }
+        CHECK(error->code == expected);
+        CHECK(error->report.code == CompatibilityError::PACKAGE_BOUNDS_INVALID);
+    }
 }
 
 // ---- test cases ----
@@ -171,9 +223,8 @@ void test_single_file() {
         CHECK(t->dims[0] == 3);
         CHECK(t->dims[1] == 4);
         CHECK(t->nbytes() == 48);
-        const float* p = reinterpret_cast<const float*>(t->data);
-        CHECK(p[0] == 0.5f);
-        CHECK(p[11] == 11.5f);
+        CHECK(load_unaligned<float>(t->data, 0) == 0.5f);
+        CHECK(load_unaligned<float>(t->data, 11) == 11.5f);
     }
 
     // F16 tensor: shape [2,2] -> dims[0]=2, dims[1]=2
@@ -184,9 +235,8 @@ void test_single_file() {
         CHECK(t->n_dims == 2);
         CHECK(t->dims[0] == 2 && t->dims[1] == 2);
         CHECK(t->nbytes() == 8);
-        const uint16_t* p = reinterpret_cast<const uint16_t*>(t->data);
-        CHECK(p[0] == 0x3C00);
-        CHECK(p[3] == 0x4400);
+        CHECK(load_unaligned<uint16_t>(t->data, 0) == 0x3C00);
+        CHECK(load_unaligned<uint16_t>(t->data, 3) == 0x4400);
     }
 
     // BF16 tensor: shape [3] -> dims[0]=3
@@ -197,9 +247,8 @@ void test_single_file() {
         CHECK(t->n_dims == 1);
         CHECK(t->dims[0] == 3);
         CHECK(t->nbytes() == 6);
-        const uint16_t* p = reinterpret_cast<const uint16_t*>(t->data);
-        CHECK(p[0] == 0x3F80);
-        CHECK(p[2] == 0x4080);
+        CHECK(load_unaligned<uint16_t>(t->data, 0) == 0x3F80);
+        CHECK(load_unaligned<uint16_t>(t->data, 2) == 0x4080);
     }
 
     // I8 tensor: shape [4] -> dims[0]=4
@@ -210,11 +259,10 @@ void test_single_file() {
         CHECK(t->n_dims == 1);
         CHECK(t->dims[0] == 4);
         CHECK(t->nbytes() == 4);
-        const int8_t* p = reinterpret_cast<const int8_t*>(t->data);
-        CHECK(p[0] == 1);
-        CHECK(p[1] == 2);
-        CHECK(p[2] == -1);
-        CHECK(p[3] == 3);
+        CHECK(load_unaligned<int8_t>(t->data, 0) == 1);
+        CHECK(load_unaligned<int8_t>(t->data, 1) == 2);
+        CHECK(load_unaligned<int8_t>(t->data, 2) == -1);
+        CHECK(load_unaligned<int8_t>(t->data, 3) == 3);
     }
 
     // U32 tensor: shape [2] -> dims[0]=2
@@ -225,9 +273,8 @@ void test_single_file() {
         CHECK(t->n_dims == 1);
         CHECK(t->dims[0] == 2);
         CHECK(t->nbytes() == 8);
-        const uint32_t* p = reinterpret_cast<const uint32_t*>(t->data);
-        CHECK(p[0] == 0xDEADBEEFu);
-        CHECK(p[1] == 0x12345678u);
+        CHECK(load_unaligned<uint32_t>(t->data, 0) == 0xDEADBEEFu);
+        CHECK(load_unaligned<uint32_t>(t->data, 1) == 0x12345678u);
     }
 
     // Missing tensor returns nullptr.
@@ -257,7 +304,7 @@ void test_no_metadata() {
     CHECK(p != nullptr);
     if (p) {
         CHECK(p->type == GGMLType::F32);
-        CHECK(*reinterpret_cast<const float*>(p->data) == 42.0f);
+        CHECK(load_unaligned<float>(p->data, 0) == 42.0f);
     }
     remove("test_st_nometa.safetensors");
 }
@@ -358,8 +405,8 @@ void test_sharded() {
         CHECK(t->type == GGMLType::F32);
         CHECK(t->n_dims == 2);
         CHECK(t->dims[0] == 2 && t->dims[1] == 2);
-        const float* p = reinterpret_cast<const float*>(t->data);
-        CHECK(p[0] == 1.0f && p[3] == 4.0f);
+        CHECK(load_unaligned<float>(t->data, 0) == 1.0f &&
+              load_unaligned<float>(t->data, 3) == 4.0f);
     }
 
     t = ctx.find_tensor("block0.bias");
@@ -367,8 +414,8 @@ void test_sharded() {
     if (t) {
         CHECK(t->type == GGMLType::F32);
         CHECK(t->n_dims == 1 && t->dims[0] == 2);
-        const float* p = reinterpret_cast<const float*>(t->data);
-        CHECK(p[0] == 0.5f && p[1] == 1.5f);
+        CHECK(load_unaligned<float>(t->data, 0) == 0.5f &&
+              load_unaligned<float>(t->data, 1) == 1.5f);
     }
 
     // Tensor from shard 2. Shape [3,2] -> dims[0]=2, dims[1]=3.
@@ -379,9 +426,8 @@ void test_sharded() {
         CHECK(t->n_dims == 2);
         CHECK(t->dims[0] == 2);
         CHECK(t->dims[1] == 3);
-        const uint16_t* p = reinterpret_cast<const uint16_t*>(t->data);
-        CHECK(p[0] == 0x3C00);
-        CHECK(p[5] == 0x4600);
+        CHECK(load_unaligned<uint16_t>(t->data, 0) == 0x3C00);
+        CHECK(load_unaligned<uint16_t>(t->data, 5) == 0x4600);
     }
 
     t = ctx.find_tensor("block1.bias");
@@ -422,6 +468,116 @@ void test_bad_json_rejected() {
     remove("test_st_badjson.safetensors");
 }
 
+void test_wire_format_contract() {
+    // ST-01: LE header length and ASCII-space padding are valid.
+    const ParsedWire padded(wire_file(
+        "{\"x\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}   ", {7}));
+    const SafeTensorsFile* padded_file = parsed_file(padded.result);
+    CHECK(padded_file != nullptr);
+    if (padded_file) {
+        CHECK(padded_file->header_length() == 56);
+        CHECK(padded_file->tensors().size() == 1);
+        CHECK(padded_file->tensors()[0].data.size() == 1);
+        CHECK(padded_file->tensors()[0].data[0] == 7);
+    }
+
+    // ST-02 and ST-03: scalar and empty tensors are valid.
+    const ParsedWire scalar(wire_file(
+        "{\"scalar\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[0,2]}}", {0x80, 0x3f}));
+    const SafeTensorsFile* scalar_file = parsed_file(scalar.result);
+    CHECK(scalar_file != nullptr);
+    if (scalar_file) {
+        CHECK(scalar_file->tensors()[0].dtype == SafeTensorsDtype::BF16);
+        CHECK(scalar_file->tensors()[0].shape.empty());
+        CHECK(scalar_file->tensors()[0].data.size() == 2);
+    }
+    const ParsedWire empty(wire_file(
+        "{\"empty\":{\"dtype\":\"F16\",\"shape\":[0],\"data_offsets\":[0,0]}}"));
+    const SafeTensorsFile* empty_file = parsed_file(empty.result);
+    CHECK(empty_file != nullptr);
+    if (empty_file) CHECK(empty_file->tensors()[0].data.empty());
+
+    // The current format also has sub-byte dtypes; validate bit arithmetic
+    // rather than truncating their element width to zero bytes.
+    const ParsedWire packed_f4(wire_file(
+        "{\"packed\":{\"dtype\":\"F4\",\"shape\":[2],\"data_offsets\":[0,1]}}", {0}));
+    const SafeTensorsFile* packed_f4_file = parsed_file(packed_f4.result);
+    CHECK(packed_f4_file != nullptr);
+    if (packed_f4_file) CHECK(packed_f4_file->tensors()[0].dtype == SafeTensorsDtype::F4);
+    const ParsedWire packed_f6(wire_file(
+        "{\"packed\":{\"dtype\":\"F6_E2M3\",\"shape\":[4],\"data_offsets\":[0,3]}}", {0, 0, 0}));
+    CHECK(parsed_file(packed_f6.result) != nullptr);
+    expect_wire_error(wire_file(
+        "{\"packed\":{\"dtype\":\"F4\",\"shape\":[1],\"data_offsets\":[0,1]}}", {0}),
+                      SafeTensorsError::TensorByteSize);
+
+    // ST-04: descriptor order is irrelevant; output is ordered by byte span.
+    const ParsedWire unordered(wire_file(
+        "{\"b\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[1,2]},\"a\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}", {3, 4}));
+    const SafeTensorsFile* unordered_file = parsed_file(unordered.result);
+    CHECK(unordered_file != nullptr);
+    if (unordered_file) {
+        CHECK(unordered_file->tensors()[0].name == "a");
+        CHECK(unordered_file->tensors()[1].name == "b");
+    }
+
+    // Current upstream SafeTensors accepts JSON whitespace before and after
+    // the root object. It is header content, so tensor data still begins after
+    // the complete declared header length.
+    const ParsedWire whitespace(wire_file(
+        " \t\r\n{\"x\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}\n\t ",
+        {9}));
+    const SafeTensorsFile* whitespace_file = parsed_file(whitespace.result);
+    CHECK(whitespace_file != nullptr);
+    if (whitespace_file) CHECK(whitespace_file->tensors()[0].data[0] == 9);
+
+    // ST-05 through ST-20: exact malformed-wire refusals.
+    expect_wire_error(wire_preamble(100000001), SafeTensorsError::HeaderTooLarge);
+    expect_wire_error(wire_preamble(std::numeric_limits<uint64_t>::max()), SafeTensorsError::HeaderLength);
+    expect_wire_error(wire_file(std::string("{}\0", 3)), SafeTensorsError::HeaderPadding);
+    expect_wire_error(wire_file("{\"x\":{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[0,0]},\"x\":{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[0,0]}}"),
+                      SafeTensorsError::DuplicateKey);
+    expect_wire_error(wire_file("[]"), SafeTensorsError::HeaderObject);
+    expect_wire_error(wire_file("{\"__metadata__\":{\"a\":\"one\",\"a\":\"two\"}}"),
+                      SafeTensorsError::DuplicateKey);
+    expect_wire_error(wire_file("{\"__metadata__\":{\"a\":1}}"), SafeTensorsError::MetadataNotString);
+    expect_wire_error(wire_file("{\"x\":{\"dtype\":\"U8\",\"shape\":[\"1\"],\"data_offsets\":[0,0]}}"),
+                      SafeTensorsError::InvalidInteger);
+    expect_wire_error(wire_file("{\"x\":{\"dtype\":\"F16\",\"shape\":[1],\"data_offsets\":[0,-1]}}"),
+                      SafeTensorsError::InvalidInteger);
+    expect_wire_error(wire_file("{\"x\":{\"dtype\":\"F16\",\"shape\":[1],\"data_offsets\":[0,1]}}", {0}),
+                      SafeTensorsError::TensorByteSize);
+    expect_wire_error(wire_file("{\"a\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]},\"b\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[2,3]}}", {1, 0, 2}),
+                      SafeTensorsError::IncompleteBuffer);
+    expect_wire_error(wire_file("{\"a\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]},\"b\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}", {1}),
+                      SafeTensorsError::IncompleteBuffer);
+    expect_wire_error(wire_file("{\"a\":{\"dtype\":\"U8\",\"shape\":[1],\"data_offsets\":[0,1]}}", {1, 2}),
+                      SafeTensorsError::IncompleteBuffer);
+    expect_wire_error(wire_file("{\"a\":{\"dtype\":\"F16\",\"shape\":[281474976710655,281474976710655],\"data_offsets\":[0,0]}}"),
+                      SafeTensorsError::ArithmeticOverflow);
+    // UINT64 values are format-valid integers. An offset outside the supplied
+    // data buffer is a coverage error, not an invented smaller integer limit.
+    expect_wire_error(wire_file(
+        "{\"a\":{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[18446744073709551615,18446744073709551615]}}"),
+                      SafeTensorsError::IncompleteBuffer);
+    std::string invalid_utf8 = "{\"";
+    invalid_utf8.push_back(static_cast<char>(0xff));
+    invalid_utf8 += "\":{\"dtype\":\"U8\",\"shape\":[0],\"data_offsets\":[0,0]}}";
+    expect_wire_error(wire_file(invalid_utf8), SafeTensorsError::HeaderUtf8);
+}
+
+void test_wire_parser_keeps_adapter_policy_separate() {
+    const ParsedWire result(wire_file(
+        "{\"rank_five\":{\"dtype\":\"U8\",\"shape\":[1,1,1,1,1],\"data_offsets\":[0,1]},\"i16\":{\"dtype\":\"I16\",\"shape\":[1],\"data_offsets\":[1,3]}}", {5, 0, 0}));
+    const SafeTensorsFile* file = parsed_file(result.result);
+    CHECK(file != nullptr);
+    if (file) {
+        CHECK(file->tensors().size() == 2);
+        CHECK(file->tensors()[0].name == "rank_five");
+        CHECK(file->tensors()[1].dtype == SafeTensorsDtype::I16);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -431,5 +587,7 @@ int main() {
     test_sharded();
     test_bad_file_rejected();
     test_bad_json_rejected();
+    test_wire_format_contract();
+    test_wire_parser_keeps_adapter_policy_separate();
     return test_summary("test_safetensors");
 }

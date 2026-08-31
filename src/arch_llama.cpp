@@ -281,7 +281,8 @@ void LlamaArch::attention_batch(int layer, int M, int pos0, KVCache& kv,
             // FP32/FP16 fast path: contiguous head streaming.
             // FP32 uses head_k/head_v (float*), FP16 uses head_k16/head_v16
             // (uint16_t*) with fused NEON FP16 dot/axpy.
-            const bool fp32_fast = (kv.mode() == KVCacheMode::FP32);
+            const bool fp32_fast =
+                kv.storage_kind(layer) == KVStorageKind::FP32;
             for (int d = 0; d < Hq * Dh; d++) ao_m[d] = 0.0f;
             for (int kvh = 0; kvh < Hk; kvh++) {
                 const int h0 = kvh * gqa;
@@ -479,7 +480,9 @@ void LlamaArch::forward_layer(int layer, const LayerWeights& W, const ModelConfi
                      H, cfg.rms_eps);
     }
 
-    if (kv.mode() == KVCacheMode::LAPLACE) {
+    const KVStorageKind storage = kv.storage_kind();
+    if (storage == KVStorageKind::Adaptive ||
+        storage == KVStorageKind::FixedQ4) {
         attention_batch_wh(layer, M, pos0, kv, W, cfg, buf);
     } else {
         attention_batch(layer, M, pos0, kv, W, cfg, buf);

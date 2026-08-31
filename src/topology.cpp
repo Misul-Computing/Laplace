@@ -52,12 +52,32 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
 
     const int layer_count = integer("block_count");
     candidate.hidden = integer("embedding_length");
-    candidate.intermediate = integer("feed_forward_length");
     candidate.max_seq_len = integer("context_length");
     const int query_heads = integer("attention.head_count");
     const int global_dim = integer("attention.key_length");
     const int sliding_dim = integer("attention.key_length_swa", global_dim);
     const int window = integer("attention.sliding_window");
+
+    std::vector<int> ffn_widths;
+    if (integer_array(metadata, prefix + "feed_forward_length", &ffn_widths) &&
+        !ffn_widths.empty()) {
+        if (static_cast<int>(ffn_widths.size()) == 1) {
+            ffn_widths.assign(layer_count, ffn_widths[0]);
+        } else if (static_cast<int>(ffn_widths.size()) != layer_count) {
+            return fail(error, "topology: feed_forward_length array length must be 1 or block_count");
+        }
+    } else {
+        const int one = integer("feed_forward_length");
+        if (one <= 0) {
+            return fail(error, "topology: missing feed_forward_length");
+        }
+        ffn_widths.assign(layer_count, one);
+    }
+    candidate.intermediate = 0;
+    for (int w : ffn_widths) {
+        if (w <= 0) return fail(error, "topology: non-positive feed_forward_length");
+        candidate.intermediate = std::max(candidate.intermediate, w);
+    }
 
     if (layer_count <= 0 || candidate.hidden <= 0 ||
         candidate.intermediate <= 0 || candidate.max_seq_len <= 0 ||
@@ -66,17 +86,32 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
     }
 
     std::vector<int> kv_heads;
-    std::vector<int> sliding_pattern;
-    if (!integer_array(metadata, prefix + "attention.head_count_kv",
-                       &kv_heads) ||
-        static_cast<int>(kv_heads.size()) != layer_count) {
-        return fail(error, "topology: attention.head_count_kv must have one entry per layer");
+    if (integer_array(metadata, prefix + "attention.head_count_kv", &kv_heads) &&
+        !kv_heads.empty()) {
+        if (static_cast<int>(kv_heads.size()) == 1) {
+            kv_heads.assign(layer_count, kv_heads[0]);
+        } else if (static_cast<int>(kv_heads.size()) != layer_count) {
+            return fail(error, "topology: attention.head_count_kv array length must be 1 or block_count");
+        }
+    } else {
+        const int kv = integer("attention.head_count_kv");
+        if (kv <= 0) {
+            return fail(error, "topology: attention.head_count_kv missing");
+        }
+        kv_heads.assign(layer_count, kv);
     }
-    if (!integer_array(metadata, prefix + "attention.sliding_window_pattern",
-                       &sliding_pattern) ||
-        static_cast<int>(sliding_pattern.size()) != layer_count) {
+
+    std::vector<int> sliding_pattern;
+    if (integer_array(metadata, prefix + "attention.sliding_window_pattern",
+                      &sliding_pattern) &&
+        static_cast<int>(sliding_pattern.size()) == layer_count) {
+        // Layer A: explicit pattern.
+    } else if (window <= 0) {
+        // Layer B: no window key means all-global. Proven on llama/smol files.
+        sliding_pattern.assign(layer_count, 0);
+    } else {
         return fail(error,
-                    "topology: attention.sliding_window_pattern must have one entry per layer");
+                    "topology: attention.sliding_window_pattern required when sliding_window > 0");
     }
 
     candidate.n_experts = integer("expert_count");
@@ -95,7 +130,14 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
     candidate.rms_eps =
         real("attention.layer_norm_rms_epsilon", 1e-6);
     candidate.logit_softcap = real("final_logit_softcapping");
-    candidate.embed_scale = std::sqrt(static_cast<float>(candidate.hidden));
+    // Prove embed scale and activation from tensors/keys, not family names.
+    // rope_freqs.weight is the p-RoPE table; those GGUFs also scale embeddings
+    // by sqrt(hidden). No such tensor => scale 1 and SwiGLU.
+    const bool has_rope_freqs = gguf.find_tensor("rope_freqs.weight") != nullptr;
+    candidate.embed_scale = has_rope_freqs
+        ? std::sqrt(static_cast<float>(candidate.hidden))
+        : 1.0f;
+    const bool swiglu = !has_rope_freqs;
 
     const float global_rope = real("rope.freq_base", 1000000.0);
     const float sliding_rope = real("rope.freq_base_swa", 10000.0);
@@ -111,10 +153,12 @@ bool synthesize_topology(const GGUFContext& gguf, TopologyPlan* plan,
         output.n_q_heads = query_heads;
         output.n_kv_heads = kv_heads[layer];
         output.head_dim = sliding ? sliding_dim : global_dim;
+        output.intermediate = ffn_widths[layer];
         output.sliding_window = sliding ? window : 0;
         output.rope_dim = sliding ? sliding_rope_dim : global_rope_dim;
         output.rope_base = sliding ? sliding_rope : global_rope;
         output.moe = candidate.n_experts > 0;
+        output.swiglu = swiglu;
 
         if (output.n_kv_heads <= 0 ||
             output.n_q_heads % output.n_kv_heads != 0 ||

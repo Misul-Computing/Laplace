@@ -141,6 +141,9 @@ void geglu(const float* gate, const float* up, float* out, int n);
 // for the target position.
 void rope_apply(float* qk, int n_heads, int head_dim, int rope_pairs,
                 const float* cos_ptr, const float* sin_ptr);
+void rope_apply_interleaved(float* qk, int n_heads, int head_dim,
+                            int rope_pairs, const float* cos_ptr,
+                            const float* sin_ptr);
 
 } // namespace ops
 } // namespace Laplace

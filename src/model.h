@@ -14,6 +14,8 @@
 
 namespace Laplace {
 
+class TokenGraphBackend;
+
 struct ModelConfig {
     int n_layers        = 0;
     int n_q_heads       = 0;    // full-attention layer dims
@@ -27,6 +29,7 @@ struct ModelConfig {
     float rope_freq_base = 1e7f;
     int rope_dim_count  = 64;
     int rope_sections[4] = {11, 11, 10, 0};
+    bool rope_interleaved = false; // Qwen3.5 MRoPE-style (2p, 2p+1) pairs
     bool tied_lm_head   = false;
 
     // DeltaNet (linear-attention) layer dims
@@ -35,6 +38,12 @@ struct ModelConfig {
     int ssm_inner_size   = 2048;
     int ssm_conv_kernel  = 4;
     int ssm_time_step_rank = 16;
+    // Derived DeltaNet geometry: q/k sections are key_dim wide, the v
+    // section and the gate are inner_size wide, decay and beta are
+    // per-value-head. Validated against tensor shapes at load.
+    int ssm_key_dim      = 0;   // group_count * state_size
+    int ssm_num_v_heads  = 0;   // time_step_rank
+    int ssm_gate_fused   = 0;   // 1 when z rides inside attn_qkv
 
     // Gemma4 MoE
     int n_experts        = 0;    // total routed experts (e.g. 128)
@@ -103,7 +112,7 @@ public:
 
     // Forward one token at position `pos`. Writes next-token logits into
     // `logits` (cfg_.vocab floats).
-    void forward(int token, int pos, KVCache& kv, float* logits);
+    bool forward(int token, int pos, KVCache& kv, float* logits);
 
     // Forward M tokens at positions pos0..pos0+M-1 in one batched pass
     // (weights stream once per layer). Writes logits for every position into
@@ -111,8 +120,17 @@ public:
     // M * ssm_state_floats() floats; after token m is absorbed, the full SSM
     // state (conv + recurrent, all layers) is copied to checkpoint m so a
     // speculative decoder can roll back to any accepted prefix.
-    void forward_batch(const int* tokens, int M, int pos0, KVCache& kv,
+    bool forward_batch(const int* tokens, int M, int pos0, KVCache& kv,
                        float* logits, float* checkpoints = nullptr);
+
+    // GPU token graph is decode-only. Prefill stays on CPU so KV exists
+    // to seed the GPU cache.
+    void enable_metal_token(bool on) { metal_token_ = on; }
+#if defined(LAPLACE_TESTING)
+    void set_token_graph_backend_for_test(TokenGraphBackend* backend) {
+        token_graph_backend_ = backend;
+    }
+#endif
 
     // Floats per SSM-state checkpoint, and rollback to a saved checkpoint.
     size_t ssm_state_floats() const {
@@ -128,6 +146,9 @@ public:
 private:
     ModelConfig cfg_;
     std::unique_ptr<ModelArch> arch_;
+public:
+    const ModelArch* arch() const { return arch_.get(); }
+private:
     const Tensor* token_embd_  = nullptr;
     const Tensor* output_norm_ = nullptr;
     const Tensor* output_      = nullptr;  // LM head (may be tied to token_embd_)
@@ -137,6 +158,8 @@ private:
 
     int max_seq_ = 0;
     int max_batch_ = 1;
+    bool metal_token_ = false;
+    TokenGraphBackend* token_graph_backend_ = nullptr;
     bool streaming_experts_ = false;  // dense pinned, experts stream from SSD
 
     ModelBuffers buffers_;
@@ -146,6 +169,7 @@ private:
     // size vs physical RAM. Faults dense weights into RAM so the OS keeps
     // them resident; leaves expert tensors to stream on demand when the
     // model does not fit. Called at the end of init().
+    void reset_load_attempt();
     void plan_residency();
     bool streaming_experts() const { return streaming_experts_; }
 };

@@ -23,6 +23,8 @@ enum class GGMLType : uint32_t {
     Q5_K    = 13,
     Q6_K    = 14,
     Q8_K    = 15,
+    IQ2_XXS = 16,
+    IQ1_S   = 19,
     BF16    = 30,
     I8      = 31,
     I32     = 32,
@@ -30,7 +32,8 @@ enum class GGMLType : uint32_t {
     U8      = 34,
     U32     = 35,
     BOOL    = 36,
-    MLX_AFFINE = 100,
+    GROUPED_AFFINE_U2_256 = 100,
+    COLUMN_GROUPED_AFFINE_U2_SKIP_256 = 101,
 };
 
 // Block / super-block element counts
@@ -61,7 +64,11 @@ inline constexpr size_t bytes_per_block(GGMLType t) {
         case GGMLType::Q5_K: return 2 + 2 + 12 + 32 + 128;   // d, dmin, scales, qh, 256 * (4+1)-bit
         case GGMLType::Q6_K: return 2 + 16 + 128 + 64;       // d, scales, ql, qh
         case GGMLType::Q8_K: return 2 + 256 + 64 + 32;       // d, qs, bsums, scales (placeholder)
-        case GGMLType::MLX_AFFINE: return 4;                  // packed uint32 (32/bits elements)
+        case GGMLType::IQ2_XXS: return 2 + 64;                // d + 32 packed uint16 words
+        case GGMLType::IQ1_S: return 2 + 32 + 16;             // d + 32 grid bytes + 8 uint16 metadata
+        // Multi-plane; callers must use the checked plane spans.
+        case GGMLType::GROUPED_AFFINE_U2_256: return 0;
+        case GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256: return 0;
         default: return 0;
     }
 }
@@ -91,8 +98,11 @@ inline constexpr int elements_per_block(GGMLType t) {
         case GGMLType::Q5_K:
         case GGMLType::Q6_K:
         case GGMLType::Q8_K:
+        case GGMLType::IQ2_XXS:
+        case GGMLType::IQ1_S:
             return QK_KQUANT;
-        case GGMLType::MLX_AFFINE:
+        case GGMLType::GROUPED_AFFINE_U2_256:
+        case GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256:
             return 1;  // variable, handled by mlx_bits/mlx_group_size
         default:
             return 0;
@@ -122,7 +132,11 @@ inline const char* type_name(GGMLType t) {
         case GGMLType::Q5_K: return "Q5_K";
         case GGMLType::Q6_K: return "Q6_K";
         case GGMLType::Q8_K: return "Q8_K";
-        case GGMLType::MLX_AFFINE: return "MLX_AFFINE";
+        case GGMLType::IQ2_XXS: return "IQ2_XXS";
+        case GGMLType::IQ1_S: return "IQ1_S";
+        case GGMLType::GROUPED_AFFINE_U2_256: return "GROUPED_AFFINE_U2_256";
+        case GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256:
+            return "COLUMN_GROUPED_AFFINE_U2_SKIP_256";
         default: return "??";
     }
 }
@@ -135,6 +149,10 @@ struct Tensor {
     const uint8_t* data = nullptr;
     const uint8_t* scales = nullptr;
     const uint8_t* biases = nullptr;
+    // Exact spans for multi-plane physical layouts. Zero means unknown.
+    uint64_t data_bytes = 0;
+    uint64_t scale_bytes = 0;
+    uint64_t bias_bytes = 0;
     int mlx_bits = 0;
     int mlx_group_size = 0;
 

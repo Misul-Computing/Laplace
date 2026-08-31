@@ -30,6 +30,8 @@ private:
                         float* checkpoints);
 
     std::vector<int> kv_layer_idx_;  // global layer -> dense KV-cache layer index
+    int ssm_gate_fused_ = -1;        // -1 unknown; 0 separate attn_gate; 1 z fused
+    bool dnet_dumped_ = false;       // differential-test dump latch
 };
 
 } // namespace Laplace

@@ -1,7 +1,8 @@
-// laplace_moe.h - Mac M-series SSD expert streaming for MoE models
+// laplace_moe.h - expert working-set cache + SSD staging
 //
-// Active routed experts can be paged in from the model file and retained
-// within a bounded resident set.
+// Routed expert slices live in a bounded RAM LRU (default ~4 GB, scaled
+// by quant block size). Misses are pread from the model file. GEMV uses
+// pointers into those slots, not the 15 GB expert mmap.
 #pragma once
 
 #include <cstddef>
@@ -35,12 +36,10 @@ private:
 
 class LaplaceMoE {
 public:
-    // Global mode: when true, dense weights are pinned and expert tensors
-    // stream from SSD. Set by Model::plan_residency()
-    // based on model size vs physical RAM.
     static bool streaming_enabled() { return streaming_enabled_; }
     static void set_streaming(bool v) { streaming_enabled_ = v; }
 
+    static void hint(const Tensor* tensor, int expert_idx);
     static ExpertAcquireTicket prefetch(
         const Tensor* tensor, const int* expert_idx, int n);
     static ExpertAcquireStats wait(const ExpertAcquireTicket& ticket);
@@ -48,13 +47,20 @@ public:
         const Tensor* tensor, const int* expert_idx, int n);
     static int io_worker_count();
 
+    // Resolve selected experts into RAM. If dest is non-null, pack a
+    // contiguous view (dims[2] = n) for tests and scalar fallbacks.
+    // If bases is non-null, bases[i] points at the cached slice (no extra
+    // copy). GEMV should use bases when present.
+    static ExpertAcquireStats load_experts(
+        const Tensor& src, const int* ids, int n, Tensor* dest,
+        const uint8_t** bases = nullptr);
+
+    static void drop_mmap(const Tensor* tensor);
+
     static void set_file_fd(int fd);
     static void set_mmap_base(const uint8_t* base);
 
-    // Size of one expert's slice in a 3D stacked tensor.
     static size_t per_expert_bytes(const Tensor* tensor);
-
-    // Pointer to a single expert's slice in a 3D stacked tensor.
     static const uint8_t* expert_data(const Tensor* tensor, int expert_idx);
 
     static void touch_expert(const Tensor* tensor, int expert_idx);

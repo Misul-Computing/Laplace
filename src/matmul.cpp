@@ -1,15 +1,24 @@
 #include "matmul.h"
 
+#include <CommonCrypto/CommonDigest.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include <vector>
 
 #include "fp16.h"
 #include "kernels.h"
+#include "token_graph_backend.h"
 #include "threadpool.h"
 
 #if defined(__APPLE__)
@@ -17,13 +26,74 @@ namespace Laplace {
 extern bool metal_gemv(const float* x, const Tensor& w, float* y, int K, int N);
 extern bool metal_gemm(const float* x, const Tensor& w, float* y, int M, int K, int N);
 extern void metal_register_weights(const void* base, size_t size);
+extern void metal_pack_tensor(const Tensor& w, int K, int N);
+extern bool metal_available();
+extern bool metal_gemv_begin(const MatmulBatchSpec* specs, int n);
+extern void metal_gemv_end();
+extern bool metal_decode_ffn_moe(
+    const float* x_norm, const Tensor& ffn_gate, const Tensor& ffn_up,
+    const Tensor& ffn_down, float* xb, int H, int inter, bool swiglu,
+    const float* moe_in, const Tensor* moe_up_stack, const Tensor* moe_dn_stack,
+    const int* expert_ids, int n_exp, int exp_inter, const float* route_w,
+    float* moe_out);
 }
 static bool metal_enabled() {
     const char* e = std::getenv("LAPLACE_METAL");
     return e && e[0] == '1';
 }
 #else
-namespace Laplace { bool metal_gemv(const float*, const Tensor&, float*, int, int) { return false; } bool metal_gemm(const float*, const Tensor&, float*, int, int, int) { return false; } void metal_register_weights(const void*, size_t) {} }
+namespace Laplace {
+bool metal_gemv(const float*, const Tensor&, float*, int, int) { return false; }
+bool metal_gemm(const float*, const Tensor&, float*, int, int, int) { return false; }
+void metal_dispatch_metrics_reset() {}
+MetalDispatchMetrics metal_dispatch_metrics() { return {}; }
+void metal_register_weights(const void*, size_t) {}
+void metal_pack_tensor(const Tensor&, int, int) {}
+bool metal_decode_ffn_moe(const float*, const Tensor&, const Tensor&, const Tensor&,
+                          float*, int, int, bool, const float*, const Tensor*,
+                          const Tensor*, const int*, int, int, const float*, float*) {
+    return false;
+}
+bool metal_tok_begin(int, int, int, int, int, int, int, int, int, int, int) { return false; }
+bool metal_tok_active() { return false; }
+void metal_tok_upload_x(const float*, int) {}
+bool metal_tok_upload_embedding(const Tensor&, uint32_t, int, int) { return false; }
+void metal_tok_import_kv(int, int, const float*, const float*, int) {}
+bool metal_tok_kv_needs_seed() { return false; }
+bool metal_tok_layer(const MetalTokLayer&) { return false; }
+bool metal_tok_flush(double* ms_out) { if (ms_out) *ms_out = 0; return true; }
+bool metal_tok_end(float*, int) { return false; }
+void metal_tok_abort() {}
+bool metal_tok_lm(const Tensor&, float*, int, int) { return false; }
+bool metal_tok_final(const Tensor&, const Tensor&, float*, int, int, float) {
+    return false;
+}
+void metal_unregister_weights(const void*) {}
+bool metal_test_attn(const float*, const float*, const float*, float*,
+                     int, int, int, int, int, int, float, int) { return false; }
+bool metal_test_q4k_embedding(const Tensor&, uint32_t, float*, int, int) { return false; }
+bool metal_test_q6k_embedding(const Tensor&, uint32_t, float*, int, int) { return false; }
+
+namespace {
+class NullTokenGraphBackend final : public TokenGraphBackend {
+public:
+    bool available() const override { return false; }
+    bool begin(int, int, int, int, int, int, int, int, int, int, int) override {
+        return false;
+    }
+    bool active() const override { return false; }
+    void upload_x(const float*, int) override {}
+    bool layer(const MetalTokLayer&) override { return false; }
+    bool end(float*, int) override { return false; }
+    void abort() override {}
+};
+}
+
+TokenGraphBackend& metal_token_graph_backend() {
+    static NullTokenGraphBackend backend;
+    return backend;
+}
+}
 static bool metal_enabled() { return false; }
 #endif
 
@@ -37,9 +107,939 @@ using kernels::block_q6_K;
 using kernels::block_q2_K;
 using kernels::block_q3_K;
 using kernels::block_q5_K;
+using kernels::block_iq2_xxs;
+using kernels::block_iq1_s;
 using kernels::get_scale_min_k4;
 
 namespace {
+
+bool is_cpu_rejected_type(GGMLType type) {
+    return type == GGMLType::COLUMN_GROUPED_AFFINE_U2_SKIP_256;
+}
+
+[[noreturn]] void reject_cpu_execution(GGMLType type) {
+    throw std::invalid_argument(
+        std::string("CPU matmul/dequantize does not support Metal-only weight type ") +
+        type_name(type));
+}
+
+#include "iq2_xxs_tables.inc"
+#include "iq1_s_tables.inc"
+
+std::array<uint8_t, 32> digest_bytes(std::span<const uint8_t> bytes) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    constexpr size_t chunk_size = 1024 * 1024;
+    for (size_t offset = 0; offset < bytes.size(); offset += chunk_size) {
+        size_t chunk = std::min(chunk_size, bytes.size() - offset);
+        CC_SHA256_Update(&context, bytes.data() + offset, static_cast<CC_LONG>(chunk));
+    }
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    return digest;
+}
+
+void digest_u16(CC_SHA256_CTX& context, uint16_t value);
+void digest_u32(CC_SHA256_CTX& context, uint32_t value);
+void digest_u64(CC_SHA256_CTX& context, uint64_t value);
+
+std::array<uint8_t, 32> column_grouped_affine_u2_skip_provenance_digest(
+    GGMLType source_format, uint64_t logical_k, uint64_t logical_n,
+    std::span<const float> importance) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    static constexpr uint8_t domain[] = {'L','A','P','S','P','Q','C','1'};
+    CC_SHA256_Update(&context, domain, sizeof(domain));
+    digest_u16(context, 1u);  // converter/fitter version
+    digest_u32(context, static_cast<uint32_t>(source_format));
+    digest_u64(context, logical_k);
+    digest_u64(context, logical_n);
+    digest_u64(context, importance.size());
+    for (float value : importance) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        digest_u32(context, bits);
+    }
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    return digest;
+}
+
+bool byte_ranges_overlap(const void* left, size_t left_size,
+                         const void* right, size_t right_size) {
+    const uintptr_t left_begin = reinterpret_cast<uintptr_t>(left);
+    const uintptr_t right_begin = reinterpret_cast<uintptr_t>(right);
+    if (left_size > std::numeric_limits<uintptr_t>::max() - left_begin ||
+        right_size > std::numeric_limits<uintptr_t>::max() - right_begin)
+        return true;
+    return left_begin < right_begin + right_size &&
+           right_begin < left_begin + left_size;
+}
+
+void digest_u16(CC_SHA256_CTX& context, uint16_t value) {
+    const uint8_t bytes[2] = {static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8)};
+    CC_SHA256_Update(&context, bytes, sizeof(bytes));
+}
+
+void digest_u32(CC_SHA256_CTX& context, uint32_t value) {
+    const uint8_t bytes[4] = {
+        static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
+        static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24),
+    };
+    CC_SHA256_Update(&context, bytes, sizeof(bytes));
+}
+
+void digest_u64(CC_SHA256_CTX& context, uint64_t value) {
+    const uint8_t bytes[8] = {
+        static_cast<uint8_t>(value), static_cast<uint8_t>(value >> 8),
+        static_cast<uint8_t>(value >> 16), static_cast<uint8_t>(value >> 24),
+        static_cast<uint8_t>(value >> 32), static_cast<uint8_t>(value >> 40),
+        static_cast<uint8_t>(value >> 48), static_cast<uint8_t>(value >> 56),
+    };
+    CC_SHA256_Update(&context, bytes, sizeof(bytes));
+}
+
+std::array<uint8_t, 32> derived_storage_digest(const DerivedQ2KStorage& storage) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    static constexpr uint8_t domain[] = {'L','A','P','Q','2','K','0','1'};
+    CC_SHA256_Update(&context, domain, sizeof(domain));
+    digest_u16(context, storage.contract.version);
+    digest_u32(context, static_cast<uint32_t>(storage.contract.source_format));
+    digest_u64(context, storage.contract.logical_k);
+    digest_u64(context, storage.contract.logical_n);
+    digest_u32(context, storage.contract.block_width);
+    digest_u32(context, storage.contract.bytes_per_block);
+    digest_u32(context, storage.contract.alignment);
+    CC_SHA256_Update(&context, storage.source_digest.data(), storage.source_digest.size());
+    constexpr size_t chunk_size = 1024 * 1024;
+    for (size_t offset = 0; offset < storage.bytes.size(); offset += chunk_size) {
+        size_t chunk = std::min(chunk_size, storage.bytes.size() - offset);
+        CC_SHA256_Update(&context, storage.bytes.data() + offset, static_cast<CC_LONG>(chunk));
+    }
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    return digest;
+}
+
+std::array<uint8_t, 32> derived_iq2_xxs_digest(const DerivedIQ2XXSRecord& record,
+                                               std::span<const uint8_t> bytes) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    static constexpr uint8_t domain[] = {'L','A','P','I','Q','2','X','1'};
+    CC_SHA256_Update(&context, domain, sizeof(domain));
+    digest_u16(context, record.contract.version);
+    digest_u32(context, static_cast<uint32_t>(record.contract.source_format));
+    digest_u64(context, record.contract.logical_k);
+    digest_u64(context, record.contract.logical_n);
+    digest_u32(context, record.contract.block_width);
+    digest_u32(context, record.contract.bytes_per_block);
+    digest_u32(context, record.contract.alignment);
+    CC_SHA256_Update(&context, record.source_digest.data(), record.source_digest.size());
+    CC_SHA256_Update(&context, record.importance_digest.data(), record.importance_digest.size());
+    constexpr size_t chunk_size = 1024 * 1024;
+    for (size_t offset = 0; offset < bytes.size(); offset += chunk_size) {
+        const size_t chunk = std::min(chunk_size, bytes.size() - offset);
+        CC_SHA256_Update(&context, bytes.data() + offset, static_cast<CC_LONG>(chunk));
+    }
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    return digest;
+}
+
+std::array<uint8_t, 32> derived_iq1_s_digest(const DerivedIQ1SRecord& record,
+                                             std::span<const uint8_t> bytes) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    static constexpr uint8_t domain[] = {'L','A','P','I','Q','1','S','1'};
+    CC_SHA256_Update(&context, domain, sizeof(domain));
+    digest_u16(context, record.contract.version);
+    digest_u32(context, static_cast<uint32_t>(record.contract.source_format));
+    digest_u64(context, record.contract.logical_k);
+    digest_u64(context, record.contract.logical_n);
+    digest_u32(context, record.contract.block_width);
+    digest_u32(context, record.contract.bytes_per_block);
+    digest_u32(context, record.contract.alignment);
+    CC_SHA256_Update(&context, record.source_digest.data(), record.source_digest.size());
+    CC_SHA256_Update(&context, record.importance_digest.data(), record.importance_digest.size());
+    constexpr size_t chunk_size = 1024 * 1024;
+    for (size_t offset = 0; offset < bytes.size(); offset += chunk_size) {
+        const size_t chunk = std::min(chunk_size, bytes.size() - offset);
+        CC_SHA256_Update(&context, bytes.data() + offset, static_cast<CC_LONG>(chunk));
+    }
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    return digest;
+}
+
+std::array<uint8_t, 32> derived_affine_u2_digest(
+    const DerivedAffineUInt2Record& record,
+    std::span<const uint8_t> packed_weights,
+    std::span<const uint16_t> scales,
+    std::span<const uint16_t> biases) {
+    CC_SHA256_CTX context;
+    CC_SHA256_Init(&context);
+    static constexpr uint8_t domain[] = {'L','A','P','A','U','2','0','1'};
+    CC_SHA256_Update(&context, domain, sizeof(domain));
+    digest_u16(context, record.contract.version);
+    digest_u32(context, static_cast<uint32_t>(record.source_format));
+    digest_u64(context, record.contract.logical_k);
+    digest_u64(context, record.contract.logical_n);
+    digest_u32(context, record.contract.block_width);
+    digest_u32(context, record.contract.packed_bytes_per_block);
+    digest_u32(context, record.contract.scale_bytes_per_block);
+    digest_u32(context, record.contract.bias_bytes_per_block);
+    digest_u32(context, record.contract.plane_alignment);
+    CC_SHA256_Update(&context, record.source_digest.data(), record.source_digest.size());
+    CC_SHA256_Update(&context, record.importance_digest.data(),
+                     record.importance_digest.size());
+    constexpr size_t chunk_size = 1024 * 1024;
+    for (size_t offset = 0; offset < packed_weights.size(); offset += chunk_size) {
+        const size_t chunk = std::min(chunk_size, packed_weights.size() - offset);
+        CC_SHA256_Update(&context, packed_weights.data() + offset,
+                         static_cast<CC_LONG>(chunk));
+    }
+    for (uint16_t value : scales) digest_u16(context, value);
+    for (uint16_t value : biases) digest_u16(context, value);
+    std::array<uint8_t, 32> digest{};
+    CC_SHA256_Final(digest.data(), &context);
+    return digest;
+}
+
+int nearest_nonnegative(float value) {
+    // Match GGML's quantizer exactly: round finite values to nearest, ties to even.
+    // Every caller supplies a small non-negative quantization coordinate.
+    float biased = value + 12582912.0f;
+    int bits;
+    std::memcpy(&bits, &biased, sizeof(bits));
+    return (bits & 0x007fffff) - 0x00400000;
+}
+
+bool quantize_affine_u2_block(const float* values, const float* weights,
+                              uint8_t* packed, uint16_t* scale_bits,
+                              uint16_t* bias_bits) {
+    double weight_sum = 0.0;
+    double minimum = 0.0;
+    double maximum = 0.0;
+    bool initialized = false;
+    for (int lane = 0; lane != 256; ++lane) {
+        if (!std::isfinite(values[lane]) || !std::isfinite(weights[lane]) ||
+            weights[lane] < 0.0f)
+            return false;
+        if (weights[lane] == 0.0f) continue;
+        weight_sum += weights[lane];
+        if (!initialized) {
+            minimum = maximum = values[lane];
+            initialized = true;
+        } else {
+            minimum = std::min(minimum, static_cast<double>(values[lane]));
+            maximum = std::max(maximum, static_cast<double>(values[lane]));
+        }
+    }
+    if (!initialized || !std::isfinite(weight_sum) || weight_sum <= 0.0)
+        return false;
+
+    double scale = (maximum - minimum) / 3.0;
+    double bias = minimum;
+    std::array<uint8_t, 256> levels{};
+    for (int iteration = 0; iteration != 8; ++iteration) {
+        double sum_q = 0.0;
+        double sum_q2 = 0.0;
+        double sum_x = 0.0;
+        double sum_qx = 0.0;
+        for (int lane = 0; lane != 256; ++lane) {
+            const int level = scale > 0.0
+                ? std::clamp(nearest_nonnegative(static_cast<float>(
+                      (static_cast<double>(values[lane]) - bias) / scale)), 0, 3)
+                : 0;
+            levels[lane] = static_cast<uint8_t>(level);
+            const double weight = weights[lane];
+            sum_q += weight * level;
+            sum_q2 += weight * level * level;
+            sum_x += weight * values[lane];
+            sum_qx += weight * level * values[lane];
+        }
+        const double determinant = weight_sum * sum_q2 - sum_q * sum_q;
+        if (determinant > 0.0) {
+            const double next_scale =
+                (weight_sum * sum_qx - sum_q * sum_x) / determinant;
+            const double next_bias = (sum_x - next_scale * sum_q) / weight_sum;
+            if (!std::isfinite(next_scale) || !std::isfinite(next_bias) ||
+                next_scale < 0.0)
+                return false;
+            scale = next_scale;
+            bias = next_bias;
+        } else {
+            scale = 0.0;
+            bias = sum_x / weight_sum;
+        }
+    }
+
+    const uint16_t stored_scale = fp32_to_fp16(static_cast<float>(scale));
+    const uint16_t stored_bias = fp32_to_fp16(static_cast<float>(bias));
+    const float decoded_scale = fp16_to_fp32(stored_scale);
+    const float decoded_bias = fp16_to_fp32(stored_bias);
+    if (!std::isfinite(decoded_scale) || !std::isfinite(decoded_bias) ||
+        decoded_scale < 0.0f)
+        return false;
+    std::fill(packed, packed + 64, uint8_t{0});
+    for (int lane = 0; lane != 256; ++lane) {
+        const int level = decoded_scale > 0.0f
+            ? std::clamp(nearest_nonnegative(
+                  (values[lane] - decoded_bias) / decoded_scale), 0, 3)
+            : 0;
+        packed[lane / 4] |= static_cast<uint8_t>(level << (2 * (lane & 3)));
+    }
+    *scale_bits = stored_scale;
+    *bias_bits = stored_bias;
+    return true;
+}
+
+float make_q2_group(const float* values, uint8_t* levels, float* minimum,
+                    uint8_t* scratch) {
+    float min_value = values[0];
+    float max_value = values[0];
+    float sum_weight = std::fabs(values[0]);
+    float sum_value = sum_weight * values[0];
+    for (int i = 1; i < 16; ++i) {
+        min_value = std::min(min_value, values[i]);
+        max_value = std::max(max_value, values[i]);
+        float weight = std::fabs(values[i]);
+        sum_weight += weight;
+        sum_value += weight * values[i];
+    }
+    if (min_value > 0.0f) min_value = 0.0f;
+    if (max_value == min_value) {
+        std::fill(levels, levels + 16, uint8_t{0});
+        *minimum = -min_value;
+        return 0.0f;
+    }
+
+    float inverse_scale = 3.0f / (max_value - min_value);
+    float scale = 1.0f / inverse_scale;
+    float best_error = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        int level = std::clamp(nearest_nonnegative(inverse_scale * (values[i] - min_value)), 0, 3);
+        levels[i] = static_cast<uint8_t>(level);
+        float difference = scale * level + min_value - values[i];
+        best_error += std::fabs(values[i]) * std::fabs(difference);
+    }
+
+    for (int step = 0; step <= 15; ++step) {
+        inverse_scale = (-0.5f + 0.1f * step + 3.0f) / (max_value - min_value);
+        float sum_level = 0.0f;
+        float sum_level2 = 0.0f;
+        float sum_value_level = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            int level = std::clamp(nearest_nonnegative(inverse_scale * (values[i] - min_value)), 0, 3);
+            scratch[i] = static_cast<uint8_t>(level);
+            float weight = std::fabs(values[i]);
+            sum_level += weight * level;
+            sum_level2 += weight * level * level;
+            sum_value_level += weight * level * values[i];
+        }
+        float determinant = sum_weight * sum_level2 - sum_level * sum_level;
+        if (determinant <= 0.0f) continue;
+        float candidate_scale = (sum_weight * sum_value_level - sum_value * sum_level) / determinant;
+        float candidate_min = (sum_level2 * sum_value - sum_level * sum_value_level) / determinant;
+        if (candidate_min > 0.0f) {
+            candidate_min = 0.0f;
+            candidate_scale = sum_level2 > 0.0f ? sum_value_level / sum_level2 : 0.0f;
+        }
+        float error = 0.0f;
+        for (int i = 0; i < 16; ++i) {
+            float difference = candidate_scale * scratch[i] + candidate_min - values[i];
+            error += std::fabs(values[i]) * std::fabs(difference);
+        }
+        if (error < best_error) {
+            std::copy(scratch, scratch + 16, levels);
+            best_error = error;
+            scale = candidate_scale;
+            min_value = candidate_min;
+        }
+    }
+    *minimum = -min_value;
+    return scale;
+}
+
+bool quantize_q2_k_block(const float* values, kernels::block_q2_K& output) {
+    uint8_t levels[256]{};
+    uint8_t scratch[16]{};
+    float minima[16]{};
+    float scales[16]{};
+    float max_scale = 0.0f;
+    float max_minimum = 0.0f;
+    for (int group = 0; group < 16; ++group) {
+        for (int lane = 0; lane < 16; ++lane)
+            if (!std::isfinite(values[group * 16 + lane])) return false;
+        scales[group] = make_q2_group(values + group * 16, levels + group * 16,
+                                      &minima[group], scratch);
+        max_scale = std::max(max_scale, scales[group]);
+        max_minimum = std::max(max_minimum, minima[group]);
+    }
+
+    output = {};
+    if (max_scale > 0.0f) {
+        float inverse = 15.0f / max_scale;
+        for (int group = 0; group < 16; ++group)
+            output.scales[group] = static_cast<uint8_t>(std::clamp(nearest_nonnegative(inverse * scales[group]), 0, 15));
+        output.d = fp32_to_fp16(max_scale / 15.0f);
+    }
+    if (max_minimum > 0.0f) {
+        float inverse = 15.0f / max_minimum;
+        for (int group = 0; group < 16; ++group)
+            output.scales[group] |= static_cast<uint8_t>(std::clamp(nearest_nonnegative(inverse * minima[group]), 0, 15) << 4);
+        output.dmin = fp32_to_fp16(max_minimum / 15.0f);
+    }
+
+    float d = fp16_to_fp32(output.d);
+    float dmin = fp16_to_fp32(output.dmin);
+    for (int group = 0; group < 16; ++group) {
+        float group_scale = d * (output.scales[group] & 0x0f);
+        if (group_scale == 0.0f) continue;
+        float group_minimum = dmin * (output.scales[group] >> 4);
+        for (int lane = 0; lane < 16; ++lane) {
+            int level = nearest_nonnegative((values[group * 16 + lane] + group_minimum) / group_scale);
+            levels[group * 16 + lane] = static_cast<uint8_t>(std::clamp(level, 0, 3));
+        }
+    }
+    for (int half = 0; half < 2; ++half) {
+        for (int lane = 0; lane < 32; ++lane) {
+            int base = half * 128 + lane;
+            output.qs[half * 32 + lane] = levels[base] |
+                (levels[base + 32] << 2) | (levels[base + 64] << 4) |
+                (levels[base + 96] << 6);
+        }
+    }
+    return true;
+}
+
+struct IQ2XXSCodebook {
+    struct CandidateRange {
+        uint32_t offset = 0;
+        uint16_t count = 0;
+    };
+    std::array<std::array<uint8_t, 8>, 256> levels{};
+    std::array<int16_t, 256> sign_index{};
+    std::array<CandidateRange, 65536> ranges{};
+    std::vector<uint16_t> candidates;
+
+    IQ2XXSCodebook() {
+        sign_index.fill(-1);
+        for (int index = 0; index < 128; ++index)
+            sign_index[kIq2XxsSigns[index]] = static_cast<int16_t>(index);
+        for (int grid = 0; grid < 256; ++grid) {
+            for (int lane = 0; lane < 8; ++lane) {
+                const uint8_t encoded = static_cast<uint8_t>(kIq2XxsGrid[grid] >> (8 * lane));
+                levels[grid][lane] = encoded == 8 ? 0 : encoded == 25 ? 1 : 2;
+            }
+        }
+        for (uint32_t pattern = 0; pattern < ranges.size(); ++pattern) {
+            std::array<uint8_t, 8> target{};
+            bool valid = true;
+            for (int lane = 0; lane < 8; ++lane) {
+                target[lane] = static_cast<uint8_t>((pattern >> (2 * lane)) & 3u);
+                valid &= target[lane] < 3;
+            }
+            if (!valid) continue;
+            std::array<uint16_t, 256> distance{};
+            uint16_t first = std::numeric_limits<uint16_t>::max();
+            uint16_t second = std::numeric_limits<uint16_t>::max();
+            for (int grid = 0; grid < 256; ++grid) {
+                int d2 = 0;
+                for (int lane = 0; lane < 8; ++lane) {
+                    int delta = static_cast<int>(levels[grid][lane]) - target[lane];
+                    d2 += delta * delta;
+                }
+                distance[grid] = static_cast<uint16_t>(d2);
+                if (d2 < first) {
+                    second = first;
+                    first = static_cast<uint16_t>(d2);
+                } else if (d2 > first && d2 < second) {
+                    second = static_cast<uint16_t>(d2);
+                }
+            }
+            CandidateRange& range = ranges[pattern];
+            range.offset = static_cast<uint32_t>(candidates.size());
+            for (int grid = 0; grid < 256; ++grid) {
+                if (distance[grid] == first || distance[grid] == second)
+                    candidates.push_back(static_cast<uint16_t>(grid));
+            }
+            range.count = static_cast<uint16_t>(candidates.size() - range.offset);
+        }
+    }
+};
+
+const IQ2XXSCodebook& iq2_xxs_codebook() {
+    static const IQ2XXSCodebook codebook;
+    return codebook;
+}
+
+float make_iq2_positive_quants(const float* values, const float* weights, uint8_t* levels) {
+    float maximum = 0.0f;
+    for (int i = 0; i < 32; ++i) maximum = std::max(maximum, values[i]);
+    if (maximum < 1e-15f) {
+        std::fill(levels, levels + 32, uint8_t{0});
+        return 0.0f;
+    }
+    float inverse_scale = 4.0f / maximum;
+    float best_error = std::numeric_limits<float>::max();
+    for (int step = -4; step <= 4; ++step) {
+        const float candidate_inverse = (4.0f + 0.1f * step) / maximum;
+        const float candidate_scale = 1.0f / candidate_inverse;
+        float error = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const int level = std::min(4, nearest_nonnegative(candidate_inverse * values[i]));
+            const float delta = values[i] - candidate_scale * level;
+            error += weights[i] * delta * delta;
+        }
+        if (error < best_error) {
+            best_error = error;
+            inverse_scale = candidate_inverse;
+        }
+    }
+    float sum_value_level = 0.0f;
+    float sum_level2 = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        const int level = std::min(4, nearest_nonnegative(inverse_scale * values[i]));
+        levels[i] = static_cast<uint8_t>(level);
+        sum_value_level += weights[i] * values[i] * level;
+        sum_level2 += weights[i] * level * level;
+    }
+    for (int iteration = 0; iteration < 5; ++iteration) {
+        int changed = 0;
+        for (int i = 0; i < 32; ++i) {
+            const float slx = sum_value_level - weights[i] * values[i] * levels[i];
+            const float sl2 = sum_level2 - weights[i] * levels[i] * levels[i];
+            if (slx <= 0.0f || sl2 <= 0.0f) continue;
+            const int candidate = std::min(4, nearest_nonnegative(values[i] * sl2 / slx));
+            if (candidate == levels[i]) continue;
+            const float new_slx = slx + weights[i] * values[i] * candidate;
+            const float new_sl2 = sl2 + weights[i] * candidate * candidate;
+            if (new_slx * new_slx * sum_level2 > sum_value_level * sum_value_level * new_sl2) {
+                levels[i] = static_cast<uint8_t>(candidate);
+                sum_value_level = new_slx;
+                sum_level2 = new_sl2;
+                ++changed;
+            }
+        }
+        if (!changed) break;
+    }
+    return sum_level2 > 0.0f ? sum_value_level / sum_level2 : 0.0f;
+}
+
+uint16_t iq2_pattern(const uint8_t* levels) {
+    uint16_t pattern = 0;
+    for (int lane = 0; lane < 8; ++lane) pattern |= static_cast<uint16_t>(levels[lane] << (2 * lane));
+    return pattern;
+}
+
+uint8_t choose_iq2_grid(uint16_t pattern, const float* values, const float* weights,
+                        float scale, uint8_t* selected_levels) {
+    const IQ2XXSCodebook& codebook = iq2_xxs_codebook();
+    const auto range = codebook.ranges[pattern];
+    float best_error = std::numeric_limits<float>::max();
+    uint16_t best_grid = 0;
+    for (uint16_t candidate = 0; candidate < range.count; ++candidate) {
+        const uint16_t grid = codebook.candidates[range.offset + candidate];
+        float error = 0.0f;
+        for (int lane = 0; lane < 8; ++lane) {
+            const float q = static_cast<float>(2 * codebook.levels[grid][lane] + 1);
+            const float delta = scale * q - values[lane];
+            error += weights[lane] * delta * delta;
+        }
+        if (error < best_error) {
+            best_error = error;
+            best_grid = grid;
+        }
+    }
+    std::copy(codebook.levels[best_grid].begin(), codebook.levels[best_grid].end(),
+              selected_levels);
+    return static_cast<uint8_t>(best_grid);
+}
+
+bool quantize_iq2_xxs_block(const float* values, const float* importance,
+                            kernels::block_iq2_xxs& output) {
+    output = {};
+    std::array<float, 8> scales{};
+    std::array<uint32_t, 16> packed{};
+    float sigma2 = 0.0f;
+    for (int i = 0; i < 256; ++i) {
+        if (!std::isfinite(values[i])) return false;
+        sigma2 += values[i] * values[i];
+    }
+    sigma2 /= 256.0f;
+    float maximum_scale = 0.0f;
+    const IQ2XXSCodebook& codebook = iq2_xxs_codebook();
+    for (int group32 = 0; group32 < 8; ++group32) {
+        const float* source = values + group32 * 32;
+        std::array<float, 32> magnitudes{};
+        std::array<float, 32> weights{};
+        std::array<float, 32> neighbor_weights{};
+        std::array<uint8_t, 32> levels{};
+        std::array<uint8_t, 4> signs{};
+        for (int lane = 0; lane < 32; ++lane)
+            weights[lane] = importance[group32 * 32 + lane] *
+                            std::sqrt(sigma2 + source[lane] * source[lane]);
+        for (int lane = 0; lane < 32; ++lane)
+            neighbor_weights[lane] = std::sqrt(weights[lane]);
+        for (int subgroup = 0; subgroup < 4; ++subgroup) {
+            int negative_count = 0;
+            uint8_t sign_pattern = 0;
+            for (int lane = 0; lane < 8; ++lane) {
+                const int index = subgroup * 8 + lane;
+                magnitudes[index] = std::fabs(source[index]);
+                if (source[index] < 0.0f) {
+                    sign_pattern |= static_cast<uint8_t>(1u << lane);
+                    ++negative_count;
+                }
+            }
+            if (negative_count & 1) {
+                int least = 0;
+                float least_cost = weights[subgroup * 8] * source[subgroup * 8] * source[subgroup * 8];
+                for (int lane = 1; lane < 8; ++lane) {
+                    const int index = subgroup * 8 + lane;
+                    const float cost = weights[index] * source[index] * source[index];
+                    if (cost < least_cost) {
+                        least = lane;
+                        least_cost = cost;
+                    }
+                }
+                magnitudes[subgroup * 8 + least] = -magnitudes[subgroup * 8 + least];
+                sign_pattern ^= static_cast<uint8_t>(1u << least);
+            }
+            const int16_t sign_index = codebook.sign_index[sign_pattern];
+            if (sign_index < 0) return false;
+            signs[subgroup] = static_cast<uint8_t>(sign_index);
+        }
+
+        float scale = make_iq2_positive_quants(magnitudes.data(), weights.data(), levels.data());
+        const float effective_maximum = scale * 3.0f;
+        if (effective_maximum <= 0.0f) continue;
+        float best_score = 0.0f;
+        std::array<uint8_t, 32> best_levels{};
+        for (int step = -6; step <= 6; ++step) {
+            const float inverse = (5.0f + 0.1f * step) / effective_maximum;
+            const float candidate_scale = 1.0f / inverse;
+            std::array<uint8_t, 32> candidate_levels{};
+            for (int subgroup = 0; subgroup < 4; ++subgroup) {
+                std::array<uint8_t, 8> approximate{};
+                for (int lane = 0; lane < 8; ++lane) {
+                    const float coordinate = 0.5f * (inverse * magnitudes[subgroup * 8 + lane] - 1.0f);
+                    approximate[lane] = static_cast<uint8_t>(std::clamp(nearest_nonnegative(coordinate), 0, 2));
+                }
+                choose_iq2_grid(iq2_pattern(approximate.data()), magnitudes.data() + subgroup * 8,
+                                neighbor_weights.data() + subgroup * 8, candidate_scale,
+                                candidate_levels.data() + subgroup * 8);
+            }
+            float sumqx = 0.0f;
+            float sumq2 = 0.0f;
+            for (int lane = 0; lane < 32; ++lane) {
+                const float q = static_cast<float>(2 * candidate_levels[lane] + 1);
+                sumqx += weights[lane] * magnitudes[lane] * q;
+                sumq2 += weights[lane] * q * q;
+            }
+            if (sumq2 > 0.0f && sumqx * sumqx > best_score * sumq2) {
+                scale = sumqx / sumq2;
+                best_score = scale * sumqx;
+                best_levels = candidate_levels;
+            }
+        }
+
+        std::array<uint8_t, 4> grids{};
+        if (scale > 0.0f) {
+            const float inverse = 1.0f / scale;
+            for (int subgroup = 0; subgroup < 4; ++subgroup) {
+                std::array<uint8_t, 8> approximate{};
+                for (int lane = 0; lane < 8; ++lane) {
+                    const float coordinate = 0.5f * (inverse * magnitudes[subgroup * 8 + lane] - 1.0f);
+                    approximate[lane] = static_cast<uint8_t>(std::clamp(nearest_nonnegative(coordinate), 0, 2));
+                }
+                grids[subgroup] = choose_iq2_grid(
+                    iq2_pattern(approximate.data()), magnitudes.data() + subgroup * 8,
+                    neighbor_weights.data() + subgroup * 8, scale,
+                    best_levels.data() + subgroup * 8);
+            }
+            float sumqx = 0.0f;
+            float sumq2 = 0.0f;
+            for (int lane = 0; lane < 32; ++lane) {
+                const float q = static_cast<float>(2 * best_levels[lane] + 1);
+                sumqx += weights[lane] * magnitudes[lane] * q;
+                sumq2 += weights[lane] * q * q;
+            }
+            if (sumq2 > 0.0f) scale = sumqx / sumq2;
+        }
+        if (scale < 0.0f) {
+            scale = -scale;
+            for (uint8_t& sign : signs) {
+                const uint8_t flipped = static_cast<uint8_t>(~kIq2XxsSigns[sign]);
+                sign = static_cast<uint8_t>(codebook.sign_index[flipped]);
+            }
+        }
+        uint32_t grid_word = 0;
+        uint32_t sign_word = 0;
+        for (int subgroup = 0; subgroup < 4; ++subgroup) {
+            grid_word |= static_cast<uint32_t>(grids[subgroup]) << (8 * subgroup);
+            sign_word |= static_cast<uint32_t>(signs[subgroup]) << (7 * subgroup);
+        }
+        packed[2 * group32] = grid_word;
+        packed[2 * group32 + 1] = sign_word;
+        scales[group32] = scale;
+        maximum_scale = std::max(maximum_scale, scale);
+    }
+    if (maximum_scale == 0.0f) return true;
+    const float d = maximum_scale / 31.0f;
+    output.d = fp32_to_fp16(d);
+    for (int group32 = 0; group32 < 8; ++group32) {
+        const int level = std::clamp(nearest_nonnegative(0.5f * (scales[group32] / d - 1.0f)), 0, 15);
+        packed[2 * group32 + 1] |= static_cast<uint32_t>(level) << 28;
+    }
+    std::memcpy(output.qs, packed.data(), sizeof(output.qs));
+    return true;
+}
+
+struct IQ1SCodebook {
+    struct CandidateRange {
+        uint32_t offset = 0;
+        uint16_t count = 0;
+    };
+    static constexpr size_t pattern_count = 43691;
+    std::array<std::array<uint8_t, 8>, 2048> levels{};
+    std::array<int16_t, pattern_count> exact{};
+    std::array<CandidateRange, pattern_count> ranges{};
+    std::vector<uint16_t> candidates;
+
+    IQ1SCodebook() {
+        exact.fill(-1);
+        for (uint16_t grid = 0; grid != levels.size(); ++grid) {
+            uint16_t pattern = 0;
+            for (int lane = 0; lane != 8; ++lane) {
+                const int8_t value = static_cast<int8_t>(kIq1SGrid[grid] >> (8 * lane));
+                const uint8_t level = static_cast<uint8_t>(value + 1);
+                levels[grid][lane] = level;
+                pattern |= static_cast<uint16_t>(level << (2 * lane));
+            }
+            exact[pattern] = static_cast<int16_t>(grid);
+        }
+        for (uint32_t pattern = 0; pattern != pattern_count; ++pattern) {
+            std::array<uint8_t, 8> target{};
+            bool valid = true;
+            for (int lane = 0; lane != 8; ++lane) {
+                target[lane] = static_cast<uint8_t>((pattern >> (2 * lane)) & 3u);
+                valid &= target[lane] < 3;
+            }
+            if (!valid || exact[pattern] >= 0) continue;
+            std::array<uint16_t, 3> best = {
+                std::numeric_limits<uint16_t>::max(),
+                std::numeric_limits<uint16_t>::max(),
+                std::numeric_limits<uint16_t>::max()};
+            for (const auto& grid : levels) {
+                uint16_t distance = 0;
+                for (int lane = 0; lane != 8; ++lane) {
+                    const int delta = static_cast<int>(grid[lane]) - target[lane];
+                    distance = static_cast<uint16_t>(distance + 4 * delta * delta);
+                }
+                for (size_t slot = 0; slot != best.size(); ++slot) {
+                    if (distance == best[slot]) break;
+                    if (distance < best[slot]) {
+                        for (size_t move = best.size() - 1; move != slot; --move)
+                            best[move] = best[move - 1];
+                        best[slot] = distance;
+                        break;
+                    }
+                }
+            }
+            CandidateRange& range = ranges[pattern];
+            range.offset = static_cast<uint32_t>(candidates.size());
+            for (const uint16_t wanted_distance : best) {
+                for (uint16_t grid = 0; grid != levels.size(); ++grid) {
+                    uint16_t distance = 0;
+                    for (int lane = 0; lane != 8; ++lane) {
+                        const int delta = static_cast<int>(levels[grid][lane]) - target[lane];
+                        distance = static_cast<uint16_t>(distance + 4 * delta * delta);
+                    }
+                    if (distance == wanted_distance) candidates.push_back(grid);
+                }
+            }
+            range.count = static_cast<uint16_t>(candidates.size() - range.offset);
+        }
+    }
+};
+
+const IQ1SCodebook& iq1_s_codebook() {
+    static const IQ1SCodebook codebook;
+    return codebook;
+}
+
+uint16_t iq1_pattern(const int8_t* levels) {
+    uint16_t pattern = 0;
+    for (int lane = 0; lane != 8; ++lane)
+        pattern |= static_cast<uint16_t>(levels[lane]) << (2 * lane);
+    return pattern;
+}
+
+uint16_t choose_iq1_grid(uint16_t pattern, const float* values, const float* weights,
+                         float scale, const float* quant_values, int8_t* selected_levels) {
+    const IQ1SCodebook& codebook = iq1_s_codebook();
+    const int16_t exact = codebook.exact[pattern];
+    if (exact >= 0) {
+        std::copy(codebook.levels[exact].begin(), codebook.levels[exact].end(),
+                  selected_levels);
+        return static_cast<uint16_t>(exact);
+    }
+    const auto range = codebook.ranges[pattern];
+    float best_error = std::numeric_limits<float>::max();
+    uint16_t best_grid = 0;
+    for (uint16_t candidate = 0; candidate != range.count; ++candidate) {
+        const uint16_t grid = codebook.candidates[range.offset + candidate];
+        float error = 0.0f;
+        for (int lane = 0; lane != 8; ++lane) {
+            const float delta = scale * quant_values[codebook.levels[grid][lane]] - values[lane];
+            error += weights[lane] * delta * delta;
+        }
+        if (error < best_error) {
+            best_error = error;
+            best_grid = grid;
+        }
+    }
+    std::copy(codebook.levels[best_grid].begin(), codebook.levels[best_grid].end(),
+              selected_levels);
+    return best_grid;
+}
+
+struct IQ1SortPair {
+    float value;
+    int index;
+};
+
+int compare_iq1_pairs(const void* left, const void* right) {
+    const float a = static_cast<const IQ1SortPair*>(left)->value;
+    const float b = static_cast<const IQ1SortPair*>(right)->value;
+    return a < b ? -1 : a > b ? 1 : 0;
+}
+
+bool quantize_iq1_s_block(const float* values, const float* importance,
+                          kernels::block_iq1_s& output) {
+    output = {};
+    constexpr float positive_values[3] = {-0.875f, 0.125f, 1.125f};
+    constexpr float negative_values[3] = {-1.125f, -0.125f, 0.875f};
+    std::array<float, 8> scales{};
+    std::array<int8_t, 8> shifts{};
+    float sum_squares = 0.0f;
+    for (int lane = 0; lane != 256; ++lane) {
+        if (!std::isfinite(values[lane])) return false;
+        sum_squares += values[lane] * values[lane];
+    }
+    const float sigma2 = 2.0f * sum_squares / 256.0f;
+    float maximum_scale = 0.0f;
+    const IQ1SCodebook& codebook = iq1_s_codebook();
+    for (int block32 = 0; block32 != 8; ++block32) {
+        const float* source = values + block32 * 32;
+        const float* source_importance = importance + block32 * 32;
+        std::array<float, 32> weights{};
+        std::array<IQ1SortPair, 32> sorted{};
+        float maximum = 0.0f;
+        for (int lane = 0; lane != 32; ++lane) {
+            weights[lane] = source_importance[lane] *
+                            std::sqrt(sigma2 + source[lane] * source[lane]);
+            maximum = std::max(maximum, std::fabs(source[lane]));
+            sorted[lane] = {source[lane], lane};
+        }
+        if (maximum < 1e-12f) {
+            shifts[block32] = 1;
+            continue;
+        }
+        std::qsort(sorted.data(), sorted.size(), sizeof(sorted[0]), compare_iq1_pairs);
+        std::array<float, 33> cumulative_value{};
+        std::array<float, 33> cumulative_weight{};
+        for (int lane = 0; lane != 32; ++lane) {
+            const int index = sorted[lane].index;
+            cumulative_value[lane + 1] = cumulative_value[lane] + weights[index] * source[index];
+            cumulative_weight[lane + 1] = cumulative_weight[lane] + weights[index];
+        }
+        float best_score = -std::numeric_limits<float>::max();
+        float scale = maximum;
+        int boundary1 = -1;
+        int boundary2 = -1;
+        int shift = 0;
+        for (int first = 0; first <= 32; ++first) {
+            for (int second = first; second <= 32; ++second) {
+                for (int sign = 0; sign != 2; ++sign) {
+                    const float* q = sign == 0 ? positive_values : negative_values;
+                    const float sumqx =
+                        cumulative_value[first] * q[0] +
+                        (cumulative_value[second] - cumulative_value[first]) * q[1] +
+                        (cumulative_value[32] - cumulative_value[second]) * q[2];
+                    const float sumq2 =
+                        cumulative_weight[first] * q[0] * q[0] +
+                        (cumulative_weight[second] - cumulative_weight[first]) * q[1] * q[1] +
+                        (cumulative_weight[32] - cumulative_weight[second]) * q[2] * q[2];
+                    if (sumq2 > 0.0f && sumqx * sumqx > best_score * sumq2) {
+                        scale = sumqx / sumq2;
+                        best_score = scale * sumqx;
+                        boundary1 = first;
+                        boundary2 = second;
+                        shift = sign == 0 ? 1 : -1;
+                    }
+                }
+            }
+        }
+        std::array<int8_t, 32> levels{};
+        if (boundary1 < 0 || boundary2 < 0 || shift == 0) {
+            levels.fill(1);
+            shifts[block32] = 1;
+            continue;
+        }
+        for (int lane = 0; lane != boundary1; ++lane) levels[sorted[lane].index] = 0;
+        for (int lane = boundary1; lane != boundary2; ++lane) levels[sorted[lane].index] = 1;
+        for (int lane = boundary2; lane != 32; ++lane) levels[sorted[lane].index] = 2;
+        if (scale < 0.0f) {
+            for (int8_t& level : levels) level = static_cast<int8_t>(2 - level);
+            scale = -scale;
+            shift = -shift;
+        }
+        const float* quant_values = shift == 1 ? positive_values : negative_values;
+        std::array<uint16_t, 4> grids{};
+        bool off_grid = false;
+        for (int group = 0; group != 4; ++group) {
+            const uint16_t pattern = iq1_pattern(levels.data() + group * 8);
+            off_grid |= codebook.exact[pattern] < 0;
+            grids[group] = choose_iq1_grid(pattern, source + group * 8,
+                                           weights.data() + group * 8, scale,
+                                           quant_values, levels.data() + group * 8);
+        }
+        if (off_grid) {
+            float sumqx = 0.0f;
+            float sumq2 = 0.0f;
+            for (int lane = 0; lane != 32; ++lane) {
+                const float q = quant_values[levels[lane]];
+                sumqx += weights[lane] * q * source[lane];
+                sumq2 += weights[lane] * q * q;
+            }
+            if (sumqx > 0.0f && sumq2 > 0.0f) scale = sumqx / sumq2;
+        }
+        uint16_t high = 0;
+        for (int group = 0; group != 4; ++group) {
+            output.qs[4 * block32 + group] = static_cast<uint8_t>(grids[group]);
+            high |= static_cast<uint16_t>((grids[group] >> 8) << (3 * group));
+        }
+        output.qh[block32] = high;
+        scales[block32] = scale;
+        shifts[block32] = static_cast<int8_t>(shift);
+        maximum_scale = std::max(maximum_scale, scale);
+    }
+    if (maximum_scale == 0.0f) return true;
+    const float d = maximum_scale / 15.0f;
+    output.d = fp32_to_fp16(d * 1.125f);
+    const float inverse = 1.0f / d;
+    for (int block32 = 0; block32 != 8; ++block32) {
+        int level = nearest_nonnegative(0.5f * (inverse * scales[block32] - 1.0f));
+        level = std::clamp(level, 0, 7);
+        if (shifts[block32] == -1) level |= 8;
+        output.qh[block32] |= static_cast<uint16_t>(level << 12);
+    }
+    return true;
+}
 
 inline float geglu_product(float gate, float up) {
     constexpr float c = 0.7978845608028654f;
@@ -343,6 +1343,7 @@ void gemm_scalar(const float* x, const uint8_t* data, float* y,
 
 bool gemm_fallback(const float* x, const uint8_t* w, GGMLType type,
                    float* y, int M, int K, int N) {
+    if (is_cpu_rejected_type(type)) return false;
     const size_t rb = static_cast<size_t>(K) / elements_per_block(type) * bytes_per_block(type);
     switch (type) {
         case GGMLType::F32:  gemm_scalar<dot_row_f32 >(x, w, y, M, K, N, rb); return true;
@@ -388,6 +1389,586 @@ struct ProfScope {
 
 } // namespace
 
+#if defined(LAPLACE_TESTING)
+uint8_t iq2_xxs_upstream_neighbor_for_testing(uint16_t pattern, const float* values,
+                                              const float* optimization_weights, float scale,
+                                              uint8_t* selected_levels) {
+    std::array<float, 8> neighbor_weights{};
+    for (size_t lane = 0; lane != neighbor_weights.size(); ++lane)
+        neighbor_weights[lane] = std::sqrt(optimization_weights[lane]);
+    return choose_iq2_grid(pattern, values, neighbor_weights.data(), scale, selected_levels);
+}
+
+uint16_t iq1_s_upstream_neighbor_for_testing(uint16_t pattern, const float* values,
+                                             const float* weights, float scale,
+                                             const float* quant_values,
+                                             int8_t* selected_levels) {
+    return choose_iq1_grid(pattern, values, weights, scale, quant_values,
+                           selected_levels);
+}
+
+bool iq1_s_candidate_order_is_upstream_for_testing() {
+    const IQ1SCodebook& codebook = iq1_s_codebook();
+    for (uint32_t pattern = 0; pattern != codebook.ranges.size(); ++pattern) {
+        const auto range = codebook.ranges[pattern];
+        if (range.count == 0) continue;
+        std::array<uint8_t, 8> target{};
+        for (int lane = 0; lane != 8; ++lane)
+            target[lane] = static_cast<uint8_t>((pattern >> (2 * lane)) & 3u);
+        uint16_t previous_distance = 0;
+        uint16_t previous_grid = 0;
+        bool first = true;
+        for (uint16_t candidate = 0; candidate != range.count; ++candidate) {
+            const uint16_t grid = codebook.candidates[range.offset + candidate];
+            uint16_t distance = 0;
+            for (int lane = 0; lane != 8; ++lane) {
+                const int delta = static_cast<int>(codebook.levels[grid][lane]) -
+                                  static_cast<int>(target[lane]);
+                distance = static_cast<uint16_t>(distance + 4 * delta * delta);
+            }
+            if (!first && (distance < previous_distance ||
+                           (distance == previous_distance && grid <= previous_grid)))
+                return false;
+            first = false;
+            previous_distance = distance;
+            previous_grid = grid;
+        }
+    }
+    return true;
+}
+#endif
+
+bool validate_affine_u2_block256(const DerivedAffineUInt2Storage& storage,
+                                 DerivedStorageError* error) {
+    auto reject = [error](DerivedStorageError value) {
+        if (error) *error = value;
+        return false;
+    };
+    if (error) *error = DerivedStorageError::None;
+    const DerivedAffineUInt2Contract expected{
+        1, storage.contract.logical_k, storage.contract.logical_n,
+        256, 64, 2, 2, 128,
+    };
+    if (storage.contract != expected)
+        return reject(DerivedStorageError::ContractMismatch);
+    if (storage.contract.logical_k == 0 || storage.contract.logical_n == 0 ||
+        storage.contract.logical_k % 256 != 0)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    const uint64_t blocks_per_row = storage.contract.logical_k / 256;
+    if (storage.contract.logical_n >
+        std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    const uint64_t blocks = storage.contract.logical_n * blocks_per_row;
+    if (blocks > std::numeric_limits<size_t>::max() / 64 ||
+        storage.packed_weights.size() != static_cast<size_t>(blocks * 64) ||
+        storage.scales.size() != blocks || storage.biases.size() != blocks)
+        return reject(DerivedStorageError::DestinationLengthMismatch);
+    for (uint64_t block = 0; block != blocks; ++block) {
+        if (!std::isfinite(fp16_to_fp32(storage.scales[block])) ||
+            !std::isfinite(fp16_to_fp32(storage.biases[block])))
+            return reject(DerivedStorageError::NonFiniteSource);
+    }
+    return true;
+}
+
+bool decode_affine_u2_block256(const DerivedAffineUInt2Storage& storage,
+                               std::vector<float>& output,
+                               DerivedStorageError* error) {
+    if (!validate_affine_u2_block256(storage, error)) return false;
+    if (storage.contract.logical_n >
+        std::numeric_limits<size_t>::max() / storage.contract.logical_k) {
+        if (error) *error = DerivedStorageError::ShapeUnsupported;
+        return false;
+    }
+    const size_t values = static_cast<size_t>(
+        storage.contract.logical_n * storage.contract.logical_k);
+    output.resize(values);
+    for (size_t index = 0; index != values; ++index) {
+        const size_t block = index / 256;
+        const uint8_t packed = storage.packed_weights[index / 4];
+        const uint8_t q = static_cast<uint8_t>((packed >> (2 * (index & 3))) & 3u);
+        output[index] = fp16_to_fp32(storage.scales[block]) * static_cast<float>(q) +
+                        fp16_to_fp32(storage.biases[block]);
+    }
+    return true;
+}
+
+bool derive_affine_u2_block256_from_gguf(
+    GGMLType source_format, std::span<const uint8_t> source,
+    uint64_t logical_k, uint64_t logical_n, std::span<const float> importance,
+    std::span<uint8_t> packed_weights, std::span<uint16_t> scales,
+    std::span<uint16_t> biases, DerivedAffineUInt2Record* record,
+    DerivedStorageError* error) {
+    auto reject = [error](DerivedStorageError value) {
+        if (error) *error = value;
+        return false;
+    };
+    if (error) *error = DerivedStorageError::None;
+    if (!record) return reject(DerivedStorageError::ShapeUnsupported);
+    uint64_t source_block_bytes = 0;
+    if (source_format == GGMLType::Q4_K)
+        source_block_bytes = sizeof(kernels::block_q4_K);
+    else if (source_format == GGMLType::Q6_K)
+        source_block_bytes = sizeof(kernels::block_q6_K);
+    else
+        return reject(DerivedStorageError::SourceFormatUnsupported);
+    if (logical_k == 0 || logical_n == 0 || logical_k % 256 != 0)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    if (importance.size() != logical_k)
+        return reject(DerivedStorageError::ImportanceLengthMismatch);
+    for (float value : importance)
+        if (!std::isfinite(value) || value < 0.0f)
+            return reject(DerivedStorageError::InvalidImportance);
+    const uint64_t blocks_per_row = logical_k / 256;
+    for (uint64_t block = 0; block != blocks_per_row; ++block) {
+        bool any_positive = false;
+        for (uint64_t lane = 0; lane != 256; ++lane)
+            any_positive = any_positive || importance[block * 256 + lane] > 0.0f;
+        if (!any_positive) return reject(DerivedStorageError::InvalidImportance);
+    }
+    if (logical_n > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    const uint64_t block_count = logical_n * blocks_per_row;
+    if (block_count > std::numeric_limits<size_t>::max() / source_block_bytes ||
+        source.size() != static_cast<size_t>(block_count * source_block_bytes))
+        return reject(DerivedStorageError::SourceLengthMismatch);
+    if (block_count > std::numeric_limits<size_t>::max() / 64 ||
+        packed_weights.size() != static_cast<size_t>(block_count * 64) ||
+        scales.size() != block_count || biases.size() != block_count)
+        return reject(DerivedStorageError::DestinationLengthMismatch);
+    constexpr uintptr_t alignment = 128;
+    if ((reinterpret_cast<uintptr_t>(packed_weights.data()) & (alignment - 1)) != 0 ||
+        (reinterpret_cast<uintptr_t>(scales.data()) & (alignment - 1)) != 0 ||
+        (reinterpret_cast<uintptr_t>(biases.data()) & (alignment - 1)) != 0)
+        return reject(DerivedStorageError::DestinationAlignmentMismatch);
+
+    DerivedAffineUInt2Record derived;
+    derived.contract.logical_k = logical_k;
+    derived.contract.logical_n = logical_n;
+    derived.source_format = source_format;
+    derived.source_digest = digest_bytes(source);
+    derived.importance_digest = digest_bytes(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(importance.data()), importance.size_bytes()));
+
+    std::atomic<bool> failed{false};
+    for (uint64_t base = 0; base < block_count; ) {
+        const int count = static_cast<int>(std::min<uint64_t>(
+            block_count - base, static_cast<uint64_t>(INT_MAX)));
+        ThreadPool::get().parallel_for(count, [&](int index) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            const uint64_t block = base + static_cast<uint64_t>(index);
+            std::array<float, 256> values{};
+            Tensor source_block;
+            source_block.type = source_format;
+            source_block.n_dims = 1;
+            source_block.dims[0] = 256;
+            source_block.data = source.data() +
+                static_cast<size_t>(block * source_block_bytes);
+            dequantize(source_block, values.data(), 256);
+            const size_t importance_offset =
+                static_cast<size_t>(block % blocks_per_row) * 256;
+            if (!quantize_affine_u2_block(
+                    values.data(), importance.data() + importance_offset,
+                    packed_weights.data() + static_cast<size_t>(block) * 64,
+                    scales.data() + block, biases.data() + block))
+                failed.store(true, std::memory_order_relaxed);
+        });
+        if (failed.load(std::memory_order_relaxed))
+            return reject(DerivedStorageError::NonFiniteSource);
+        base += static_cast<uint64_t>(count);
+    }
+    derived.storage_digest = derived_affine_u2_digest(
+        derived, packed_weights, scales, biases);
+    *record = derived;
+    return true;
+}
+
+bool derive_column_grouped_affine_u2_skip_v1_from_gguf(
+    GGMLType source_format, std::span<const uint8_t> source,
+    uint64_t logical_k, uint64_t logical_n, std::span<const float> importance,
+    std::span<uint8_t> packed_weights, std::span<uint16_t> scales,
+    std::span<uint16_t> biases,
+    ColumnGroupedAffineUInt2SkipV1Storage* storage,
+    DerivedStorageError* error) {
+    const auto reject = [error](DerivedStorageError value) {
+        if (error) *error = value;
+        return false;
+    };
+    if (error) *error = DerivedStorageError::None;
+    if (!storage) return reject(DerivedStorageError::ShapeUnsupported);
+
+    uint64_t source_block_bytes = 0;
+    if (source_format == GGMLType::Q4_K)
+        source_block_bytes = sizeof(kernels::block_q4_K);
+    else if (source_format == GGMLType::Q6_K)
+        source_block_bytes = sizeof(kernels::block_q6_K);
+    else
+        return reject(DerivedStorageError::SourceFormatUnsupported);
+    if (logical_k == 0 || logical_n == 0 || logical_k % 256u != 0 ||
+        logical_n % 256u != 0 || logical_k > static_cast<uint64_t>(INT_MAX) ||
+        logical_n > static_cast<uint64_t>(UINT32_MAX))
+        return reject(DerivedStorageError::ShapeUnsupported);
+    if (importance.size() != logical_k)
+        return reject(DerivedStorageError::ImportanceLengthMismatch);
+    bool any_importance = false;
+    for (float value : importance) {
+        if (!std::isfinite(value) || value < 0.0f)
+            return reject(DerivedStorageError::InvalidImportance);
+        any_importance = any_importance || value > 0.0f;
+    }
+    if (!any_importance) return reject(DerivedStorageError::InvalidImportance);
+
+    const uint64_t blocks_per_row = logical_k / 256u;
+    if (logical_n > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    const uint64_t source_blocks = logical_n * blocks_per_row;
+    if (source_blocks > std::numeric_limits<size_t>::max() / source_block_bytes ||
+        source.size() != static_cast<size_t>(source_blocks * source_block_bytes))
+        return reject(DerivedStorageError::SourceLengthMismatch);
+
+    ColumnGroupedAffineUInt2SkipV1Contract contract;
+    ColumnGroupedAffineUInt2SkipV1Error contract_error{};
+    if (!column_grouped_affine_uint2_skip_v1_make_contract(
+            logical_k, logical_n, &contract, &contract_error))
+        return reject(DerivedStorageError::ShapeUnsupported);
+    if (packed_weights.size() != static_cast<size_t>(contract.values_bytes) ||
+        scales.size() != static_cast<size_t>(contract.group_count) ||
+        biases.size() != static_cast<size_t>(contract.group_count))
+        return reject(DerivedStorageError::DestinationLengthMismatch);
+    constexpr uintptr_t alignment = 128u;
+    if (!packed_weights.data() || !scales.data() || !biases.data() ||
+        (reinterpret_cast<uintptr_t>(packed_weights.data()) & (alignment - 1u)) != 0u ||
+        (reinterpret_cast<uintptr_t>(scales.data()) & (alignment - 1u)) != 0u ||
+        (reinterpret_cast<uintptr_t>(biases.data()) & (alignment - 1u)) != 0u)
+        return reject(DerivedStorageError::DestinationAlignmentMismatch);
+    if (byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            scales.data(), scales.size_bytes()) ||
+        byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            biases.data(), biases.size_bytes()) ||
+        byte_ranges_overlap(scales.data(), scales.size_bytes(),
+                            biases.data(), biases.size_bytes()) ||
+        byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            source.data(), source.size()) ||
+        byte_ranges_overlap(scales.data(), scales.size_bytes(),
+                            source.data(), source.size()) ||
+        byte_ranges_overlap(biases.data(), biases.size_bytes(),
+                            source.data(), source.size()) ||
+        byte_ranges_overlap(packed_weights.data(), packed_weights.size(),
+                            importance.data(), importance.size_bytes()) ||
+        byte_ranges_overlap(scales.data(), scales.size_bytes(),
+                            importance.data(), importance.size_bytes()) ||
+        byte_ranges_overlap(biases.data(), biases.size_bytes(),
+                            importance.data(), importance.size_bytes()))
+        return reject(DerivedStorageError::DestinationOverlap);
+
+    if (logical_k > std::numeric_limits<size_t>::max() / (256u * sizeof(float)))
+        return reject(DerivedStorageError::ShapeUnsupported);
+    std::vector<float> tile;
+    try {
+        tile.resize(static_cast<size_t>(logical_k) * 256u);
+    } catch (const std::bad_alloc&) {
+        return reject(DerivedStorageError::ShapeUnsupported);
+    } catch (const std::length_error&) {
+        return reject(DerivedStorageError::ShapeUnsupported);
+    }
+    const size_t source_row_bytes = static_cast<size_t>(blocks_per_row * source_block_bytes);
+    std::atomic<bool> failed{false};
+    const uint32_t output_groups = static_cast<uint32_t>(logical_n / 256u);
+    for (uint32_t output_group = 0; output_group != output_groups; ++output_group) {
+        ThreadPool::get().parallel_for(256, [&](int lane) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            Tensor row;
+            row.type = source_format;
+            row.n_dims = 1;
+            row.dims[0] = logical_k;
+            row.data = source.data() +
+                (static_cast<size_t>(output_group) * 256u + static_cast<size_t>(lane)) *
+                    source_row_bytes;
+            dequantize(row, tile.data() + static_cast<size_t>(lane) * logical_k,
+                       static_cast<int>(logical_k));
+        });
+        ThreadPool::get().parallel_for(static_cast<int>(logical_k), [&](int column_value) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            const uint32_t column = static_cast<uint32_t>(column_value);
+            std::array<float, 256> values{};
+            std::array<float, 256> weights{};
+            for (uint32_t lane = 0; lane != 256u; ++lane)
+                values[lane] = tile[static_cast<size_t>(lane) * logical_k + column];
+            // A K-length activation statistic has one value per input column.
+            // A positive constant factor cancels in this column's least-squares
+            // fit; an unseen column uses a complete unweighted fit rather than
+            // deleting weights that may become active outside calibration.
+            weights.fill(importance[column] > 0.0f ? importance[column] : 1.0f);
+            const uint64_t group = static_cast<uint64_t>(output_group) * logical_k + column;
+            if (!quantize_affine_u2_block(
+                    values.data(), weights.data(),
+                    packed_weights.data() + static_cast<size_t>(group) * 64u,
+                    scales.data() + group, biases.data() + group))
+                failed.store(true, std::memory_order_relaxed);
+        });
+        if (failed.load(std::memory_order_relaxed))
+            return reject(DerivedStorageError::NonFiniteSource);
+    }
+
+    ColumnGroupedAffineUInt2SkipV1Storage candidate;
+    candidate.contract = contract;
+    candidate.planes = {packed_weights.data(), packed_weights.size(),
+                        scales.data(), scales.size(), biases.data(), biases.size()};
+    candidate.source_digest = digest_bytes(source);
+    candidate.provenance_digest = column_grouped_affine_u2_skip_provenance_digest(
+        source_format, logical_k, logical_n, importance);
+    candidate.storage_digest =
+        column_grouped_affine_uint2_skip_v1_storage_digest(candidate);
+    if (!column_grouped_affine_uint2_skip_v1_validate(
+            candidate, candidate.source_digest, candidate.provenance_digest,
+            &contract_error))
+        return reject(DerivedStorageError::IntegrityMismatch);
+    *storage = candidate;
+    return true;
+}
+
+bool derive_q2_k_from_gguf(GGMLType source_format, std::span<const uint8_t> source,
+                           uint64_t logical_k, uint64_t logical_n,
+                           DerivedQ2KStorage* output, DerivedStorageError* error) {
+    auto reject = [error](DerivedStorageError value) {
+        if (error) *error = value;
+        return false;
+    };
+    if (error) *error = DerivedStorageError::None;
+    if (!output) return reject(DerivedStorageError::ShapeUnsupported);
+
+    uint64_t source_block_bytes = 0;
+    if (source_format == GGMLType::Q4_K) source_block_bytes = sizeof(kernels::block_q4_K);
+    else if (source_format == GGMLType::Q6_K) source_block_bytes = sizeof(kernels::block_q6_K);
+    else return reject(DerivedStorageError::SourceFormatUnsupported);
+
+    if (logical_k == 0 || logical_n == 0 || logical_k % 256 != 0)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    uint64_t blocks_per_row = logical_k / 256;
+    if (logical_n > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    uint64_t block_count = logical_n * blocks_per_row;
+    if (block_count > std::numeric_limits<size_t>::max() / source_block_bytes ||
+        source.size() != static_cast<size_t>(block_count * source_block_bytes))
+        return reject(DerivedStorageError::SourceLengthMismatch);
+    if (block_count > std::numeric_limits<size_t>::max() / sizeof(kernels::block_q2_K))
+        return reject(DerivedStorageError::ShapeUnsupported);
+
+    DerivedQ2KStorage derived;
+    derived.contract.source_format = source_format;
+    derived.contract.logical_k = logical_k;
+    derived.contract.logical_n = logical_n;
+    derived.source_digest = digest_bytes(source);
+    derived.bytes.resize(static_cast<size_t>(block_count) * sizeof(kernels::block_q2_K));
+
+    std::array<float, 256> values{};
+    for (uint64_t block = 0; block < block_count; ++block) {
+        Tensor source_block;
+        source_block.type = source_format;
+        source_block.n_dims = 1;
+        source_block.dims[0] = 256;
+        source_block.data = source.data() + static_cast<size_t>(block * source_block_bytes);
+        dequantize(source_block, values.data(), 256);
+        kernels::block_q2_K packed{};
+        if (!quantize_q2_k_block(values.data(), packed))
+            return reject(DerivedStorageError::NonFiniteSource);
+        std::memcpy(derived.bytes.data() + static_cast<size_t>(block) * sizeof(packed),
+                    &packed, sizeof(packed));
+    }
+    derived.storage_digest = derived_storage_digest(derived);
+    *output = std::move(derived);
+    return true;
+}
+
+bool decode_derived_q2_k(const DerivedQ2KStorage& storage, std::vector<float>& output) {
+    const DerivedQ2KContract expected{
+        1, storage.contract.source_format, storage.contract.logical_k,
+        storage.contract.logical_n, 256, 84, 128,
+    };
+    if (storage.contract != expected ||
+        (storage.contract.source_format != GGMLType::Q4_K &&
+         storage.contract.source_format != GGMLType::Q6_K) ||
+        storage.contract.logical_k == 0 || storage.contract.logical_n == 0 ||
+        storage.contract.logical_k % 256 != 0)
+        return false;
+    uint64_t blocks_per_row = storage.contract.logical_k / 256;
+    if (storage.contract.logical_n > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return false;
+    uint64_t block_count = storage.contract.logical_n * blocks_per_row;
+    if (block_count > std::numeric_limits<size_t>::max() / sizeof(kernels::block_q2_K) ||
+        storage.bytes.size() != static_cast<size_t>(block_count) * sizeof(kernels::block_q2_K) ||
+        derived_storage_digest(storage) != storage.storage_digest)
+        return false;
+    if (storage.contract.logical_n > std::numeric_limits<size_t>::max() / storage.contract.logical_k)
+        return false;
+    output.resize(static_cast<size_t>(storage.contract.logical_n * storage.contract.logical_k));
+    for (uint64_t block = 0; block < block_count; ++block) {
+        Tensor q2_block;
+        q2_block.type = GGMLType::Q2_K;
+        q2_block.n_dims = 1;
+        q2_block.dims[0] = 256;
+        q2_block.data = storage.bytes.data() + static_cast<size_t>(block) * sizeof(kernels::block_q2_K);
+        dequantize(q2_block, output.data() + static_cast<size_t>(block) * 256, 256);
+    }
+    return true;
+}
+
+bool derive_iq2_xxs_from_gguf(GGMLType source_format, std::span<const uint8_t> source,
+                              uint64_t logical_k, uint64_t logical_n,
+                              std::span<const float> importance,
+                              std::span<uint8_t> destination,
+                              DerivedIQ2XXSRecord* record, DerivedStorageError* error) {
+    auto reject = [error](DerivedStorageError value) {
+        if (error) *error = value;
+        return false;
+    };
+    if (error) *error = DerivedStorageError::None;
+    if (!record) return reject(DerivedStorageError::ShapeUnsupported);
+
+    uint64_t source_block_bytes = 0;
+    if (source_format == GGMLType::Q4_K) source_block_bytes = sizeof(kernels::block_q4_K);
+    else if (source_format == GGMLType::Q6_K) source_block_bytes = sizeof(kernels::block_q6_K);
+    else return reject(DerivedStorageError::SourceFormatUnsupported);
+    if (logical_k == 0 || logical_n == 0 || logical_k % 256 != 0)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    if (importance.size() != logical_k)
+        return reject(DerivedStorageError::ImportanceLengthMismatch);
+    for (float weight : importance) {
+        if (!std::isfinite(weight) || weight < 0.0f)
+            return reject(DerivedStorageError::InvalidImportance);
+    }
+
+    const uint64_t blocks_per_row = logical_k / 256;
+    if (logical_n > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    const uint64_t block_count = logical_n * blocks_per_row;
+    if (block_count > std::numeric_limits<size_t>::max() / source_block_bytes ||
+        source.size() != static_cast<size_t>(block_count * source_block_bytes))
+        return reject(DerivedStorageError::SourceLengthMismatch);
+    if (block_count > std::numeric_limits<size_t>::max() / sizeof(kernels::block_iq2_xxs) ||
+        destination.size() != static_cast<size_t>(block_count) * sizeof(kernels::block_iq2_xxs))
+        return reject(DerivedStorageError::DestinationLengthMismatch);
+
+    DerivedIQ2XXSRecord derived;
+    derived.contract.source_format = source_format;
+    derived.contract.logical_k = logical_k;
+    derived.contract.logical_n = logical_n;
+    derived.source_digest = digest_bytes(source);
+    const auto* importance_bytes = reinterpret_cast<const uint8_t*>(importance.data());
+    derived.importance_digest = digest_bytes(std::span<const uint8_t>(
+        importance_bytes, importance.size_bytes()));
+
+    (void)iq2_xxs_codebook();
+    std::atomic<bool> failed{false};
+    for (uint64_t base = 0; base < block_count; ) {
+        const int count = static_cast<int>(std::min<uint64_t>(
+            block_count - base, static_cast<uint64_t>(INT_MAX)));
+        ThreadPool::get().parallel_for(count, [&](int index) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            const uint64_t block = base + static_cast<uint64_t>(index);
+            std::array<float, 256> values{};
+            Tensor source_block;
+            source_block.type = source_format;
+            source_block.n_dims = 1;
+            source_block.dims[0] = 256;
+            source_block.data = source.data() + static_cast<size_t>(block * source_block_bytes);
+            dequantize(source_block, values.data(), 256);
+            kernels::block_iq2_xxs packed{};
+            const size_t column_offset = static_cast<size_t>(block % blocks_per_row) * 256;
+            if (!quantize_iq2_xxs_block(values.data(), importance.data() + column_offset, packed)) {
+                failed.store(true, std::memory_order_relaxed);
+                return;
+            }
+            std::memcpy(destination.data() + static_cast<size_t>(block) * sizeof(packed),
+                        &packed, sizeof(packed));
+        });
+        if (failed.load(std::memory_order_relaxed))
+            return reject(DerivedStorageError::NonFiniteSource);
+        base += static_cast<uint64_t>(count);
+    }
+    derived.storage_digest = derived_iq2_xxs_digest(derived, destination);
+    *record = derived;
+    return true;
+}
+
+bool derive_iq1_s_from_gguf(GGMLType source_format, std::span<const uint8_t> source,
+                            uint64_t logical_k, uint64_t logical_n,
+                            std::span<const float> importance,
+                            std::span<uint8_t> destination,
+                            DerivedIQ1SRecord* record, DerivedStorageError* error) {
+    auto reject = [error](DerivedStorageError value) {
+        if (error) *error = value;
+        return false;
+    };
+    if (error) *error = DerivedStorageError::None;
+    if (!record) return reject(DerivedStorageError::ShapeUnsupported);
+
+    uint64_t source_block_bytes = 0;
+    if (source_format == GGMLType::Q4_K) source_block_bytes = sizeof(kernels::block_q4_K);
+    else if (source_format == GGMLType::Q6_K) source_block_bytes = sizeof(kernels::block_q6_K);
+    else return reject(DerivedStorageError::SourceFormatUnsupported);
+    if (logical_k == 0 || logical_n == 0 || logical_k % 256 != 0)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    if (importance.size() != logical_k)
+        return reject(DerivedStorageError::ImportanceLengthMismatch);
+    for (float weight : importance) {
+        if (!std::isfinite(weight) || weight < 0.0f)
+            return reject(DerivedStorageError::InvalidImportance);
+    }
+
+    const uint64_t blocks_per_row = logical_k / 256;
+    if (logical_n > std::numeric_limits<uint64_t>::max() / blocks_per_row)
+        return reject(DerivedStorageError::ShapeUnsupported);
+    const uint64_t block_count = logical_n * blocks_per_row;
+    if (block_count > std::numeric_limits<size_t>::max() / source_block_bytes ||
+        source.size() != static_cast<size_t>(block_count * source_block_bytes))
+        return reject(DerivedStorageError::SourceLengthMismatch);
+    if (block_count > std::numeric_limits<size_t>::max() / sizeof(kernels::block_iq1_s) ||
+        destination.size() != static_cast<size_t>(block_count) * sizeof(kernels::block_iq1_s))
+        return reject(DerivedStorageError::DestinationLengthMismatch);
+
+    DerivedIQ1SRecord derived;
+    derived.contract.source_format = source_format;
+    derived.contract.logical_k = logical_k;
+    derived.contract.logical_n = logical_n;
+    derived.source_digest = digest_bytes(source);
+    const auto* importance_bytes = reinterpret_cast<const uint8_t*>(importance.data());
+    derived.importance_digest = digest_bytes(std::span<const uint8_t>(
+        importance_bytes, importance.size_bytes()));
+
+    (void)iq1_s_codebook();
+    std::atomic<bool> failed{false};
+    for (uint64_t base = 0; base < block_count; ) {
+        const int count = static_cast<int>(std::min<uint64_t>(
+            block_count - base, static_cast<uint64_t>(INT_MAX)));
+        ThreadPool::get().parallel_for(count, [&](int index) {
+            if (failed.load(std::memory_order_relaxed)) return;
+            const uint64_t block = base + static_cast<uint64_t>(index);
+            std::array<float, 256> values{};
+            Tensor source_block;
+            source_block.type = source_format;
+            source_block.n_dims = 1;
+            source_block.dims[0] = 256;
+            source_block.data = source.data() + static_cast<size_t>(block * source_block_bytes);
+            dequantize(source_block, values.data(), 256);
+            kernels::block_iq1_s packed{};
+            const size_t column_offset = static_cast<size_t>(block % blocks_per_row) * 256;
+            if (!quantize_iq1_s_block(values.data(), importance.data() + column_offset, packed)) {
+                failed.store(true, std::memory_order_relaxed);
+                return;
+            }
+            std::memcpy(destination.data() + static_cast<size_t>(block) * sizeof(packed),
+                        &packed, sizeof(packed));
+        });
+        if (failed.load(std::memory_order_relaxed))
+            return reject(DerivedStorageError::NonFiniteSource);
+        base += static_cast<uint64_t>(count);
+    }
+    derived.storage_digest = derived_iq1_s_digest(derived, destination);
+    *record = derived;
+    return true;
+}
+
 // MLX affine quantization dot product.
 // w: packed uint32 weights (32/bits elements per word, LSB first)
 // scales: per-group scale (fp16), biases: per-group bias (fp16)
@@ -414,7 +1995,8 @@ static float dot_row_mlx(const float* x, const uint8_t* w,
 }
 
 void matmul_rows(const float* x, const Tensor& w, float* y, int M, int K, int N) {
-    if (w.type == GGMLType::MLX_AFFINE) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
+    if (w.type == GGMLType::GROUPED_AFFINE_U2_256) {
         int bits = w.mlx_bits;
         int gs = w.mlx_group_size;
         int epw = 32 / bits;
@@ -445,17 +2027,65 @@ void matmul_row(const float* x, const Tensor& w, float* y, int K, int N) {
 }
 
 void matmul_lm_head(const float* x, const Tensor& w, float* y, int M, int K, int N) {
-    if (metal_enabled()) {
+    static const bool lm_cpu = std::getenv("LAPLACE_LM_CPU") != nullptr;
+    if (metal_enabled() && !lm_cpu) {
         if (metal_gemm(x, w, y, M, K, N)) return;
     }
     matmul_rows(x, w, y, M, K, N);
 }
 
+void matmul_use_gcd(bool on) {
+    kernels::set_gcd_gemm(on);
+}
+
+bool matmul_gpu_available() {
+    return metal_enabled() && metal_available();
+}
+
+bool matmul_gpu_batch(const MatmulBatchSpec* specs, int n) {
+    if (!metal_enabled() || n <= 0) return false;
+    if (!metal_gemv_begin(specs, n)) return false;
+    metal_gemv_end();
+    return true;
+}
+
+bool matmul_decode_ffn_moe(
+    const float* x_norm, const Tensor& ffn_gate, const Tensor& ffn_up,
+    const Tensor& ffn_down, float* xb, int H, int inter, bool swiglu,
+    const float* moe_in, const Tensor* moe_up_stack, const Tensor* moe_dn_stack,
+    const int* expert_ids, int n_exp, int exp_inter, const float* route_w,
+    float* moe_out) {
+    if (!metal_enabled()) return false;
+    return metal_decode_ffn_moe(x_norm, ffn_gate, ffn_up, ffn_down, xb,
+                                H, inter, swiglu, moe_in, moe_up_stack,
+                                moe_dn_stack, expert_ids, n_exp, exp_inter,
+                                route_w, moe_out);
+}
+
+bool matmul_gpu_begin(const MatmulBatchSpec* specs, int n) {
+    if (!metal_enabled()) return false;
+    return metal_gemv_begin(specs, n);
+}
+
+void matmul_gpu_end() {
+    metal_gemv_end();
+}
+
 void matmul_register_weights(const void* base, size_t size) {
+    if (!metal_enabled()) return;
     metal_register_weights(base, size);
 }
 
+void matmul_gpu_pack(const Tensor& w, int K, int N) {
+    if (!metal_enabled()) return;
+    metal_pack_tensor(w, K, N);
+}
+
 bool matmul_gemm_batch(const MatmulBatchSpec* specs, int n) {
+    for (int i = 0; i < n; i++) {
+        if (specs[i].w && is_cpu_rejected_type(specs[i].w->type))
+            reject_cpu_execution(specs[i].w->type);
+    }
     for (int i = 0; i < n; i++)
         matmul_rows(specs[i].x, *specs[i].w, specs[i].y, 1, specs[i].K, specs[i].N);
     return true;
@@ -464,6 +2094,7 @@ bool matmul_gemm_batch(const MatmulBatchSpec* specs, int n) {
 void fused_moe_gemm_idx(const float* x, const Tensor& w, float* y,
                         const int* expert_idx, int n_experts,
                         int K, int N) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
     // Fused MoE GEMV with indirect expert access. One parallel_for across
     // all selected experts' columns. Activation quantized once.
     ProfScope prof;
@@ -487,6 +2118,7 @@ void fused_moe_gemm_idx(const float* x, const Tensor& w, float* y,
 void fused_moe_gemm_multi(const float* x, const Tensor& w, float* y,
                           const int* expert_idx, int n_experts,
                           int K, int N) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
     // Fused MoE GEMV with per-expert activations. Each expert k has its
     // own input at x[k * K]. One parallel_for across all experts' columns.
     ProfScope prof;
@@ -509,19 +2141,57 @@ void fused_moe_gemm_multi(const float* x, const Tensor& w, float* y,
 
 bool fused_moe_gate_up_geglu(const float* x, const Tensor& w, float* hidden,
                              const int* expert_idx, int n_experts,
-                             int K, int hidden_dim) {
+                             int K, int hidden_dim,
+                             const uint8_t* const* bases) {
+    if (metal_enabled() && n_experts > 0 && n_experts <= 16) {
+        MatmulBatchSpec specs[16];
+        Tensor views[16];
+        std::vector<float> gate_up(static_cast<size_t>(n_experts) * 2 * hidden_dim);
+        size_t per = static_cast<size_t>(2 * hidden_dim) *
+                     (static_cast<size_t>(K) / elements_per_block(w.type) *
+                      bytes_per_block(w.type));
+        bool ok = true;
+        for (int k = 0; k < n_experts; k++) {
+            views[k] = w;
+            views[k].data = bases ? bases[k]
+                                  : w.data + static_cast<size_t>(expert_idx[k]) * per;
+            if (!views[k].data) { ok = false; break; }
+            specs[k] = {x, &views[k],
+                        gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim,
+                        K, 2 * hidden_dim};
+        }
+        if (ok && matmul_gpu_batch(specs, n_experts)) {
+            for (int k = 0; k < n_experts; k++) {
+                const float* gu = gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim;
+                float* dst = hidden + static_cast<size_t>(k) * hidden_dim;
+                for (int j = 0; j < hidden_dim; j++)
+                    dst[j] = geglu_product(gu[j], gu[hidden_dim + j]);
+            }
+            return true;
+        }
+    }
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
     if (kernels::moe_gate_up_fn fn = [] {
         const char* off = std::getenv("LAPLACE_NOSIMD");
         if (off && off[0] == '1') return static_cast<kernels::moe_gate_up_fn>(nullptr);
         return kernels::get_simd_moe_gate_up();
     }()) {
         if (fn(x, w.data, w.type, expert_idx, n_experts, hidden,
-               K, hidden_dim)) return true;
+               K, hidden_dim, bases)) return true;
     }
 
     std::vector<float> gate_up(static_cast<size_t>(n_experts) * 2 * hidden_dim);
-    fused_moe_gemm_idx(x, w, gate_up.data(), expert_idx, n_experts,
+    if (bases) {
+        for (int k = 0; k < n_experts; k++) {
+            Tensor view = w;
+            view.data = bases[k];
+            matmul_row(x, view, gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim,
                        K, 2 * hidden_dim);
+        }
+    } else {
+        fused_moe_gemm_idx(x, w, gate_up.data(), expert_idx, n_experts,
+                           K, 2 * hidden_dim);
+    }
     for (int k = 0; k < n_experts; k++) {
         const float* gu = gate_up.data() + static_cast<size_t>(k) * 2 * hidden_dim;
         float* dst = hidden + static_cast<size_t>(k) * hidden_dim;
@@ -533,18 +2203,53 @@ bool fused_moe_gate_up_geglu(const float* x, const Tensor& w, float* hidden,
 
 bool fused_moe_down_accumulate(const float* x, const Tensor& w,
                                const int* expert_idx, const float* route_weight,
-                               int n_experts, int K, int N, float* output) {
+                               int n_experts, int K, int N, float* output,
+                               const uint8_t* const* bases) {
+    if (metal_enabled() && n_experts > 0 && n_experts <= 16) {
+        MatmulBatchSpec specs[16];
+        Tensor views[16];
+        std::vector<float> expert_out(static_cast<size_t>(n_experts) * N);
+        size_t per = static_cast<size_t>(N) *
+                     (static_cast<size_t>(K) / elements_per_block(w.type) *
+                      bytes_per_block(w.type));
+        bool ok = true;
+        for (int k = 0; k < n_experts; k++) {
+            views[k] = w;
+            views[k].data = bases ? bases[k]
+                                  : w.data + static_cast<size_t>(expert_idx[k]) * per;
+            if (!views[k].data) { ok = false; break; }
+            specs[k] = {x + static_cast<size_t>(k) * K, &views[k],
+                        expert_out.data() + static_cast<size_t>(k) * N, K, N};
+        }
+        if (ok && matmul_gpu_batch(specs, n_experts)) {
+            for (int k = 0; k < n_experts; k++)
+                for (int j = 0; j < N; j++)
+                    output[j] += route_weight[k] *
+                        expert_out[static_cast<size_t>(k) * N + j];
+            return true;
+        }
+    }
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
     if (kernels::moe_down_fn fn = [] {
         const char* off = std::getenv("LAPLACE_NOSIMD");
         if (off && off[0] == '1') return static_cast<kernels::moe_down_fn>(nullptr);
         return kernels::get_simd_moe_down();
     }()) {
         if (fn(x, w.data, w.type, expert_idx, route_weight, n_experts,
-               output, K, N)) return true;
+               output, K, N, bases)) return true;
     }
 
     std::vector<float> expert_out(static_cast<size_t>(n_experts) * N);
-    fused_moe_gemm_multi(x, w, expert_out.data(), expert_idx, n_experts, K, N);
+    if (bases) {
+        for (int k = 0; k < n_experts; k++) {
+            Tensor view = w;
+            view.data = bases[k];
+            matmul_row(x + static_cast<size_t>(k) * K, view,
+                       expert_out.data() + static_cast<size_t>(k) * N, K, N);
+        }
+    } else {
+        fused_moe_gemm_multi(x, w, expert_out.data(), expert_idx, n_experts, K, N);
+    }
     for (int k = 0; k < n_experts; k++)
         for (int j = 0; j < N; j++)
             output[j] += route_weight[k] *
@@ -555,6 +2260,7 @@ bool fused_moe_down_accumulate(const float* x, const Tensor& w,
 // ---------------- Dequantize (embeddings, verification) ---------------------
 
 void dequantize(const Tensor& w, float* dst, int n) {
+    if (is_cpu_rejected_type(w.type)) reject_cpu_execution(w.type);
     switch (w.type) {
         case GGMLType::F32: {
             const float* p = reinterpret_cast<const float*>(w.data);
@@ -665,6 +2371,58 @@ void dequantize(const Tensor& w, float* dst, int n) {
                     for (int l = 0; l < 16; l++) {
                         int q = (blk.qs[half*32 + lo*16 + l] >> (group*2)) & 3;
                         dst[i + j*16 + l] = d * sc * q - dmin * mn;
+                    }
+                }
+            }
+            return;
+        }
+        case GGMLType::IQ2_XXS: {
+            for (int i = 0; i < n; i += 256) {
+                block_iq2_xxs blk;
+                std::memcpy(&blk, w.data + static_cast<size_t>(i / 256) * sizeof(blk),
+                            sizeof(blk));
+                const float d = fp16_to_fp32(blk.d);
+                for (int ib32 = 0; ib32 < 8; ++ib32) {
+                    uint32_t aux32[2];
+                    std::memcpy(aux32, blk.qs + 4 * ib32, sizeof(aux32));
+                    const uint8_t* grid_indices =
+                        reinterpret_cast<const uint8_t*>(&aux32[0]);
+                    const float db = d * (0.5f + static_cast<float>(aux32[1] >> 28)) * 0.25f;
+                    for (int group = 0; group < 4; ++group) {
+                        const uint64_t grid = kIq2XxsGrid[grid_indices[group]];
+                        const uint8_t signs =
+                            kIq2XxsSigns[(aux32[1] >> (7 * group)) & 127u];
+                        for (int lane = 0; lane < 8; ++lane) {
+                            const float magnitude =
+                                static_cast<float>((grid >> (8 * lane)) & 0xffu);
+                            dst[i + ib32 * 32 + group * 8 + lane] =
+                                db * magnitude * ((signs & (1u << lane)) ? -1.0f : 1.0f);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        case GGMLType::IQ1_S: {
+            constexpr float delta_magnitude = 0.125f;
+            for (int i = 0; i < n; i += 256) {
+                block_iq1_s blk;
+                std::memcpy(&blk, w.data + static_cast<size_t>(i / 256) * sizeof(blk),
+                            sizeof(blk));
+                const float d = fp16_to_fp32(blk.d);
+                for (int ib32 = 0; ib32 != 8; ++ib32) {
+                    const uint16_t high = blk.qh[ib32];
+                    const float scale = d * static_cast<float>(2 * ((high >> 12) & 7) + 1);
+                    const float delta = (high & 0x8000) ? -delta_magnitude : delta_magnitude;
+                    for (int group = 0; group != 4; ++group) {
+                        const uint16_t grid_index = static_cast<uint16_t>(
+                            blk.qs[4 * ib32 + group] | (((high >> (3 * group)) & 7) << 8));
+                        const uint64_t grid = kIq1SGrid[grid_index];
+                        for (int lane = 0; lane != 8; ++lane) {
+                            const int8_t level = static_cast<int8_t>(grid >> (8 * lane));
+                            dst[i + ib32 * 32 + group * 8 + lane] =
+                                scale * (static_cast<float>(level) + delta);
+                        }
                     }
                 }
             }
