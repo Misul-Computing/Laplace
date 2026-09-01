@@ -91,6 +91,7 @@ set(LAPLACE_SOURCES
     src/program_ir.cpp
     src/physical_program.cpp
     src/physical_program_package.cpp
+    src/program_package.cpp
     src/program_state.cpp
     src/container_schema_program.cpp
     src/semantic_manifest.cpp
@@ -197,7 +198,8 @@ target_include_directories(test_physical_program_package PRIVATE src tests)
 add_test(NAME test_physical_program_package COMMAND test_physical_program_package)
 
 add_executable(test_program_package tests/test_program_package.cpp
-    src/program_package.cpp src/physical_program_package.cpp
+    src/program_package.cpp src/container_schema_program.cpp
+    src/physical_program_package.cpp
     src/physical_program.cpp src/physical_program_interpreter.cpp
     src/program_state.cpp src/program_ir.cpp src/token_program.cpp
     src/semantic_manifest.cpp src/source_compiler_graph_proof.cpp
@@ -206,6 +208,10 @@ add_executable(test_program_package tests/test_program_package.cpp
     src/compatibility_report.cpp src/mmap.cpp)
 target_include_directories(test_program_package PRIVATE src tests)
 add_test(NAME test_program_package COMMAND test_program_package)
+add_test(NAME test_unseen_container_schema
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tests/run_unseen_container_schema.py
+        $<TARGET_FILE:test_program_package>)
 
 add_executable(test_program_reference tests/test_program_reference.cpp
     src/program_reference.cpp src/physical_program_package.cpp src/physical_program.cpp

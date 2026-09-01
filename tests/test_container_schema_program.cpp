@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
+#include <new>
 #include <span>
 #include <variant>
 #include <vector>
@@ -12,6 +15,27 @@
 using namespace Laplace;
 
 namespace {
+
+std::atomic<bool> track_allocations = false;
+std::atomic<size_t> largest_tracked_allocation = 0;
+
+void record_allocation(size_t size) {
+    if (!track_allocations.load(std::memory_order_relaxed)) return;
+    size_t prior = largest_tracked_allocation.load(std::memory_order_relaxed);
+    while (prior < size &&
+           !largest_tracked_allocation.compare_exchange_weak(
+               prior, size, std::memory_order_relaxed)) {}
+}
+
+struct AllocationScope {
+    AllocationScope() {
+        largest_tracked_allocation.store(0, std::memory_order_relaxed);
+        track_allocations.store(true, std::memory_order_relaxed);
+    }
+    ~AllocationScope() {
+        track_allocations.store(false, std::memory_order_relaxed);
+    }
+};
 
 ContainerSchemaInstruction instruction(ContainerSchemaOpcode opcode) {
     ContainerSchemaInstruction result;
@@ -150,6 +174,18 @@ void test_schema_selection_is_exact() {
     CHECK(report(excessive) != nullptr);
     if (report(excessive))
         CHECK(report(excessive)->code == CompatibilityError::IMPORT_SCHEMA_LIMIT);
+
+    ContainerSchemaProgram prefix_only = first_schema();
+    prefix_only.instructions.pop_back();
+    auto trailing_input = first_container();
+    trailing_input.insert(trailing_input.end(), {'T', 'R', 'A', 'I', 'L'});
+    const std::array<ContainerSchemaProgram, 1> prefix_set = {
+        std::move(prefix_only)};
+    const auto prefix_result = select_container_schema(prefix_set, trailing_input);
+    CHECK(report(prefix_result) != nullptr);
+    if (report(prefix_result))
+        CHECK(report(prefix_result)->code ==
+              CompatibilityError::PACKAGE_BOUNDS_INVALID);
 }
 
 void test_schema_program_is_canonical_and_explicit() {
@@ -296,6 +332,143 @@ void test_schema_digest_binds_program() {
     }
 }
 
+void test_schema_set_wire_is_canonical_and_bounded() {
+    const std::array<ContainerSchemaProgram, 2> schemas = {
+        second_schema(), first_schema()};
+    const auto encoded = encode_container_schema_set(schemas);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(encoded));
+    if (!std::holds_alternative<std::vector<uint8_t>>(encoded)) return;
+    const auto& bytes = std::get<std::vector<uint8_t>>(encoded);
+
+    const std::array<ContainerSchemaProgram, 2> reversed = {
+        first_schema(), second_schema()};
+    const auto reordered = encode_container_schema_set(reversed);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(reordered));
+    if (const auto* reordered_bytes =
+            std::get_if<std::vector<uint8_t>>(&reordered))
+        CHECK(*reordered_bytes == bytes);
+
+    const auto decoded = decode_container_schema_set(bytes);
+    CHECK(std::holds_alternative<std::vector<ContainerSchemaProgram>>(decoded));
+    if (const auto* programs =
+            std::get_if<std::vector<ContainerSchemaProgram>>(&decoded)) {
+        CHECK(programs->size() == 2);
+        const auto roundtrip = encode_container_schema_set(*programs);
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(roundtrip));
+        if (const auto* roundtrip_bytes =
+                std::get_if<std::vector<uint8_t>>(&roundtrip))
+            CHECK(*roundtrip_bytes == bytes);
+    }
+
+    const auto rejected = [](std::vector<uint8_t> wire) {
+        return std::holds_alternative<CompatibilityReport>(
+            decode_container_schema_set(wire));
+    };
+    auto bad_magic = bytes;
+    bad_magic[0] ^= 1;
+    CHECK(rejected(std::move(bad_magic)));
+    auto bad_version = bytes;
+    bad_version[8] = 2;
+    CHECK(rejected(std::move(bad_version)));
+    auto bad_reserved = bytes;
+    bad_reserved[10] = 1;
+    CHECK(rejected(std::move(bad_reserved)));
+    auto bad_total = bytes;
+    bad_total[12] ^= 1;
+    CHECK(rejected(std::move(bad_total)));
+    auto too_many = bytes;
+    too_many[16] = 1;
+    too_many[17] = 4;
+    too_many[18] = 0;
+    too_many[19] = 0;
+    CHECK(rejected(std::move(too_many)));
+    auto bad_header_reserved = bytes;
+    bad_header_reserved[20] = 1;
+    CHECK(rejected(std::move(bad_header_reserved)));
+    auto bad_record_length = bytes;
+    std::fill(bad_record_length.begin() + 24,
+              bad_record_length.begin() + 28, 0xff);
+    CHECK(rejected(std::move(bad_record_length)));
+    auto bad_instruction_reserved = bytes;
+    bad_instruction_reserved[65] = 1;
+    CHECK(rejected(std::move(bad_instruction_reserved)));
+    auto bad_literal_length = bytes;
+    std::fill(bad_literal_length.begin() + 92,
+              bad_literal_length.begin() + 96, 0xff);
+    CHECK(rejected(std::move(bad_literal_length)));
+
+    auto impossible_instruction_count = bytes;
+    impossible_instruction_count[60] = 0;
+    impossible_instruction_count[61] = 16;
+    impossible_instruction_count[62] = 0;
+    impossible_instruction_count[63] = 0;
+    {
+        AllocationScope scope;
+        CHECK(rejected(std::move(impossible_instruction_count)));
+    }
+    CHECK(largest_tracked_allocation.load(std::memory_order_relaxed) <
+          64 * 1024);
+    const auto read_u32 = [](const std::vector<uint8_t>& value, size_t offset) {
+        uint32_t result = 0;
+        for (unsigned shift = 0; shift != 32; shift += 8)
+            result |= static_cast<uint32_t>(value[offset + shift / 8]) << shift;
+        return result;
+    };
+    const uint32_t first_record_length = read_u32(bytes, 24);
+    auto bad_program_digest = bytes;
+    bad_program_digest[28 + first_record_length - 1] ^= 1;
+    CHECK(rejected(std::move(bad_program_digest)));
+    const size_t second_record = 28 + first_record_length;
+    const uint32_t second_record_length = read_u32(bytes, second_record);
+    const size_t records_end = second_record + 4 + second_record_length;
+    std::vector<uint8_t> wrong_order(bytes.begin(), bytes.begin() + 24);
+    wrong_order.insert(wrong_order.end(), bytes.begin() + second_record,
+                       bytes.begin() + records_end);
+    wrong_order.insert(wrong_order.end(), bytes.begin() + 24,
+                       bytes.begin() + second_record);
+    wrong_order.insert(wrong_order.end(), bytes.begin() + records_end,
+                       bytes.end());
+    CHECK(rejected(std::move(wrong_order)));
+    auto bad_digest = bytes;
+    bad_digest.back() ^= 1;
+    CHECK(rejected(std::move(bad_digest)));
+    auto trailing = bytes;
+    trailing.push_back(0);
+    CHECK(rejected(std::move(trailing)));
+    auto truncated = bytes;
+    truncated.pop_back();
+    CHECK(rejected(std::move(truncated)));
+    for (size_t length = 0; length < bytes.size(); ++length)
+        CHECK(rejected(std::vector<uint8_t>(bytes.begin(),
+                                            bytes.begin() + length)));
+
+    const std::array<ContainerSchemaProgram, 2> duplicate = {
+        first_schema(), first_schema()};
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_container_schema_set(duplicate)));
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_container_schema_set(
+            std::span<const ContainerSchemaProgram>{})));
+
+    ContainerSchemaProgram large = first_schema();
+    large.instructions.front().literal.assign(65'536, 'A');
+    std::vector<ContainerSchemaProgram> over_wire_limit;
+    over_wire_limit.reserve(512);
+    for (uint32_t index = 0; index < 512; ++index) {
+        ContainerSchemaProgram item = large;
+        item.instructions[3].section_id = index;
+        over_wire_limit.push_back(std::move(item));
+    }
+    ContainerSchemaWireResult oversized_wire;
+    {
+        AllocationScope scope;
+        oversized_wire = encode_container_schema_set(over_wire_limit);
+    }
+    CHECK(std::holds_alternative<CompatibilityReport>(oversized_wire));
+    CHECK(largest_tracked_allocation.load(std::memory_order_relaxed) <
+          64 * 1024);
+}
+
 void test_maximum_ranges_remain_bounded() {
     ContainerSchemaProgram program;
     program.register_count = 4;
@@ -344,6 +517,15 @@ void test_maximum_ranges_remain_bounded() {
 
 } // namespace
 
+void* operator new(std::size_t size) {
+    record_allocation(size);
+    if (void* value = std::malloc(size == 0 ? 1 : size)) return value;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* value) noexcept { std::free(value); }
+void operator delete(void* value, std::size_t) noexcept { std::free(value); }
+
 int main() {
     test_two_presentations_extract_equivalent_sections();
     test_schema_selection_is_exact();
@@ -351,6 +533,7 @@ int main() {
     test_repetition_and_limits();
     test_malformed_arithmetic_and_ranges_fail_closed();
     test_schema_digest_binds_program();
+    test_schema_set_wire_is_canonical_and_bounded();
     test_maximum_ranges_remain_bounded();
     return test_summary("test_container_schema_program");
 }

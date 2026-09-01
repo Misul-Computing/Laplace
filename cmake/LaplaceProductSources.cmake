@@ -46,6 +46,7 @@ set(LAPLACE_PRODUCT_SOURCES
     src/program_ir.cpp
     src/physical_program.cpp
     src/physical_program_package.cpp
+    src/program_package.cpp
     src/program_state.cpp
     src/container_schema_program.cpp
     src/semantic_manifest.cpp

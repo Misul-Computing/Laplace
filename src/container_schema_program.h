@@ -71,6 +71,10 @@ using ContainerSchemaDigestResult =
     std::variant<ContainerSchemaDigest, CompatibilityReport>;
 using ContainerSchemaResult =
     std::variant<ContainerExtraction, CompatibilityReport>;
+using ContainerSchemaWireResult =
+    std::variant<std::vector<uint8_t>, CompatibilityReport>;
+using ContainerSchemaSetResult =
+    std::variant<std::vector<ContainerSchemaProgram>, CompatibilityReport>;
 
 ContainerSchemaDigestResult
 container_schema_digest(const ContainerSchemaProgram& program);
@@ -78,5 +82,11 @@ container_schema_digest(const ContainerSchemaProgram& program);
 ContainerSchemaResult select_container_schema(
     std::span<const ContainerSchemaProgram> schemas,
     std::span<const uint8_t> bytes);
+
+ContainerSchemaWireResult encode_container_schema_set(
+    std::span<const ContainerSchemaProgram> schemas);
+
+ContainerSchemaSetResult decode_container_schema_set(
+    std::span<const uint8_t> wire);
 
 } // namespace Laplace

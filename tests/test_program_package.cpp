@@ -1,11 +1,16 @@
 #include "program_package.h"
+#include "container_schema_program.h"
 #include "test_util.h"
 
 #include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <fstream>
+#include <iostream>
+#include <iterator>
 #include <span>
+#include <string>
 #include <variant>
 #include <vector>
 
@@ -275,6 +280,184 @@ ProgramPackageResult build(Fixture source) {
         source.records, source.resources);
 }
 
+ContainerSchemaProgram package_container_schema(uint32_t section_id = 23) {
+    ContainerSchemaProgram program;
+    program.register_count = 3;
+    program.predicate_count = 1;
+    ContainerSchemaInstruction match;
+    match.opcode = ContainerSchemaOpcode::MatchBytes;
+    match.literal = {'P', 'K', 'G', 'X'};
+    ContainerSchemaInstruction length;
+    length.opcode = ContainerSchemaOpcode::ReadU32Le;
+    length.destination = 0;
+    ContainerSchemaInstruction cursor;
+    cursor.opcode = ContainerSchemaOpcode::CaptureCursor;
+    cursor.destination = 1;
+    ContainerSchemaInstruction emit;
+    emit.opcode = ContainerSchemaOpcode::EmitRange;
+    emit.input_a = 1;
+    emit.input_b = 0;
+    emit.section_id = section_id;
+    ContainerSchemaInstruction advance;
+    advance.opcode = ContainerSchemaOpcode::Advance;
+    advance.input_a = 0;
+    ContainerSchemaInstruction end;
+    end.opcode = ContainerSchemaOpcode::RequireCursorEnd;
+    program.instructions = {
+        std::move(match), length, cursor, emit, advance, end};
+    return program;
+}
+
+std::vector<uint8_t> package_container(std::span<const uint8_t> package) {
+    std::vector<uint8_t> result = {'P', 'K', 'G', 'X'};
+    const uint32_t size = static_cast<uint32_t>(package.size());
+    for (unsigned shift = 0; shift != 32; shift += 8)
+        result.push_back(static_cast<uint8_t>(size >> shift));
+    result.insert(result.end(), package.begin(), package.end());
+    return result;
+}
+
+ContainerSchemaProgram duplicate_package_schema() {
+    ContainerSchemaProgram program;
+    program.register_count = 3;
+    program.predicate_count = 1;
+    ContainerSchemaInstruction match;
+    match.opcode = ContainerSchemaOpcode::MatchBytes;
+    match.literal = {'D', 'U', 'P', 'X'};
+    ContainerSchemaInstruction length;
+    length.opcode = ContainerSchemaOpcode::ReadU32Le;
+    length.destination = 0;
+    ContainerSchemaInstruction first_cursor;
+    first_cursor.opcode = ContainerSchemaOpcode::CaptureCursor;
+    first_cursor.destination = 1;
+    ContainerSchemaInstruction first_emit;
+    first_emit.opcode = ContainerSchemaOpcode::EmitRange;
+    first_emit.input_a = 1;
+    first_emit.input_b = 0;
+    first_emit.section_id = 23;
+    ContainerSchemaInstruction first_advance;
+    first_advance.opcode = ContainerSchemaOpcode::Advance;
+    first_advance.input_a = 0;
+    ContainerSchemaInstruction second_cursor;
+    second_cursor.opcode = ContainerSchemaOpcode::CaptureCursor;
+    second_cursor.destination = 2;
+    ContainerSchemaInstruction second_emit = first_emit;
+    second_emit.input_a = 2;
+    ContainerSchemaInstruction second_advance = first_advance;
+    ContainerSchemaInstruction end;
+    end.opcode = ContainerSchemaOpcode::RequireCursorEnd;
+    program.instructions = {
+        std::move(match), length, first_cursor, first_emit, first_advance,
+        second_cursor, second_emit, second_advance, end};
+    return program;
+}
+
+std::vector<uint8_t> duplicate_package_container(
+    std::span<const uint8_t> package) {
+    std::vector<uint8_t> result = {'D', 'U', 'P', 'X'};
+    const uint32_t size = static_cast<uint32_t>(package.size());
+    for (unsigned shift = 0; shift != 32; shift += 8)
+        result.push_back(static_cast<uint8_t>(size >> shift));
+    result.insert(result.end(), package.begin(), package.end());
+    result.insert(result.end(), package.begin(), package.end());
+    return result;
+}
+
+void test_container_handoff_uses_verified_package_decoder() {
+    auto source_package = build(fixture());
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(source_package));
+    if (!std::holds_alternative<VerifiedProgramPackage>(source_package)) return;
+    const auto encoded = encode_program_package(
+        std::get<VerifiedProgramPackage>(source_package));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(encoded));
+    if (!std::holds_alternative<std::vector<uint8_t>>(encoded)) return;
+    const auto container = package_container(
+        std::get<std::vector<uint8_t>>(encoded));
+    const std::array<ContainerSchemaProgram, 1> schemas = {
+        package_container_schema()};
+
+    Fixture destination = fixture();
+    const auto loaded = decode_container_program_package(
+        std::move(destination.index), schemas, container, 23);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(loaded));
+    if (const auto* verified = std::get_if<VerifiedProgramPackage>(&loaded))
+        CHECK(verified->digest() ==
+              std::get<VerifiedProgramPackage>(source_package).digest());
+
+    const std::array<ContainerSchemaProgram, 1> missing = {
+        package_container_schema(24)};
+    Fixture missing_destination = fixture();
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        decode_container_program_package(std::move(missing_destination.index),
+                                         missing, container, 23)));
+
+    auto corrupt = container;
+    corrupt[8] ^= 1;
+    Fixture corrupt_destination = fixture();
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        decode_container_program_package(std::move(corrupt_destination.index),
+                                         schemas, corrupt, 23)));
+
+    const std::array<ContainerSchemaProgram, 1> duplicate_schema = {
+        duplicate_package_schema()};
+    const auto duplicate_container = duplicate_package_container(
+        std::get<std::vector<uint8_t>>(encoded));
+    Fixture duplicate_destination = fixture();
+    const auto duplicate_result = decode_container_program_package(
+        std::move(duplicate_destination.index), duplicate_schema,
+        duplicate_container, 23);
+    CHECK(std::holds_alternative<CompatibilityReport>(duplicate_result));
+    if (const auto* failure =
+            std::get_if<CompatibilityReport>(&duplicate_result))
+        CHECK(failure->code == CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS);
+}
+
+bool write_bytes(const char* path, std::span<const uint8_t> bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    return output.good();
+}
+
+std::vector<uint8_t> read_bytes(const char* path) {
+    std::ifstream input(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>()};
+}
+
+int emit_external_package(const char* path) {
+    auto package = build(fixture());
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
+    if (!std::holds_alternative<VerifiedProgramPackage>(package))
+        return test_summary("test_program_package_emit");
+    const auto wire = encode_program_package(
+        std::get<VerifiedProgramPackage>(package));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire))
+        CHECK(write_bytes(path, *bytes));
+    return test_summary("test_program_package_emit");
+}
+
+int load_external_container(const char* schema_path, const char* container_path) {
+    const auto schema_wire = read_bytes(schema_path);
+    const auto container = read_bytes(container_path);
+    const auto decoded_schemas = decode_container_schema_set(schema_wire);
+    CHECK(std::holds_alternative<std::vector<ContainerSchemaProgram>>(
+        decoded_schemas));
+    if (!std::holds_alternative<std::vector<ContainerSchemaProgram>>(
+            decoded_schemas))
+        return test_summary("test_unseen_container_schema");
+    Fixture destination = fixture();
+    const auto package = decode_container_program_package(
+        std::move(destination.index),
+        std::get<std::vector<ContainerSchemaProgram>>(decoded_schemas),
+        container, 23);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
+    if (const auto* verified = std::get_if<VerifiedProgramPackage>(&package))
+        CHECK(verified->complete());
+    return test_summary("test_unseen_container_schema");
+}
+
 void test_complete_package_roundtrip_and_identity() {
     auto package = build(fixture());
     CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
@@ -371,8 +554,13 @@ void test_token_binding_and_provenance_counterexamples() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--emit-program-package")
+        return emit_external_package(argv[2]);
+    if (argc == 4 && std::string(argv[1]) == "--load-container-schema")
+        return load_external_container(argv[2], argv[3]);
     test_complete_package_roundtrip_and_identity();
     test_token_binding_and_provenance_counterexamples();
+    test_container_handoff_uses_verified_package_decoder();
     return test_summary("test_program_package");
 }

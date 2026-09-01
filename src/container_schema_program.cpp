@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -19,6 +20,7 @@ constexpr uint64_t kMaximumLoopIterations = 1'000'000;
 constexpr uint32_t kMaximumRanges = 65'536;
 constexpr uint64_t kMaximumSelectionSteps = 4'000'000;
 constexpr size_t kMaximumLiteralBytes = 65'536;
+constexpr size_t kMaximumSchemaWireBytes = 32u * 1024u * 1024u;
 
 CompatibilityReport schema_error(CompatibilityError code, std::string detail) {
     return compatibility_report(code, std::move(detail));
@@ -242,6 +244,138 @@ struct DigestBuilder {
     }
 };
 
+struct SchemaWireWriter {
+    std::vector<uint8_t> value;
+
+    void u8(uint8_t item) { value.push_back(item); }
+    void u16(uint16_t item) {
+        u8(static_cast<uint8_t>(item));
+        u8(static_cast<uint8_t>(item >> 8));
+    }
+    void u32(uint32_t item) {
+        for (unsigned shift = 0; shift != 32; shift += 8)
+            u8(static_cast<uint8_t>(item >> shift));
+    }
+    void u64(uint64_t item) {
+        for (unsigned shift = 0; shift != 64; shift += 8)
+            u8(static_cast<uint8_t>(item >> shift));
+    }
+    void bytes(std::span<const uint8_t> items) {
+        value.insert(value.end(), items.begin(), items.end());
+    }
+};
+
+class SchemaWireReader {
+public:
+    explicit SchemaWireReader(std::span<const uint8_t> source) : source_(source) {}
+
+    bool u8(uint8_t* output) {
+        if (remaining() < 1) return false;
+        *output = source_[offset_++];
+        return true;
+    }
+    bool u16(uint16_t* output) {
+        uint8_t low = 0, high = 0;
+        if (!u8(&low) || !u8(&high)) return false;
+        *output = static_cast<uint16_t>(low) |
+                  static_cast<uint16_t>(high) << 8;
+        return true;
+    }
+    bool u32(uint32_t* output) {
+        uint64_t value = 0;
+        if (!integer(4, &value)) return false;
+        *output = static_cast<uint32_t>(value);
+        return true;
+    }
+    bool u64(uint64_t* output) { return integer(8, output); }
+    bool take(size_t count, std::span<const uint8_t>* output) {
+        if (count > remaining()) return false;
+        *output = source_.subspan(offset_, count);
+        offset_ += count;
+        return true;
+    }
+    size_t remaining() const { return source_.size() - offset_; }
+    bool finished() const { return offset_ == source_.size(); }
+
+private:
+    bool integer(size_t width, uint64_t* output) {
+        if (width > remaining()) return false;
+        uint64_t value = 0;
+        for (size_t index = 0; index < width; ++index)
+            value |= static_cast<uint64_t>(source_[offset_ + index]) <<
+                     (index * 8);
+        offset_ += width;
+        *output = value;
+        return true;
+    }
+
+    std::span<const uint8_t> source_;
+    size_t offset_ = 0;
+};
+
+bool digest_less(ContainerSchemaDigest left, ContainerSchemaDigest right) {
+    return std::lexicographical_compare(
+        left.bytes.begin(), left.bytes.end(),
+        right.bytes.begin(), right.bytes.end());
+}
+
+ContainerSchemaDigest schema_set_digest(
+    std::span<const ContainerSchemaDigest> digests) {
+    DigestBuilder builder;
+    constexpr std::array<uint8_t, 31> domain = {
+        'l','a','p','l','a','c','e','-','c','o','n','t','a','i','n','e','r','-',
+        's','c','h','e','m','a','-','s','e','t','-','v','1'};
+    builder.bytes(domain);
+    builder.u32(static_cast<uint32_t>(digests.size()));
+    for (const ContainerSchemaDigest digest : digests)
+        builder.bytes(digest.bytes);
+    return builder.finish();
+}
+
+std::vector<uint8_t> encode_schema_record(
+    const ContainerSchemaProgram& program,
+    ContainerSchemaDigest digest) {
+    SchemaWireWriter writer;
+    writer.u16(program.major);
+    writer.u16(program.minor);
+    writer.u32(program.register_count);
+    writer.u32(program.predicate_count);
+    writer.u64(program.maximum_steps);
+    writer.u64(program.maximum_loop_iterations);
+    writer.u32(program.maximum_ranges);
+    writer.u32(static_cast<uint32_t>(program.instructions.size()));
+    for (const ContainerSchemaInstruction& item : program.instructions) {
+        writer.u8(static_cast<uint8_t>(item.opcode));
+        writer.u8(0);
+        writer.u8(0);
+        writer.u8(0);
+        writer.u32(item.destination);
+        writer.u32(item.input_a);
+        writer.u32(item.input_b);
+        writer.u32(item.section_id);
+        writer.u64(item.immediate);
+        writer.u32(static_cast<uint32_t>(item.literal.size()));
+        writer.bytes(item.literal);
+    }
+    writer.bytes(digest.bytes);
+    return std::move(writer.value);
+}
+
+std::optional<size_t> schema_record_size(
+    const ContainerSchemaProgram& program) {
+    size_t total = 36 + 32;
+    for (const ContainerSchemaInstruction& item : program.instructions) {
+        constexpr size_t instruction_bytes = 32;
+        if (item.literal.size() >
+            std::numeric_limits<size_t>::max() - instruction_bytes ||
+            total > std::numeric_limits<size_t>::max() -
+                        instruction_bytes - item.literal.size())
+            return std::nullopt;
+        total += instruction_bytes + item.literal.size();
+    }
+    return total;
+}
+
 ContainerSchemaDigest digest_unchecked(const ContainerSchemaProgram& program) {
     DigestBuilder builder;
     constexpr std::array<uint8_t, 35> domain = {
@@ -452,6 +586,10 @@ ContainerSchemaResult execute_schema(const ContainerSchemaProgram& program,
         return schema_error(CompatibilityError::IMPORT_SCHEMA_INCOMPLETE,
                             "container schema execution ended inside a loop");
     }
+    if (cursor != bytes.size()) {
+        return schema_error(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                            "container schema did not consume the complete file");
+    }
     std::vector<std::pair<uint64_t, uint64_t>> intervals;
     intervals.reserve(ranges.size());
     for (const ContainerRange& range : ranges) {
@@ -519,6 +657,214 @@ ContainerSchemaResult select_container_schema(
     if (single_failure) return std::move(*single_failure);
     return schema_error(CompatibilityError::IMPORT_SCHEMA_NOT_FOUND,
                         "matching container schemas did not complete interpretation");
+}
+
+ContainerSchemaWireResult encode_container_schema_set(
+    std::span<const ContainerSchemaProgram> schemas) {
+    // One fixed V1 wire reuses the existing validator and schema model.
+    if (schemas.empty() || schemas.size() > kMaximumSchemas) {
+        return schema_error(CompatibilityError::IMPORT_SCHEMA_LIMIT,
+                            "container schema wire count is invalid");
+    }
+    try {
+        struct PreparedSchema {
+            const ContainerSchemaProgram* program = nullptr;
+            ContainerSchemaDigest digest;
+            size_t record_size = 0;
+        };
+        std::vector<PreparedSchema> prepared;
+        prepared.reserve(schemas.size());
+        size_t total = 24 + 32;
+        for (const ContainerSchemaProgram& schema : schemas) {
+            auto digest_result = container_schema_digest(schema);
+            if (const auto* report =
+                    std::get_if<CompatibilityReport>(&digest_result))
+                return *report;
+            const auto digest = std::get<ContainerSchemaDigest>(digest_result);
+            const std::optional<size_t> record_size = schema_record_size(schema);
+            if (!record_size || *record_size > UINT32_MAX ||
+                total > kMaximumSchemaWireBytes - 4 ||
+                *record_size > kMaximumSchemaWireBytes - total - 4) {
+                return schema_error(CompatibilityError::IMPORT_SCHEMA_LIMIT,
+                                    "container schema wire exceeds its byte limit");
+            }
+            total += 4 + *record_size;
+            prepared.push_back({&schema, digest, *record_size});
+        }
+        std::sort(prepared.begin(), prepared.end(),
+                  [](const PreparedSchema& left, const PreparedSchema& right) {
+                      return digest_less(left.digest, right.digest);
+                  });
+        for (size_t index = 1; index < prepared.size(); ++index) {
+            if (prepared[index - 1].digest == prepared[index].digest) {
+                return schema_error(
+                    CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS,
+                    "container schema wire contains a duplicate program");
+            }
+        }
+        std::vector<ContainerSchemaDigest> digests;
+        digests.reserve(prepared.size());
+        for (const PreparedSchema& schema : prepared)
+            digests.push_back(schema.digest);
+        const ContainerSchemaDigest closure = schema_set_digest(digests);
+
+        SchemaWireWriter writer;
+        writer.value.reserve(total);
+        constexpr std::array<uint8_t, 8> magic = {
+            'L','A','P','C','S','W','0','1'};
+        writer.bytes(magic);
+        writer.u16(1);
+        writer.u16(0);
+        writer.u32(static_cast<uint32_t>(total));
+        writer.u32(static_cast<uint32_t>(prepared.size()));
+        writer.u32(0);
+        for (const PreparedSchema& schema : prepared) {
+            writer.u32(static_cast<uint32_t>(schema.record_size));
+            const std::vector<uint8_t> record =
+                encode_schema_record(*schema.program, schema.digest);
+            writer.bytes(record);
+        }
+        writer.bytes(closure.bytes);
+        return std::move(writer.value);
+    } catch (const std::bad_alloc&) {
+        return schema_error(CompatibilityError::IMPORT_SCHEMA_LIMIT,
+                            "container schema wire allocation failed");
+    }
+}
+
+ContainerSchemaSetResult decode_container_schema_set(
+    std::span<const uint8_t> wire) {
+    constexpr std::array<uint8_t, 8> magic = {
+        'L','A','P','C','S','W','0','1'};
+    if (wire.size() < 56 || wire.size() > kMaximumSchemaWireBytes ||
+        !std::equal(magic.begin(), magic.end(), wire.begin())) {
+        return schema_error(CompatibilityError::PACKAGE_BAD_MAGIC,
+                            "container schema wire header is invalid");
+    }
+    try {
+        SchemaWireReader reader(wire.subspan(magic.size()));
+        uint16_t version = 0, reserved = 0;
+        uint32_t total = 0, count = 0, header_reserved = 0;
+        if (!reader.u16(&version) || !reader.u16(&reserved) ||
+            !reader.u32(&total) || !reader.u32(&count) ||
+            !reader.u32(&header_reserved) || version != 1 || reserved != 0 ||
+            total != wire.size() || count == 0 || count > kMaximumSchemas ||
+            header_reserved != 0) {
+            return schema_error(
+                CompatibilityError::PACKAGE_VERSION_UNSUPPORTED,
+                "container schema wire version, length, or count is invalid");
+        }
+        std::vector<ContainerSchemaProgram> programs;
+        std::vector<ContainerSchemaDigest> digests;
+        programs.reserve(count);
+        digests.reserve(count);
+        for (uint32_t program_index = 0; program_index < count;
+             ++program_index) {
+            uint32_t record_length = 0;
+            std::span<const uint8_t> record_bytes;
+            if (!reader.u32(&record_length) || record_length < 68 ||
+                !reader.take(record_length, &record_bytes)) {
+                return schema_error(
+                    CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                    "container schema record length is invalid");
+            }
+            SchemaWireReader record(record_bytes);
+            ContainerSchemaProgram program;
+            uint32_t instruction_count = 0;
+            if (!record.u16(&program.major) || !record.u16(&program.minor) ||
+                !record.u32(&program.register_count) ||
+                !record.u32(&program.predicate_count) ||
+                !record.u64(&program.maximum_steps) ||
+                !record.u64(&program.maximum_loop_iterations) ||
+                !record.u32(&program.maximum_ranges) ||
+                !record.u32(&instruction_count) || instruction_count == 0 ||
+                instruction_count > kMaximumInstructions) {
+                return schema_error(
+                    CompatibilityError::IMPORT_SCHEMA_LIMIT,
+                    "container schema record header is invalid");
+            }
+            if (record.remaining() < 32 ||
+                instruction_count > (record.remaining() - 32) / 32) {
+                return schema_error(
+                    CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                    "container schema instruction count exceeds its record");
+            }
+            program.instructions.reserve(instruction_count);
+            size_t literal_bytes = 0;
+            for (uint32_t instruction_index = 0;
+                 instruction_index < instruction_count; ++instruction_index) {
+                ContainerSchemaInstruction item;
+                uint8_t opcode = 0, reserved_a = 0, reserved_b = 0,
+                        reserved_c = 0;
+                uint32_t literal_length = 0;
+                if (!record.u8(&opcode) || !record.u8(&reserved_a) ||
+                    !record.u8(&reserved_b) || !record.u8(&reserved_c) ||
+                    !record.u32(&item.destination) ||
+                    !record.u32(&item.input_a) ||
+                    !record.u32(&item.input_b) ||
+                    !record.u32(&item.section_id) ||
+                    !record.u64(&item.immediate) ||
+                    !record.u32(&literal_length) || reserved_a != 0 ||
+                    reserved_b != 0 || reserved_c != 0 ||
+                    literal_length > kMaximumLiteralBytes - literal_bytes) {
+                    return schema_error(
+                        CompatibilityError::IMPORT_SCHEMA_LIMIT,
+                        "container schema instruction encoding is invalid");
+                }
+                std::span<const uint8_t> literal;
+                if (!record.take(literal_length, &literal)) {
+                    return schema_error(
+                        CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                        "container schema instruction literal is truncated");
+                }
+                item.opcode = static_cast<ContainerSchemaOpcode>(opcode);
+                item.literal.assign(literal.begin(), literal.end());
+                literal_bytes += literal_length;
+                program.instructions.push_back(std::move(item));
+            }
+            std::span<const uint8_t> expected_digest;
+            if (!record.take(32, &expected_digest) || !record.finished()) {
+                return schema_error(
+                    CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                    "container schema record has trailing or truncated bytes");
+            }
+            auto digest_result = container_schema_digest(program);
+            if (const auto* report =
+                    std::get_if<CompatibilityReport>(&digest_result))
+                return *report;
+            const auto digest = std::get<ContainerSchemaDigest>(digest_result);
+            if (!std::equal(expected_digest.begin(), expected_digest.end(),
+                            digest.bytes.begin())) {
+                return schema_error(
+                    CompatibilityError::PACKAGE_CHECKSUM_MISMATCH,
+                    "container schema program digest does not match");
+            }
+            if (!digests.empty() && !digest_less(digests.back(), digest)) {
+                return schema_error(
+                    CompatibilityError::IMPORT_SCHEMA_INCOMPLETE,
+                    "container schema programs are not canonically ordered");
+            }
+            digests.push_back(digest);
+            programs.push_back(std::move(program));
+        }
+        std::span<const uint8_t> expected_closure;
+        if (!reader.take(32, &expected_closure) || !reader.finished()) {
+            return schema_error(
+                CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                "container schema wire has trailing or truncated bytes");
+        }
+        const ContainerSchemaDigest closure = schema_set_digest(digests);
+        if (!std::equal(expected_closure.begin(), expected_closure.end(),
+                        closure.bytes.begin())) {
+            return schema_error(
+                CompatibilityError::PACKAGE_CHECKSUM_MISMATCH,
+                "container schema set digest does not match");
+        }
+        return programs;
+    } catch (const std::bad_alloc&) {
+        return schema_error(CompatibilityError::IMPORT_SCHEMA_LIMIT,
+                            "container schema wire allocation failed");
+    }
 }
 
 } // namespace Laplace

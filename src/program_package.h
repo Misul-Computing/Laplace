@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "physical_program_package.h"
+#include "container_schema_program.h"
 #include "program_state.h"
 #include "token_program.h"
 
@@ -92,5 +93,11 @@ encode_program_package(const VerifiedProgramPackage& package);
 
 ProgramPackageResult decode_program_package(
     ArtifactIndex physical, std::span<const uint8_t> wire);
+
+ProgramPackageResult decode_container_program_package(
+    ArtifactIndex physical,
+    std::span<const ContainerSchemaProgram> schemas,
+    std::span<const uint8_t> container,
+    uint32_t package_section_id);
 
 } // namespace Laplace

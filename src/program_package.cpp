@@ -628,4 +628,41 @@ ProgramPackageResult decode_program_package(
     }
 }
 
+ProgramPackageResult decode_container_program_package(
+    ArtifactIndex physical,
+    std::span<const ContainerSchemaProgram> schemas,
+    std::span<const uint8_t> container,
+    uint32_t package_section_id) {
+    // Extraction finds one byte span. The existing package decoder remains
+    // the sole authority and validation path.
+    auto selected = select_container_schema(schemas, container);
+    if (const auto* report = std::get_if<CompatibilityReport>(&selected))
+        return *report;
+    const auto& extraction = std::get<ContainerExtraction>(selected);
+    const ContainerRange* package_range = nullptr;
+    for (const ContainerRange& range : extraction.ranges) {
+        if (range.section_id != package_section_id) continue;
+        if (package_range != nullptr) {
+            return package_error(
+                CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS,
+                "container schema emitted multiple program package sections");
+        }
+        package_range = &range;
+    }
+    if (package_range == nullptr) {
+        return package_error(
+            CompatibilityError::IMPORT_CLOSURE_INCOMPLETE,
+            "container schema did not emit a program package section");
+    }
+    if (package_range->offset > container.size() ||
+        package_range->length > container.size() - package_range->offset) {
+        return package_error(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                             "container program package range is invalid");
+    }
+    return decode_program_package(
+        std::move(physical),
+        container.subspan(static_cast<size_t>(package_range->offset),
+                          static_cast<size_t>(package_range->length)));
+}
+
 } // namespace Laplace
