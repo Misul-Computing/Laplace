@@ -822,6 +822,50 @@ struct MlxProductFixture {
     std::vector<uint8_t> manifest;
 };
 
+std::vector<uint8_t> physical_package_for_mlx(
+    const MlxProductPhysicalPackage& package) {
+    CHECK(package.physical_index.tensors().size() == 1);
+    if (package.physical_index.tensors().size() != 1) return {};
+    const ArtifactTensorRecord& tensor = package.physical_index.tensors()[0];
+    CHECK(tensor.planes.size() == 1);
+    if (tensor.planes.size() != 1 || tensor.planes[0].source.length == 0)
+        return {};
+
+    PhysicalProgram program;
+    program.planes = {{PhysicalPlaneStorage::External, 1, 0, 0}};
+    program.instructions = {
+        {PhysicalOpcode::ConstIndex, PhysicalValueType::Index,
+         {kNoPhysicalValue, kNoPhysicalValue, kNoPhysicalValue},
+         kNoPhysicalPlane, kNoPhysicalPolicy, 0, 0,
+         PhysicalBitOrder::Lsb0Little},
+        {PhysicalOpcode::LoadBits, PhysicalValueType::U32,
+         {0, kNoPhysicalValue, kNoPhysicalValue}, 0, kNoPhysicalPolicy, 0, 8,
+         PhysicalBitOrder::Lsb0Little},
+    };
+    program.result = 1;
+    const auto wire = encode_physical_program(program);
+    const auto digest = physical_program_digest(program);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    CHECK(std::holds_alternative<PhysicalProgramDigest>(digest));
+    if (!std::holds_alternative<std::vector<uint8_t>>(wire) ||
+        !std::holds_alternative<PhysicalProgramDigest>(digest))
+        return {};
+    PhysicalProgramRecord record{
+        std::get<PhysicalProgramDigest>(digest),
+        std::get<std::vector<uint8_t>>(wire), {ElementType::U32, {}}};
+    PhysicalResourceBinding resource;
+    resource.resource_id = 0;
+    resource.program_digest = record.digest;
+    resource.planes = {{0, tensor.planes[0].source.artifact_id,
+                        tensor.planes[0].source.offset, 1}};
+    const auto encoded = encode_physical_program_package_records(
+        std::span<const PhysicalProgramRecord>(&record, 1),
+        std::span<const PhysicalResourceBinding>(&resource, 1));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(encoded));
+    if (!std::holds_alternative<std::vector<uint8_t>>(encoded)) return {};
+    return std::get<std::vector<uint8_t>>(encoded);
+}
+
 std::vector<uint8_t> manifest_for_mlx(const MlxProductPhysicalPackage& package,
                                       const PackageView& token_data) {
     auto compiled = TokenProgram::compile(token_data.bytes());
@@ -911,7 +955,8 @@ std::vector<uint8_t> manifest_for_mlx(const MlxProductPhysicalPackage& package,
 }
 
 MlxProductFixture make_mlx_product_fixture(const char* dtype = "F16",
-                                           bool padded_index = false) {
+                                           bool padded_index = false,
+                                           bool with_physical_package = false) {
     MlxProductFixture fixture;
     fixture.directory = temporary_directory();
     const std::string config_path = fixture.directory + "/config.json";
@@ -942,13 +987,22 @@ MlxProductFixture make_mlx_product_fixture(const char* dtype = "F16",
             CHECK(!fixture.manifest.empty());
             if (!fixture.manifest.empty()) CHECK(write_bytes(manifest_path, fixture.manifest));
         }
+        if (with_physical_package) {
+            const std::vector<uint8_t> physical =
+                physical_package_for_mlx(package);
+            CHECK(!physical.empty());
+            if (!physical.empty())
+                CHECK(write_bytes(fixture.directory + "/laplace.lappkg",
+                                  physical));
+        }
     }
     return fixture;
 }
 
 void remove_mlx_product_fixture(MlxProductFixture& fixture) {
     for (const char* leaf : {"config.json", "model.safetensors.index.json",
-                             "model.safetensors", "laplace.lapman", "laplace.laptok"}) {
+                             "model.safetensors", "laplace.lapman",
+                             "laplace.laptok", "laplace.lappkg"}) {
         unlink((fixture.directory + "/" + leaf).c_str());
     }
     rmdir(fixture.directory.c_str());
@@ -1221,11 +1275,49 @@ void test_mlx_carried_manifest_factory_grants_product_authority() {
     ProductPackageLoadResult loaded = load_product_package(fixture.directory);
     CHECK(std::holds_alternative<ProductPackage>(loaded));
     if (auto* package = std::get_if<ProductPackage>(&loaded)) {
+        CHECK(package->physical_program_package() == nullptr);
         const auto runtime = package->runtime_package();
         CHECK(runtime != nullptr);
         if (runtime) {
             CHECK(runtime->authority_kind() == PackageAuthorityKind::CarriedManifest);
             CHECK(runtime->product_authoritative());
+        }
+    }
+    remove_mlx_product_fixture(fixture);
+}
+
+void test_safetensors_directory_rejects_invalid_physical_program_carrier() {
+    MlxProductFixture malformed = make_mlx_product_fixture();
+    CHECK(write_bytes(malformed.directory + "/laplace.lappkg",
+                      std::array<uint8_t, 4>{'b', 'a', 'd', '!'}));
+    check_error(malformed.directory, CompatibilityError::PACKAGE_BAD_MAGIC);
+    remove_mlx_product_fixture(malformed);
+
+    MlxProductFixture nonregular = make_mlx_product_fixture();
+    const std::string carrier = nonregular.directory + "/laplace.lappkg";
+    CHECK(mkdir(carrier.c_str(), 0700) == 0);
+    check_error(nonregular.directory, CompatibilityError::PACKAGE_BOUNDS_INVALID);
+    CHECK(rmdir(carrier.c_str()) == 0);
+    remove_mlx_product_fixture(nonregular);
+}
+
+void test_safetensors_directory_loads_optional_physical_program_carrier() {
+    MlxProductFixture fixture = make_mlx_product_fixture("F16", false, true);
+    ProductPackageLoadResult loaded = load_product_package(fixture.directory);
+    CHECK(std::holds_alternative<ProductPackage>(loaded));
+    if (auto* package = std::get_if<ProductPackage>(&loaded)) {
+        const auto& physical = package->physical_program_package();
+        CHECK(physical != nullptr);
+        if (physical) {
+            CHECK(physical->resources().size() == 1);
+            const auto resolved = physical->resolve_resource(0);
+            CHECK(std::holds_alternative<
+                  std::vector<PhysicalResourcePlaneView>>(resolved));
+            if (const auto* planes = std::get_if<
+                    std::vector<PhysicalResourcePlaneView>>(&resolved)) {
+                CHECK(planes->size() == 1);
+                if (planes->size() == 1) CHECK((*planes)[0].bytes.size() == 1);
+            }
         }
     }
     remove_mlx_product_fixture(fixture);
@@ -1342,6 +1434,8 @@ int main(int argc, char** argv) {
     test_missing_token_program_fails_closed();
     test_token_program_semantics_must_match_carried_authority();
     test_mlx_carried_manifest_factory_grants_product_authority();
+    test_safetensors_directory_loads_optional_physical_program_carrier();
+    test_safetensors_directory_rejects_invalid_physical_program_carrier();
     test_mlx_index_is_retained_and_changes_package_identity();
     test_mlx_runtime_alone_retains_complete_immutable_closure();
     test_mlx_directory_accepts_f32_values();

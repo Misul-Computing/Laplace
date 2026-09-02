@@ -308,6 +308,50 @@ void test_complete_physical_contract_validation() {
     unlink(shard.c_str());
 }
 
+void test_scalar_encoding_does_not_select_axis_order() {
+    const std::string primary = temporary_path();
+    const std::string shard = temporary_path();
+    write_pattern(primary, 3, 512);
+    write_pattern(shard, 17, 512);
+    const std::vector<PackageView> views = load_views(primary, shard);
+
+    auto scalar = [](ArtifactTensorRecord tensor) {
+        tensor.axis.source_rank = 2;
+        tensor.axis.source_axis_order =
+            {0, 1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+        tensor.format = {1, ArtifactPhysicalEncoding::F32,
+                         ArtifactScalarType::F32,
+                         ArtifactScalarType::None,
+                         ArtifactScalarType::None,
+                         ArtifactScalarType::None,
+                         ArtifactScalarType::None, 1, 4, 0, 0, 0, 0};
+        tensor.axis.row_stride_bytes = 16;
+        return tensor;
+    };
+
+    ArtifactIndexInput last_axis_contiguous = valid_input(views);
+    last_axis_contiguous.tensors[0] = scalar(last_axis_contiguous.tensors[0]);
+    CHECK(std::holds_alternative<ArtifactIndex>(
+        ArtifactIndex::build(std::move(last_axis_contiguous))));
+
+    ArtifactIndexInput first_axis_contiguous = valid_input(views);
+    first_axis_contiguous.tensors[0] = scalar(first_axis_contiguous.tensors[0]);
+    first_axis_contiguous.tensors[0].layout.strides =
+        {1, 2, 0, 0, 0, 0, 0, 0};
+    first_axis_contiguous.tensors[0].axis.row_stride_bytes = 8;
+    CHECK(std::holds_alternative<ArtifactIndex>(
+        ArtifactIndex::build(std::move(first_axis_contiguous))));
+
+    ArtifactIndexInput malformed = valid_input(views);
+    malformed.tensors[0] = scalar(malformed.tensors[0]);
+    malformed.tensors[0].layout.strides =
+        {2, 2, 0, 0, 0, 0, 0, 0};
+    expect_error(std::move(malformed), CompatibilityError::IR_LAYOUT_MISMATCH);
+
+    unlink(primary.c_str());
+    unlink(shard.c_str());
+}
+
 void test_grouped_affine_physical_contract_is_exact() {
     const std::string primary = temporary_path();
     const std::string shard = temporary_path();
@@ -488,6 +532,7 @@ int main() {
     test_coordinate_namespace_collision_is_rejected();
     test_physical_index_does_not_claim_semantic_roles();
     test_complete_physical_contract_validation();
+    test_scalar_encoding_does_not_select_axis_order();
     test_grouped_affine_physical_contract_is_exact();
     test_column_grouped_affine_u2_skip_uses_packed_byte_values();
     return test_summary("test_artifact_index");

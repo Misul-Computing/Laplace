@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <variant>
@@ -60,7 +61,20 @@ enum class Primitive : uint16_t {
     BoundedLoop = 4,
     StateRead = 5,
     StateWrite = 6,
+    StructuredTensor = 7,
+    Subtract = 8,
+    Divide = 9,
+    Maximum = 10,
+    Negate = 11,
+    Exp = 12,
+    Log = 13,
+    Rsqrt = 14,
+    Sin = 15,
+    Cos = 16,
 };
+
+inline constexpr size_t kPrimitiveCount =
+    static_cast<size_t>(Primitive::Cos) + 1;
 
 struct PrimitiveVersion {
     Primitive code = Primitive::Constant;
@@ -92,8 +106,51 @@ struct StateAttributes {
     friend bool operator==(StateAttributes, StateAttributes) = default;
 };
 
+enum class TensorIteratorKind : uint8_t {
+    Parallel = 1,
+    Reduction = 2,
+};
+
+enum class TensorIndexExpression : uint8_t {
+    Constant = 1,
+    Iterator = 2,
+    Add = 3,
+    Multiply = 4,
+    FloorDivide = 5,
+    Remainder = 6,
+    SourceScalar = 7,
+};
+
+struct TensorIndexExpr {
+    TensorIndexExpression expression = TensorIndexExpression::Constant;
+    int64_t value = 0;
+    std::vector<TensorIndexExpr> operands;
+    friend bool operator==(const TensorIndexExpr&, const TensorIndexExpr&) = default;
+};
+
+enum class TensorBoundsMode : uint8_t {
+    Reject = 1,
+    Zero = 2,
+};
+
+struct TensorIndexMap {
+    TensorBoundsMode bounds = TensorBoundsMode::Reject;
+    std::vector<TensorIndexExpr> results;
+    friend bool operator==(const TensorIndexMap&, const TensorIndexMap&) = default;
+};
+
+struct StructuredTensorAttributes {
+    uint32_t source_count = 0;
+    std::vector<DimensionExpr> iteration_dimensions;
+    std::vector<TensorIteratorKind> iterator_kinds;
+    std::vector<TensorIndexMap> indexing_maps;
+    friend bool operator==(const StructuredTensorAttributes&,
+                           const StructuredTensorAttributes&) = default;
+};
+
 using PrimitiveAttributes =
-    std::variant<NoAttributes, ConstantAttributes, LoopAttributes, StateAttributes>;
+    std::variant<NoAttributes, ConstantAttributes, LoopAttributes, StateAttributes,
+                 StructuredTensorAttributes>;
 
 struct Instruction {
     uint32_t id = UINT32_MAX;

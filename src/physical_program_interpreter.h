@@ -62,6 +62,8 @@ class VerifiedPhysicalProgram {
                             const LogicalTensorType&);
     friend PhysicalInterpretResult interpret_physical_value(
         const VerifiedPhysicalProgram&, std::span<const uint64_t>);
+    friend std::span<const uint8_t> physical_program_plane_bytes(
+        const VerifiedPhysicalProgram&, uint16_t) noexcept;
 };
 
 using VerifiedPhysicalProgramResult =
@@ -74,5 +76,8 @@ VerifiedPhysicalProgramResult verify_physical_program(
 PhysicalInterpretResult interpret_physical_value(
     const VerifiedPhysicalProgram& program,
     std::span<const uint64_t> logical_coordinate);
+
+std::span<const uint8_t> physical_program_plane_bytes(
+    const VerifiedPhysicalProgram& program, uint16_t plane) noexcept;
 
 } // namespace Laplace

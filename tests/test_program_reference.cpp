@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cstdint>
+#include <cmath>
 #include <optional>
 #include <span>
 #include <vector>
@@ -49,6 +50,403 @@ Program tensor_program() {
     result.functions = {function};
     result.exports = {{9, 0, tensor_type()}};
     return result;
+}
+
+Program algebra_program(Primitive primitive, bool unary) {
+    const ValueType scalar{ElementType::F32, {}};
+    Region region;
+    region.id = 1;
+    region.arguments = {{10, scalar}};
+    std::vector<uint32_t> inputs = {10};
+    if (!unary) {
+        region.arguments.push_back({11, scalar});
+        inputs.push_back(11);
+    }
+    region.instructions = {
+        Instruction{20, {primitive, 1, 0}, std::move(inputs), {{30, scalar}},
+                    {}, {}, NoAttributes{}}};
+    region.yields = {30};
+    Function function{9, 1, {std::move(region)}, {scalar}};
+    Program result;
+    result.functions = {std::move(function)};
+    result.exports = {{9, 0, scalar}};
+    return result;
+}
+
+std::variant<ReferenceResult, CompatibilityReport> run_algebra(
+    Primitive primitive, float left, std::optional<float> right = std::nullopt) {
+    auto verified = verify_and_canonicalize_program(
+        algebra_program(primitive, !right.has_value()));
+    if (const auto* report = std::get_if<CompatibilityReport>(&verified))
+        return *report;
+    const std::array<ReferenceInput, 2> inputs = {
+        ReferenceInput{10, {ElementType::F32, {},
+                            {std::bit_cast<uint32_t>(left)}}},
+        ReferenceInput{11, {ElementType::F32, {},
+                            {std::bit_cast<uint32_t>(right.value_or(0.0f))}}}};
+    ReferenceState state;
+    return execute_reference_program(
+        std::get<VerifiedProgram>(verified), state,
+        std::span<const ReferenceInput>(inputs).first(right ? 2 : 1));
+}
+
+void check_algebra(Primitive primitive, float left, std::optional<float> right,
+                   float expected) {
+    const auto result = run_algebra(primitive, left, right);
+    CHECK(std::holds_alternative<ReferenceResult>(result));
+    if (const auto* value = std::get_if<ReferenceResult>(&result)) {
+        CHECK(value->exports.size() == 1);
+        if (!value->exports.empty()) {
+            const float observed = std::bit_cast<float>(
+                static_cast<uint32_t>(value->exports.front().bits.front()));
+            CHECK(std::abs(observed - expected) <= 2.0e-6f);
+        }
+    }
+}
+
+void test_generic_f32_algebra_reference() {
+    check_algebra(Primitive::Subtract, 5.0f, 2.0f, 3.0f);
+    check_algebra(Primitive::Divide, 5.0f, 2.0f, 2.5f);
+    check_algebra(Primitive::Maximum, -3.0f, 2.0f, 2.0f);
+    check_algebra(Primitive::Negate, 1.25f, std::nullopt, -1.25f);
+    check_algebra(Primitive::Exp, 1.0f, std::nullopt, std::exp(1.0f));
+    check_algebra(Primitive::Log, 2.0f, std::nullopt, std::log(2.0f));
+    check_algebra(Primitive::Rsqrt, 4.0f, std::nullopt, 0.5f);
+    check_algebra(Primitive::Sin, 0.5f, std::nullopt, std::sin(0.5f));
+    check_algebra(Primitive::Cos, 0.5f, std::nullopt, std::cos(0.5f));
+
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        run_algebra(Primitive::Divide, 1.0f, 0.0f)));
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        run_algebra(Primitive::Exp, 1000.0f)));
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        run_algebra(Primitive::Log, -2.0f)));
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        run_algebra(Primitive::Rsqrt, -1.0f)));
+}
+
+TensorIndexExpr iterator_index(uint32_t index) {
+    return {TensorIndexExpression::Iterator, static_cast<int64_t>(index), {}};
+}
+
+TensorIndexMap index_map(std::initializer_list<uint32_t> iterators) {
+    TensorIndexMap result;
+    for (uint32_t iterator : iterators)
+        result.results.push_back(iterator_index(iterator));
+    return result;
+}
+
+Program dynamic_gather_program() {
+    const auto dimension = [](uint64_t value) {
+        return DimensionExpr{DimensionExpression::Constant, value, {}};
+    };
+    const ValueType table{ElementType::F32, {dimension(4), dimension(3)}};
+    const ValueType index{ElementType::U32, {}};
+    const ValueType output{ElementType::F32, {dimension(3)}};
+    const ValueType scalar{ElementType::F32, {}};
+    Region body{20, {{21, scalar}, {22, index}, {23, scalar}},
+                {Instruction{24, {Primitive::Add, 1, 0}, {21, 23},
+                             {{25, scalar}}, {}, {}, NoAttributes{}}},
+                {25}};
+    TensorIndexMap table_map;
+    table_map.results = {
+        TensorIndexExpr{TensorIndexExpression::SourceScalar, 1, {}},
+        iterator_index(0)};
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 2;
+    attributes.iteration_dimensions = {dimension(3)};
+    attributes.iterator_kinds = {TensorIteratorKind::Parallel};
+    attributes.indexing_maps = {
+        std::move(table_map), TensorIndexMap{}, index_map({0})};
+    Region root;
+    root.id = 1;
+    root.arguments = {{10, table}, {11, index}};
+    root.instructions = {
+        Instruction{12, {Primitive::Constant, 1, 0}, {}, {{13, output}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{14, {Primitive::StructuredTensor, 1, 0}, {10, 11, 13},
+                    {{15, output}}, {20}, {}, std::move(attributes)}};
+    root.yields = {15};
+    Function function{9, 1, {std::move(body), std::move(root)}, {output}};
+    Program program;
+    program.minor = 1;
+    program.functions = {std::move(function)};
+    program.exports = {{9, 0, output}};
+    return program;
+}
+
+void test_data_dependent_tensor_index_reference() {
+    auto verified = verify_and_canonicalize_program(dynamic_gather_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    const auto bits = [](float value) {
+        return static_cast<uint64_t>(std::bit_cast<uint32_t>(value));
+    };
+    ReferenceValue table{ElementType::F32, {4, 3},
+                         {bits(1), bits(2), bits(3), bits(4), bits(5), bits(6),
+                          bits(7), bits(8), bits(9), bits(10), bits(11), bits(12)}};
+    const std::array<ReferenceInput, 2> inputs = {
+        ReferenceInput{10, std::move(table)},
+        ReferenceInput{11, {ElementType::U32, {}, {2}}}};
+    ReferenceState state;
+    const auto result = execute_reference_program(
+        std::get<VerifiedProgram>(verified), state, inputs);
+    CHECK(std::holds_alternative<ReferenceResult>(result));
+    if (const auto* output = std::get_if<ReferenceResult>(&result)) {
+        CHECK(output->exports.size() == 1);
+        if (!output->exports.empty())
+            CHECK(output->exports.front().bits ==
+                  std::vector<uint64_t>({bits(7), bits(8), bits(9)}));
+    }
+
+    auto invalid = inputs;
+    invalid[1].value.bits.front() = 4;
+    ReferenceState invalid_state;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        execute_reference_program(std::get<VerifiedProgram>(verified),
+                                  invalid_state, invalid)));
+}
+
+Program structured_matmul_program() {
+    const auto dimension = [](uint64_t value) {
+        return DimensionExpr{DimensionExpression::Constant, value, {}};
+    };
+    const ValueType left{ElementType::F32, {dimension(2), dimension(3)}};
+    const ValueType right{ElementType::F32, {dimension(3), dimension(2)}};
+    const ValueType output{ElementType::F32, {dimension(2), dimension(2)}};
+    const ValueType scalar{ElementType::F32, {}};
+
+    Region body;
+    body.id = 20;
+    body.arguments = {{21, scalar}, {22, scalar}, {23, scalar}};
+    body.instructions = {
+        Instruction{24, {Primitive::Multiply, 1, 0}, {21, 22}, {{25, scalar}},
+                    {}, {}, NoAttributes{}},
+        Instruction{26, {Primitive::Add, 1, 0}, {23, 25}, {{27, scalar}},
+                    {}, {}, NoAttributes{}},
+    };
+    body.yields = {27};
+
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 2;
+    attributes.iteration_dimensions = {dimension(2), dimension(2), dimension(3)};
+    attributes.iterator_kinds = {
+        TensorIteratorKind::Parallel,
+        TensorIteratorKind::Parallel,
+        TensorIteratorKind::Reduction,
+    };
+    attributes.indexing_maps = {
+        index_map({0, 2}), index_map({2, 1}), index_map({0, 1})};
+
+    Instruction zero{10, {Primitive::Constant, 1, 0}, {}, {{12, output}},
+                     {}, {}, ConstantAttributes{0}};
+    Instruction contraction{30, {Primitive::StructuredTensor, 1, 0},
+                            {10, 11, 12}, {{13, output}}, {20}, {},
+                            std::move(attributes)};
+    Region root;
+    root.id = 1;
+    root.arguments = {{10, left}, {11, right}};
+    root.instructions = {std::move(zero), std::move(contraction)};
+    root.yields = {13};
+    Function function;
+    function.id = 9;
+    function.entry_region_id = 1;
+    function.regions = {std::move(body), std::move(root)};
+    function.result_types = {output};
+    Program program;
+    program.minor = 1;
+    program.functions = {std::move(function)};
+    program.exports = {{9, 0, output}};
+    return program;
+}
+
+Program structured_transpose_broadcast_program() {
+    const auto dimension = [](uint64_t value) {
+        return DimensionExpr{DimensionExpression::Constant, value, {}};
+    };
+    const ValueType matrix{ElementType::F32, {dimension(3), dimension(2)}};
+    const ValueType bias{ElementType::F32, {dimension(3)}};
+    const ValueType output{ElementType::F32, {dimension(2), dimension(3)}};
+    const ValueType scalar{ElementType::F32, {}};
+    Region body{20, {{21, scalar}, {22, scalar}, {23, scalar}},
+                {Instruction{24, {Primitive::Add, 1, 0}, {21, 22},
+                             {{25, scalar}}, {}, {}, NoAttributes{}}},
+                {25}};
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 2;
+    attributes.iteration_dimensions = {dimension(2), dimension(3)};
+    attributes.iterator_kinds = {
+        TensorIteratorKind::Parallel, TensorIteratorKind::Parallel};
+    attributes.indexing_maps = {
+        index_map({1, 0}), index_map({1}), index_map({0, 1})};
+    Region root;
+    root.id = 1;
+    root.arguments = {{10, matrix}, {11, bias}};
+    root.instructions = {
+        Instruction{12, {Primitive::Constant, 1, 0}, {}, {{13, output}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{14, {Primitive::StructuredTensor, 1, 0}, {10, 11, 13},
+                    {{15, output}}, {20}, {}, std::move(attributes)}};
+    root.yields = {15};
+    Function function{9, 1, {std::move(body), std::move(root)}, {output}};
+    Program program;
+    program.minor = 1;
+    program.functions = {std::move(function)};
+    program.exports = {{9, 0, output}};
+    return program;
+}
+
+Program structured_reduction_program() {
+    const auto dimension = [](uint64_t value) {
+        return DimensionExpr{DimensionExpression::Constant, value, {}};
+    };
+    const ValueType matrix{ElementType::F32, {dimension(2), dimension(3)}};
+    const ValueType output{ElementType::F32, {dimension(2)}};
+    const ValueType scalar{ElementType::F32, {}};
+    Region body{20, {{21, scalar}, {22, scalar}},
+                {Instruction{23, {Primitive::Add, 1, 0}, {21, 22},
+                             {{24, scalar}}, {}, {}, NoAttributes{}}},
+                {24}};
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 1;
+    attributes.iteration_dimensions = {dimension(2), dimension(3)};
+    attributes.iterator_kinds = {
+        TensorIteratorKind::Parallel, TensorIteratorKind::Reduction};
+    attributes.indexing_maps = {index_map({0, 1}), index_map({0})};
+    Region root;
+    root.id = 1;
+    root.arguments = {{10, matrix}};
+    root.instructions = {
+        Instruction{11, {Primitive::Constant, 1, 0}, {}, {{12, output}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{13, {Primitive::StructuredTensor, 1, 0}, {10, 12},
+                    {{14, output}}, {20}, {}, std::move(attributes)}};
+    root.yields = {14};
+    Function function{9, 1, {std::move(body), std::move(root)}, {output}};
+    Program program;
+    program.minor = 1;
+    program.functions = {std::move(function)};
+    program.exports = {{9, 0, output}};
+    return program;
+}
+
+Program oversized_structured_reduction_program() {
+    const auto dimension = [](uint64_t value) {
+        return DimensionExpr{DimensionExpression::Constant, value, {}};
+    };
+    const ValueType scalar{ElementType::F32, {}};
+    Region body{20, {{21, scalar}, {22, scalar}},
+                {Instruction{23, {Primitive::Add, 1, 0}, {21, 22},
+                             {{24, scalar}}, {}, {}, NoAttributes{}}},
+                {24}};
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 1;
+    attributes.iteration_dimensions = {dimension((uint64_t{1} << 24) + 1)};
+    attributes.iterator_kinds = {TensorIteratorKind::Reduction};
+    attributes.indexing_maps = {TensorIndexMap{}, TensorIndexMap{}};
+    Region root;
+    root.id = 1;
+    root.arguments = {{10, scalar}};
+    root.instructions = {
+        Instruction{11, {Primitive::Constant, 1, 0}, {}, {{12, scalar}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{13, {Primitive::StructuredTensor, 1, 0}, {10, 12},
+                    {{14, scalar}}, {20}, {}, std::move(attributes)}};
+    root.yields = {14};
+    Function function{9, 1, {std::move(body), std::move(root)}, {scalar}};
+    Program program;
+    program.minor = 1;
+    program.functions = {std::move(function)};
+    program.exports = {{9, 0, scalar}};
+    return program;
+}
+
+std::optional<VerifiedPhysicalProgramPackage> package_for(const Program& source);
+
+void test_structured_tensor_reference() {
+    const auto package = package_for(structured_matmul_program());
+    CHECK(package.has_value());
+    if (!package) return;
+    const auto f32 = [](float value) {
+        return static_cast<uint64_t>(std::bit_cast<uint32_t>(value));
+    };
+    const ReferenceValue left{ElementType::F32, {2, 3},
+                              {f32(1), f32(2), f32(3),
+                               f32(4), f32(5), f32(6)}};
+    const ReferenceValue right{ElementType::F32, {3, 2},
+                               {f32(1), f32(2), f32(3),
+                                f32(4), f32(5), f32(6)}};
+    const std::array<ReferenceInput, 2> inputs = {
+        ReferenceInput{10, left}, ReferenceInput{11, right}};
+    ReferenceState state;
+    const auto result = execute_reference(*package, state, inputs);
+    CHECK(std::holds_alternative<ReferenceResult>(result));
+    if (const auto* output = std::get_if<ReferenceResult>(&result)) {
+        CHECK(output->exports.size() == 1);
+        CHECK(output->exports[0].extents == std::vector<uint64_t>({2, 2}));
+        const std::vector<uint64_t> expected = {
+            f32(22), f32(28), f32(49), f32(64)};
+        CHECK(output->exports[0].bits == expected);
+    }
+
+    const auto transpose_package =
+        package_for(structured_transpose_broadcast_program());
+    CHECK(transpose_package.has_value());
+    if (transpose_package) {
+        const ReferenceValue matrix{ElementType::F32, {3, 2},
+                                    {f32(1), f32(2), f32(3),
+                                     f32(4), f32(5), f32(6)}};
+        const ReferenceValue bias{ElementType::F32, {3},
+                                  {f32(10), f32(20), f32(30)}};
+        const std::array<ReferenceInput, 2> transpose_inputs = {
+            ReferenceInput{10, matrix}, ReferenceInput{11, bias}};
+        ReferenceState transpose_state;
+        const auto transpose_result = execute_reference(
+            *transpose_package, transpose_state, transpose_inputs);
+        CHECK(std::holds_alternative<ReferenceResult>(transpose_result));
+        if (const auto* values =
+                std::get_if<ReferenceResult>(&transpose_result)) {
+            CHECK(values->exports[0].bits ==
+                  std::vector<uint64_t>({f32(11), f32(23), f32(35),
+                                         f32(12), f32(24), f32(36)}));
+        }
+    }
+
+    const auto reduction_package = package_for(structured_reduction_program());
+    CHECK(reduction_package.has_value());
+    if (reduction_package) {
+        const ReferenceValue matrix{ElementType::F32, {2, 3},
+                                    {f32(1), f32(2), f32(3),
+                                     f32(4), f32(5), f32(6)}};
+        const std::array<ReferenceInput, 1> reduction_inputs = {
+            ReferenceInput{10, matrix}};
+        ReferenceState reduction_state;
+        const auto reduction_result = execute_reference(
+            *reduction_package, reduction_state, reduction_inputs);
+        CHECK(std::holds_alternative<ReferenceResult>(reduction_result));
+        if (const auto* values =
+                std::get_if<ReferenceResult>(&reduction_result)) {
+            CHECK(values->exports[0].bits ==
+                  std::vector<uint64_t>({f32(6), f32(15)}));
+        }
+    }
+
+    const auto oversized_package =
+        package_for(oversized_structured_reduction_program());
+    CHECK(oversized_package.has_value());
+    if (oversized_package) {
+        const ReferenceValue scalar_input{ElementType::F32, {}, {f32(1)}};
+        const std::array<ReferenceInput, 1> oversized_inputs = {
+            ReferenceInput{10, scalar_input}};
+        ReferenceState oversized_state;
+        const auto oversized_result = execute_reference(
+            *oversized_package, oversized_state, oversized_inputs);
+        CHECK(std::holds_alternative<CompatibilityReport>(oversized_result));
+        if (const auto* report =
+                std::get_if<CompatibilityReport>(&oversized_result))
+            CHECK(report->code == CompatibilityError::RUNTIME_NUMERICAL_FAILURE);
+        CHECK(oversized_state.generation == 0);
+    }
 }
 
 Program program(bool with_state) {
@@ -316,7 +714,10 @@ void test_reference_execution_and_transaction() {
 } // namespace
 
 int main() {
+    test_generic_f32_algebra_reference();
+    test_data_dependent_tensor_index_reference();
     test_bound_physical_resource_feeds_semantic_input();
     test_reference_execution_and_transaction();
+    test_structured_tensor_reference();
     return test_summary("test_program_reference");
 }

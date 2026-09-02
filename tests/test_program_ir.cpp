@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -109,6 +110,405 @@ Program minimal_scalar_program() {
     instructions.push_back(instruction(
         30, Primitive::Add, {100, 200}, {value(300)}));
     return one_function_program(7, 9, {}, std::move(instructions), {300}, {scalar()});
+}
+
+Program algebra_program(Primitive primitive, bool unary,
+                        ElementType type = ElementType::F32) {
+    const ValueType value_type = scalar(type);
+    std::vector<TypedValue> arguments = {value(10, value_type)};
+    std::vector<uint32_t> inputs = {10};
+    if (!unary) {
+        arguments.push_back(value(11, value_type));
+        inputs.push_back(11);
+    }
+    return one_function_program(
+        7, 9, std::move(arguments),
+        {instruction(20, primitive, std::move(inputs),
+                     {value(30, value_type)})},
+        {30}, {value_type});
+}
+
+void test_generic_f32_algebra_contract() {
+    constexpr std::array binary = {
+        Primitive::Subtract, Primitive::Divide, Primitive::Maximum};
+    constexpr std::array unary = {
+        Primitive::Negate, Primitive::Exp, Primitive::Log,
+        Primitive::Rsqrt, Primitive::Sin, Primitive::Cos};
+
+    std::vector<ProgramDigest> digests;
+    for (Primitive primitive : binary) {
+        auto verified = verify_and_canonicalize_program(
+            algebra_program(primitive, false));
+        CHECK(std::holds_alternative<VerifiedProgram>(verified));
+        if (const auto* value = std::get_if<VerifiedProgram>(&verified)) {
+            digests.push_back(program_digest(*value));
+            const auto wire = encode_program_wire(*value);
+            CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+            if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire))
+                CHECK(std::holds_alternative<VerifiedProgram>(
+                    decode_program_wire(*bytes)));
+        }
+        CHECK(rejected_with(algebra_program(primitive, false,
+                                            ElementType::U32),
+                            CompatibilityError::IR_SHAPE_MISMATCH));
+    }
+    for (Primitive primitive : unary) {
+        auto verified = verify_and_canonicalize_program(
+            algebra_program(primitive, true));
+        CHECK(std::holds_alternative<VerifiedProgram>(verified));
+        if (const auto* value = std::get_if<VerifiedProgram>(&verified)) {
+            digests.push_back(program_digest(*value));
+            const auto wire = encode_program_wire(*value);
+            CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+            if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire))
+                CHECK(std::holds_alternative<VerifiedProgram>(
+                    decode_program_wire(*bytes)));
+        }
+        CHECK(rejected_with(algebra_program(primitive, true,
+                                            ElementType::U32),
+                            CompatibilityError::IR_SHAPE_MISMATCH));
+    }
+    std::sort(digests.begin(), digests.end(),
+              [](const ProgramDigest& left, const ProgramDigest& right) {
+                  return left.bytes < right.bytes;
+              });
+    CHECK(std::adjacent_find(digests.begin(), digests.end()) == digests.end());
+
+    Program wrong_arity = algebra_program(Primitive::Exp, true);
+    auto& item = wrong_arity.functions.front().regions.front().instructions.front();
+    item.inputs.push_back(10);
+    CHECK(rejected_with(wrong_arity,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program attributed = algebra_program(Primitive::Maximum, false);
+    attributed.functions.front().regions.front().instructions.front().attributes =
+        ConstantAttributes{0};
+    CHECK(rejected_with(attributed,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+}
+
+TensorIndexExpr iterator_index(uint32_t index) {
+    return {TensorIndexExpression::Iterator, static_cast<int64_t>(index), {}};
+}
+
+TensorIndexMap index_map(std::initializer_list<uint32_t> iterators) {
+    TensorIndexMap result;
+    for (uint32_t iterator : iterators)
+        result.results.push_back(iterator_index(iterator));
+    return result;
+}
+
+TensorIndexExpr source_scalar_index(uint32_t source) {
+    return {TensorIndexExpression::SourceScalar,
+            static_cast<int64_t>(source), {}};
+}
+
+Program dynamic_gather_program(ElementType index_type = ElementType::U32) {
+    const ValueType table = tensor({4, 3});
+    const ValueType index = scalar(index_type);
+    const ValueType output = tensor({3});
+    Region body;
+    body.id = 20;
+    body.arguments = {value(21), value(22, index), value(23)};
+    body.instructions = {
+        instruction(24, Primitive::Add, {21, 23}, {value(25)})};
+    body.yields = {25};
+
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 2;
+    attributes.iteration_dimensions = {constant_dimension(3)};
+    attributes.iterator_kinds = {TensorIteratorKind::Parallel};
+    TensorIndexMap table_map;
+    table_map.results = {source_scalar_index(1), iterator_index(0)};
+    attributes.indexing_maps = {
+        std::move(table_map), TensorIndexMap{}, index_map({0})};
+
+    Instruction zero = instruction(
+        10, Primitive::Constant, {}, {value(12, output)},
+        ConstantAttributes{0});
+    Instruction gather = instruction(
+        30, Primitive::StructuredTensor, {10, 11, 12},
+        {value(13, output)}, std::move(attributes));
+    gather.regions = {20};
+    Region root;
+    root.id = 1;
+    root.arguments = {value(10, table), value(11, index)};
+    root.instructions = {std::move(zero), std::move(gather)};
+    root.yields = {13};
+    Function function{9, 1, {std::move(body), std::move(root)}, {output}};
+    Program program;
+    program.minor = 1;
+    program.functions = {std::move(function)};
+    program.exports = {{9, 0, output}};
+    return program;
+}
+
+void test_data_dependent_tensor_index() {
+    auto verified = verify_and_canonicalize_program(dynamic_gather_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (const auto* value = std::get_if<VerifiedProgram>(&verified)) {
+        const auto wire = encode_program_wire(*value);
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+        if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire)) {
+            const auto decoded = decode_program_wire(*bytes);
+            CHECK(std::holds_alternative<VerifiedProgram>(decoded));
+            if (const auto* roundtrip = std::get_if<VerifiedProgram>(&decoded))
+                CHECK(program_digest(*roundtrip) == program_digest(*value));
+        }
+    }
+
+    CHECK(rejected_with(dynamic_gather_program(ElementType::F32),
+                        CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program missing_source = dynamic_gather_program();
+    auto& missing_map = std::get<StructuredTensorAttributes>(
+        missing_source.functions.front().regions.back().instructions.back()
+            .attributes).indexing_maps.front();
+    missing_map.results.front().value = 2;
+    CHECK(rejected_with(missing_source,
+                        CompatibilityError::IR_REFERENCE_INVALID));
+
+    Program malformed = dynamic_gather_program();
+    auto& malformed_index = std::get<StructuredTensorAttributes>(
+        malformed.functions.front().regions.back().instructions.back()
+            .attributes).indexing_maps.front().results.front();
+    malformed_index.operands.push_back(iterator_index(0));
+    CHECK(rejected_with(malformed,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+}
+
+Program structured_matmul_program(uint32_t rename = 0) {
+    const ValueType left = tensor({2, 3});
+    const ValueType right = tensor({3, 2});
+    const ValueType output = tensor({2, 2});
+
+    Region body;
+    body.id = 20 + rename;
+    body.arguments = {value(21 + rename), value(22 + rename), value(23 + rename)};
+    body.instructions = {
+        instruction(24 + rename, Primitive::Multiply,
+                    {21 + rename, 22 + rename}, {value(25 + rename)}),
+        instruction(26 + rename, Primitive::Add,
+                    {23 + rename, 25 + rename}, {value(27 + rename)}),
+    };
+    body.yields = {27 + rename};
+
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 2;
+    attributes.iteration_dimensions = {
+        constant_dimension(2), constant_dimension(2), constant_dimension(3)};
+    attributes.iterator_kinds = {
+        TensorIteratorKind::Parallel,
+        TensorIteratorKind::Parallel,
+        TensorIteratorKind::Reduction,
+    };
+    attributes.indexing_maps = {
+        index_map({0, 2}), index_map({2, 1}), index_map({0, 1})};
+
+    Instruction zero = instruction(
+        10 + rename, Primitive::Constant, {}, {value(12 + rename, output)},
+        ConstantAttributes{0});
+    Instruction contraction = instruction(
+        30 + rename, Primitive::StructuredTensor,
+        {10 + rename, 11 + rename, 12 + rename}, {value(13 + rename, output)},
+        std::move(attributes));
+    contraction.regions = {body.id};
+
+    Region root;
+    root.id = 1 + rename;
+    root.arguments = {value(10 + rename, left), value(11 + rename, right)};
+    root.instructions = {std::move(zero), std::move(contraction)};
+    root.yields = {13 + rename};
+
+    Function function;
+    function.id = 9 + rename;
+    function.entry_region_id = root.id;
+    function.regions = {std::move(body), std::move(root)};
+    function.result_types = {output};
+
+    Program program;
+    program.minor = 1;
+    program.functions = {std::move(function)};
+    program.exports = {{9 + rename, 0, output}};
+    return program;
+}
+
+void test_structured_tensor_contract() {
+    const auto verified = verify_and_canonicalize_program(structured_matmul_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+
+    const ProgramDigest expected =
+        program_digest(std::get<VerifiedProgram>(verified));
+    const auto renamed = verify_and_canonicalize_program(
+        structured_matmul_program(1000));
+    CHECK(std::holds_alternative<VerifiedProgram>(renamed));
+    if (const auto* value = std::get_if<VerifiedProgram>(&renamed))
+        CHECK(program_digest(*value) == expected);
+    const auto wire = encode_program_wire(std::get<VerifiedProgram>(verified));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(wire)) return;
+    const auto roundtrip =
+        decode_program_wire(std::get<std::vector<uint8_t>>(wire));
+    CHECK(std::holds_alternative<VerifiedProgram>(roundtrip));
+    if (const auto* decoded = std::get_if<VerifiedProgram>(&roundtrip))
+        CHECK(program_digest(*decoded) == expected);
+
+    Program old_version = structured_matmul_program();
+    old_version.minor = 0;
+    Region& old_root = old_version.functions.front().regions.back();
+    old_root.arguments.push_back(value(12, tensor({2, 2})));
+    old_root.instructions.erase(old_root.instructions.begin());
+    CHECK(rejected_with(old_version, CompatibilityError::IR_VERSION_UNSUPPORTED));
+
+    Program reduction_destination = structured_matmul_program();
+    auto& reduction_attributes = std::get<StructuredTensorAttributes>(
+        reduction_destination.functions.front().regions.back()
+            .instructions.back().attributes);
+    reduction_attributes.indexing_maps.back() = index_map({0, 2});
+    CHECK(rejected_with(reduction_destination,
+                        CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program missing_parallel = structured_matmul_program();
+    auto& missing_attributes = std::get<StructuredTensorAttributes>(
+        missing_parallel.functions.front().regions.back()
+            .instructions.back().attributes);
+    missing_attributes.indexing_maps.back() = index_map({0, 0});
+    CHECK(rejected_with(missing_parallel,
+                        CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program invalid_body = structured_matmul_program();
+    invalid_body.functions.front().regions.front().arguments.front().type =
+        tensor({1});
+    CHECK(rejected_with(invalid_body,
+                        CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program missing_map = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        missing_map.functions.front().regions.back().instructions.back().attributes)
+        .indexing_maps.pop_back();
+    CHECK(rejected_with(missing_map,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program wrong_map_rank = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        wrong_map_rank.functions.front().regions.back()
+            .instructions.back().attributes)
+        .indexing_maps.front().results.pop_back();
+    CHECK(rejected_with(wrong_map_rank,
+                        CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program invalid_iterator_kind = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        invalid_iterator_kind.functions.front().regions.back()
+            .instructions.back().attributes)
+        .iterator_kinds.front() = static_cast<TensorIteratorKind>(255);
+    CHECK(rejected_with(invalid_iterator_kind,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program invalid_bounds_mode = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        invalid_bounds_mode.functions.front().regions.back()
+            .instructions.back().attributes)
+        .indexing_maps.front().bounds = static_cast<TensorBoundsMode>(255);
+    CHECK(rejected_with(invalid_bounds_mode,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program zero_destination = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        zero_destination.functions.front().regions.back()
+            .instructions.back().attributes)
+        .indexing_maps.back().bounds = TensorBoundsMode::Zero;
+    CHECK(rejected_with(zero_destination,
+                        CompatibilityError::IR_SHAPE_MISMATCH));
+
+    Program zero_divisor = structured_matmul_program();
+    auto& divisor_attributes = std::get<StructuredTensorAttributes>(
+        zero_divisor.functions.front().regions.back().instructions.back().attributes);
+    divisor_attributes.indexing_maps.front().results.front() = {
+        TensorIndexExpression::FloorDivide, 0,
+        {iterator_index(0),
+         TensorIndexExpr{TensorIndexExpression::Constant, 0, {}}}};
+    CHECK(rejected_with(zero_divisor,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program invalid_iterator = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        invalid_iterator.functions.front().regions.back()
+            .instructions.back().attributes)
+        .indexing_maps.front().results.front() = iterator_index(99);
+    CHECK(rejected_with(invalid_iterator,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program invalid_arity = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        invalid_arity.functions.front().regions.back()
+            .instructions.back().attributes)
+        .indexing_maps.front().results.front() = {
+            TensorIndexExpression::Add, 0, {iterator_index(0)}};
+    CHECK(rejected_with(invalid_arity,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program index_overflow = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        index_overflow.functions.front().regions.back()
+            .instructions.back().attributes)
+        .indexing_maps.front().results.front() = {
+            TensorIndexExpression::Add, 0,
+            {TensorIndexExpr{TensorIndexExpression::Constant, INT64_MAX, {}},
+             TensorIndexExpr{TensorIndexExpression::Constant, 1, {}}}};
+    CHECK(rejected_with(index_overflow,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program excessive_index_depth = structured_matmul_program();
+    TensorIndexExpr deep = iterator_index(0);
+    for (uint32_t depth = 0; depth < 34; ++depth) {
+        deep = {TensorIndexExpression::Add, 0,
+                {std::move(deep),
+                 TensorIndexExpr{TensorIndexExpression::Constant, 0, {}}}};
+    }
+    std::get<StructuredTensorAttributes>(
+        excessive_index_depth.functions.front().regions.back()
+            .instructions.back().attributes)
+        .indexing_maps.front().results.front() = std::move(deep);
+    CHECK(rejected_with(excessive_index_depth,
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    Program effectful_body = structured_matmul_program();
+    effectful_body.functions.front().regions.front()
+        .instructions.back().effect_predecessors = {24};
+    CHECK(rejection(verify_and_canonicalize_program(effectful_body)) != nullptr);
+
+    Program changed_bounds = structured_matmul_program();
+    std::get<StructuredTensorAttributes>(
+        changed_bounds.functions.front().regions.back().instructions.back().attributes)
+        .indexing_maps.front().bounds = TensorBoundsMode::Zero;
+    const auto changed = verify_and_canonicalize_program(std::move(changed_bounds));
+    CHECK(std::holds_alternative<VerifiedProgram>(changed));
+    if (const auto* value = std::get_if<VerifiedProgram>(&changed))
+        CHECK(program_digest(*value) != expected);
+
+    auto truncated = std::get<std::vector<uint8_t>>(wire);
+    truncated.pop_back();
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        decode_program_wire(truncated)));
+
+    auto malformed_attributes = std::get<std::vector<uint8_t>>(wire);
+    const std::array<uint8_t, 11> structured_marker = {
+        30, 0, 0, 0,
+        static_cast<uint8_t>(Primitive::StructuredTensor), 0,
+        1, 0, 0, 0, 4};
+    const auto marker = std::search(malformed_attributes.begin(),
+                                    malformed_attributes.end(),
+                                    structured_marker.begin(),
+                                    structured_marker.end());
+    CHECK(marker != malformed_attributes.end());
+    if (marker != malformed_attributes.end()) {
+        malformed_attributes[static_cast<size_t>(
+            std::distance(malformed_attributes.begin(), marker)) + 10] = 255;
+        CHECK(std::holds_alternative<CompatibilityReport>(
+            decode_program_wire(malformed_attributes)));
+    }
 }
 
 void test_minimal_programs() {
@@ -898,6 +1298,9 @@ void test_structural_wire_roundtrip() {
 
 int main() {
     test_minimal_programs();
+    test_generic_f32_algebra_contract();
+    test_data_dependent_tensor_index();
+    test_structured_tensor_contract();
     test_unseen_repeated_graph_with_multiple_outputs();
     test_export_serialization_order_is_not_identity();
     test_bounded_loop_and_state_edge();

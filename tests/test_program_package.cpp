@@ -363,6 +363,143 @@ std::vector<uint8_t> duplicate_package_container(
     return result;
 }
 
+ContainerSchemaProgram product_container_schema() {
+    ContainerSchemaProgram program;
+    program.register_count = 6;
+    program.predicate_count = 1;
+    ContainerSchemaInstruction match;
+    match.opcode = ContainerSchemaOpcode::MatchBytes;
+    match.literal = {'P', 'R', 'D', 'X'};
+    ContainerSchemaInstruction weight_length;
+    weight_length.opcode = ContainerSchemaOpcode::ReadU64Le;
+    weight_length.destination = 0;
+    ContainerSchemaInstruction token_length = weight_length;
+    token_length.destination = 1;
+    ContainerSchemaInstruction package_length = weight_length;
+    package_length.destination = 2;
+    const auto emit = [](uint32_t cursor_register, uint32_t length_register,
+                         uint32_t section_id) {
+        std::array<ContainerSchemaInstruction, 3> result;
+        result[0].opcode = ContainerSchemaOpcode::CaptureCursor;
+        result[0].destination = cursor_register;
+        result[1].opcode = ContainerSchemaOpcode::EmitRange;
+        result[1].input_a = cursor_register;
+        result[1].input_b = length_register;
+        result[1].section_id = section_id;
+        result[2].opcode = ContainerSchemaOpcode::Advance;
+        result[2].input_a = length_register;
+        return result;
+    };
+    const auto weight = emit(3, 0, 41);
+    const auto token = emit(4, 1, 42);
+    const auto package = emit(5, 2, 23);
+    ContainerSchemaInstruction end;
+    end.opcode = ContainerSchemaOpcode::RequireCursorEnd;
+    program.instructions = {
+        match, weight_length, token_length, package_length,
+        weight[0], weight[1], weight[2], token[0], token[1], token[2],
+        package[0], package[1], package[2], end};
+    return program;
+}
+
+std::vector<uint8_t> product_container(const ArtifactIndex& index,
+                                       std::span<const uint8_t> package) {
+    const auto find = [&](ArtifactId id) -> const PackageView* {
+        for (const PackageView& artifact : index.artifacts())
+            if (artifact.artifact_id() == id) return &artifact;
+        return nullptr;
+    };
+    const PackageView* weights = find(ArtifactId{7});
+    const PackageView* token = find(ArtifactId{2});
+    CHECK(weights != nullptr);
+    CHECK(token != nullptr);
+    if (weights == nullptr || token == nullptr) return {};
+    std::vector<uint8_t> result = {'P', 'R', 'D', 'X'};
+    const auto append_u64 = [&](uint64_t value) {
+        for (unsigned shift = 0; shift != 64; shift += 8)
+            result.push_back(static_cast<uint8_t>(value >> shift));
+    };
+    append_u64(weights->bytes().size());
+    append_u64(token->bytes().size());
+    append_u64(package.size());
+    result.insert(result.end(), weights->bytes().begin(), weights->bytes().end());
+    result.insert(result.end(), token->bytes().begin(), token->bytes().end());
+    result.insert(result.end(), package.begin(), package.end());
+    return result;
+}
+
+void test_container_loader_builds_artifact_index() {
+    Fixture source = fixture();
+    auto package = build(source);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
+    if (!std::holds_alternative<VerifiedProgramPackage>(package)) return;
+    auto wire = encode_program_package(
+        std::get<VerifiedProgramPackage>(package));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(wire)) return;
+    const auto container = product_container(
+        source.index, std::get<std::vector<uint8_t>>(wire));
+    auto container_view = ArtifactSet::make_owned_blob(
+        ArtifactId{99}, ArtifactRole::Primary, container);
+    CHECK(std::holds_alternative<PackageView>(container_view));
+    if (!std::holds_alternative<PackageView>(container_view)) return;
+    const std::array<ContainerSchemaProgram, 1> schemas = {
+        product_container_schema()};
+    const std::array<ContainerArtifactSection, 2> sections = {{
+        {41, ArtifactId{7}, ArtifactRole::Primary},
+        {42, ArtifactId{2}, ArtifactRole::Shard},
+    }};
+    auto loaded = load_container_program_package(
+        std::get<PackageView>(container_view), schemas, sections, 23);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(loaded));
+    if (const auto* verified = std::get_if<VerifiedProgramPackage>(&loaded))
+        CHECK(verified->digest() ==
+              std::get<VerifiedProgramPackage>(package).digest());
+
+    auto missing = sections;
+    missing[1].section_id = 44;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        load_container_program_package(std::get<PackageView>(container_view),
+                                       schemas, missing, 23)));
+    auto duplicate = sections;
+    duplicate[1].section_id = duplicate[0].section_id;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        load_container_program_package(std::get<PackageView>(container_view),
+                                       schemas, duplicate, 23)));
+    auto reused_id = sections;
+    reused_id[1].artifact_id = reused_id[0].artifact_id;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        load_container_program_package(std::get<PackageView>(container_view),
+                                       schemas, reused_id, 23)));
+
+    ContainerSchemaProgram overlap = product_container_schema();
+    overlap.register_count = 7;
+    ContainerSchemaInstruction zero;
+    zero.opcode = ContainerSchemaOpcode::SetConstant;
+    zero.destination = 6;
+    overlap.instructions.insert(overlap.instructions.begin() + 4, zero);
+    overlap.instructions[7].input_a = 6;
+    ContainerSchemaInstruction catch_up;
+    catch_up.opcode = ContainerSchemaOpcode::Advance;
+    catch_up.input_a = 0;
+    overlap.instructions.insert(overlap.instructions.end() - 1, catch_up);
+    const std::array<ContainerSchemaProgram, 1> overlap_schemas = {overlap};
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        load_container_program_package(std::get<PackageView>(container_view),
+                                       overlap_schemas, sections, 23)));
+
+    auto oversized = container;
+    std::fill(oversized.begin() + 4, oversized.begin() + 12, 0xff);
+    auto oversized_view = ArtifactSet::make_owned_blob(
+        ArtifactId{99}, ArtifactRole::Primary, oversized);
+    CHECK(std::holds_alternative<PackageView>(oversized_view));
+    if (std::holds_alternative<PackageView>(oversized_view)) {
+        CHECK(std::holds_alternative<CompatibilityReport>(
+            load_container_program_package(std::get<PackageView>(oversized_view),
+                                           schemas, sections, 23)));
+    }
+}
+
 void test_container_handoff_uses_verified_package_decoder() {
     auto source_package = build(fixture());
     CHECK(std::holds_alternative<VerifiedProgramPackage>(source_package));
@@ -438,6 +575,32 @@ int emit_external_package(const char* path) {
     return test_summary("test_program_package_emit");
 }
 
+int emit_external_product_source(const char* package_path,
+                                 const char* weights_path,
+                                 const char* token_path) {
+    Fixture source = fixture();
+    auto package = build(source);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
+    if (!std::holds_alternative<VerifiedProgramPackage>(package))
+        return test_summary("test_program_product_emit");
+    const auto wire = encode_program_package(
+        std::get<VerifiedProgramPackage>(package));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire))
+        CHECK(write_bytes(package_path, *bytes));
+    const PackageView* weights = nullptr;
+    const PackageView* token = nullptr;
+    for (const PackageView& artifact : source.index.artifacts()) {
+        if (artifact.artifact_id() == ArtifactId{7}) weights = &artifact;
+        if (artifact.artifact_id() == ArtifactId{2}) token = &artifact;
+    }
+    CHECK(weights != nullptr);
+    CHECK(token != nullptr);
+    if (weights != nullptr) CHECK(write_bytes(weights_path, weights->bytes()));
+    if (token != nullptr) CHECK(write_bytes(token_path, token->bytes()));
+    return test_summary("test_program_product_emit");
+}
+
 int load_external_container(const char* schema_path, const char* container_path) {
     const auto schema_wire = read_bytes(schema_path);
     const auto container = read_bytes(container_path);
@@ -456,6 +619,36 @@ int load_external_container(const char* schema_path, const char* container_path)
     if (const auto* verified = std::get_if<VerifiedProgramPackage>(&package))
         CHECK(verified->complete());
     return test_summary("test_unseen_container_schema");
+}
+
+int load_external_product_container(const char* schema_path,
+                                    const char* container_path) {
+    const auto schema_wire = read_bytes(schema_path);
+    const auto decoded_schemas = decode_container_schema_set(schema_wire);
+    CHECK(std::holds_alternative<std::vector<ContainerSchemaProgram>>(
+        decoded_schemas));
+    auto loaded = ArtifactSet::load_single_file(container_path);
+    CHECK(std::holds_alternative<ArtifactSet>(loaded));
+    if (!std::holds_alternative<std::vector<ContainerSchemaProgram>>(
+            decoded_schemas) ||
+        !std::holds_alternative<ArtifactSet>(loaded))
+        return test_summary("test_unseen_container_product");
+    auto container = std::get<ArtifactSet>(std::move(loaded)).view(ArtifactId{0});
+    CHECK(std::holds_alternative<PackageView>(container));
+    if (!std::holds_alternative<PackageView>(container))
+        return test_summary("test_unseen_container_product");
+    const std::array<ContainerArtifactSection, 2> sections = {{
+        {41, ArtifactId{7}, ArtifactRole::Primary},
+        {42, ArtifactId{2}, ArtifactRole::Shard},
+    }};
+    const auto package = load_container_program_package(
+        std::get<PackageView>(container),
+        std::get<std::vector<ContainerSchemaProgram>>(decoded_schemas),
+        sections, 23);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
+    if (const auto* verified = std::get_if<VerifiedProgramPackage>(&package))
+        CHECK(verified->complete());
+    return test_summary("test_unseen_container_product");
 }
 
 void test_complete_package_roundtrip_and_identity() {
@@ -557,10 +750,15 @@ void test_token_binding_and_provenance_counterexamples() {
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--emit-program-package")
         return emit_external_package(argv[2]);
+    if (argc == 5 && std::string(argv[1]) == "--emit-program-product")
+        return emit_external_product_source(argv[2], argv[3], argv[4]);
     if (argc == 4 && std::string(argv[1]) == "--load-container-schema")
         return load_external_container(argv[2], argv[3]);
+    if (argc == 4 && std::string(argv[1]) == "--load-container-product-schema")
+        return load_external_product_container(argv[2], argv[3]);
     test_complete_package_roundtrip_and_identity();
     test_token_binding_and_provenance_counterexamples();
     test_container_handoff_uses_verified_package_decoder();
+    test_container_loader_builds_artifact_index();
     return test_summary("test_program_package");
 }

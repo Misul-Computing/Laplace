@@ -665,4 +665,103 @@ ProgramPackageResult decode_container_program_package(
                           static_cast<size_t>(package_range->length)));
 }
 
+ProgramPackageResult load_container_program_package(
+    const PackageView& container,
+    std::span<const ContainerSchemaProgram> schemas,
+    std::span<const ContainerArtifactSection> artifact_sections,
+    uint32_t package_section_id) {
+    if (artifact_sections.empty() ||
+        artifact_sections.size() > UINT32_MAX) {
+        return package_error(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                             "container package has no bounded artifact sections");
+    }
+    auto selected = select_container_schema(schemas, container.bytes());
+    if (const auto* report = std::get_if<CompatibilityReport>(&selected))
+        return *report;
+    const auto& ranges = std::get<ContainerExtraction>(selected).ranges;
+    if (artifact_sections.size() > ranges.size()) {
+        return package_error(CompatibilityError::IMPORT_CLOSURE_INCOMPLETE,
+                             "container package declares more artifacts than extracted sections");
+    }
+    const auto unique_range = [&](uint32_t section_id)
+        -> std::variant<const ContainerRange*, CompatibilityReport> {
+        const ContainerRange* found = nullptr;
+        for (const ContainerRange& range : ranges) {
+            if (range.section_id != section_id) continue;
+            if (found != nullptr) {
+                return package_error(
+                    CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS,
+                    "container schema emitted a duplicate required section");
+            }
+            found = &range;
+        }
+        if (found == nullptr) {
+            return package_error(
+                CompatibilityError::IMPORT_CLOSURE_INCOMPLETE,
+                "container schema omitted a required package section");
+        }
+        return found;
+    };
+    auto package_result = unique_range(package_section_id);
+    if (const auto* report = std::get_if<CompatibilityReport>(&package_result))
+        return *report;
+    const ContainerRange* package_range =
+        std::get<const ContainerRange*>(package_result);
+    try {
+        ArtifactIndexInput input;
+        input.artifacts.reserve(artifact_sections.size());
+        std::vector<uint32_t> section_ids;
+        std::vector<uint32_t> artifact_ids;
+        section_ids.reserve(artifact_sections.size());
+        artifact_ids.reserve(artifact_sections.size());
+        for (const ContainerArtifactSection& binding : artifact_sections) {
+            if (binding.section_id == package_section_id) {
+                return package_error(
+                    CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                    "container package section bindings are not unique");
+            }
+            section_ids.push_back(binding.section_id);
+            artifact_ids.push_back(binding.artifact_id.value);
+        }
+        std::sort(section_ids.begin(), section_ids.end());
+        std::sort(artifact_ids.begin(), artifact_ids.end());
+        if (std::adjacent_find(section_ids.begin(), section_ids.end()) !=
+                section_ids.end() ||
+            std::adjacent_find(artifact_ids.begin(), artifact_ids.end()) !=
+                artifact_ids.end()) {
+            return package_error(
+                CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                "container package section bindings are not unique");
+        }
+        for (const ContainerArtifactSection& binding : artifact_sections) {
+            auto range_result = unique_range(binding.section_id);
+            if (const auto* report =
+                    std::get_if<CompatibilityReport>(&range_result))
+                return *report;
+            const ContainerRange* range =
+                std::get<const ContainerRange*>(range_result);
+            auto view = ArtifactSet::make_subview(
+                container, binding.artifact_id, binding.role,
+                static_cast<size_t>(range->offset),
+                static_cast<size_t>(range->length));
+            if (const auto* report =
+                    std::get_if<CompatibilityReport>(&view))
+                return *report;
+            input.artifacts.push_back(
+                std::get<PackageView>(std::move(view)));
+        }
+        auto physical = ArtifactIndex::build(std::move(input));
+        if (const auto* report = std::get_if<CompatibilityReport>(&physical))
+            return *report;
+        return decode_program_package(
+            std::get<ArtifactIndex>(std::move(physical)),
+            container.bytes().subspan(
+                static_cast<size_t>(package_range->offset),
+                static_cast<size_t>(package_range->length)));
+    } catch (const std::bad_alloc&) {
+        return package_error(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                             "container package loader allocation failed");
+    }
+}
+
 } // namespace Laplace

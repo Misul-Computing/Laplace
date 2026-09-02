@@ -139,6 +139,12 @@ enum class PhysicalOpcode : uint16_t {
     F32Fma = 33,
     F32Negate = 34,
     F32Clamp = 35,
+    // Low 32 bits of ({high, low} >> shift). The verifier proves shift < 64.
+    U32FunnelShiftRight = 36,
+    U32Add = 37,
+    U32Multiply = 38,
+    // Round to IEEE binary16, then widen back to F32.
+    F32RoundToF16 = 39,
 };
 
 struct PhysicalInstruction {

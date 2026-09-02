@@ -503,6 +503,11 @@ struct MetalResourceSnapshot {
     uint64_t implicit_weight_copies = 0;
     uint64_t session_owned_metadata_bytes = 0;
     uint64_t transient_workspace_bytes = 0;
+    uint64_t residency_allocated_size = 0;
+    uint32_t residency_allocation_count = 0;
+    bool residency_set_supported = false;
+    bool residency_set_committed = false;
+    bool residency_requested = false;
 };
 struct MetalTokMoeCapabilities {
     bool router_topk = false;
@@ -552,6 +557,7 @@ MetalTokMoeCapabilities metal_tok_session_moe_capabilities(MetalTokSession&);
 bool metal_tok_session_moe_ready(MetalTokSession&);
 bool metal_tok_session_recurrent_ready(MetalTokSession&);
 bool metal_tok_session_register_weights(MetalTokSession&, const void* base, size_t size);
+bool metal_tok_session_prepare_weight_residency(MetalTokSession&);
 void metal_tok_session_unregister_weights(MetalTokSession&, const void* base);
 #if defined(LAPLACE_TESTING)
 // Test-only registration seam. The chunk limit forces split-buffer coverage;

@@ -1,5 +1,6 @@
 #include <array>
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,8 @@
 #include "codec_program.h"
 #include "compat_rule.h"
 #include "product_package.h"
+#include "program_metal.h"
+#include "program_package.h"
 #include "runtime_session.h"
 #include "semantic_manifest.h"
 #include "test_util.h"
@@ -57,7 +60,9 @@ struct ProductFixture {
 
 SessionRequest request();
 
-static_assert(!std::is_invocable_v<decltype(&create_runtime_session),
+using ProductSessionFactory = SessionCreateResult (*)(
+    const ProductPackage&, SessionRequest, SessionFaultPoint);
+static_assert(!std::is_invocable_v<ProductSessionFactory,
                                    std::shared_ptr<const RuntimePackage>,
                                    SessionRequest, SessionFaultPoint>);
 static_assert(!std::is_copy_constructible_v<ProductPackage>);
@@ -260,8 +265,11 @@ ArtifactTensorRecord physical_record(const SemanticTensor& tensor) {
                                                                     : source.storage_type == ScalarType::F16 ? 2u : 4u,
                              source.storage_type == ScalarType::U8 ? tensor.layout.block_elements : 1u,
                              source.alignment});
+    size_t unit_stride_axis = 0;
+    for (size_t axis = 0; axis < record.logical_dimensions.size(); ++axis)
+        if (record.layout.strides[axis] == 1) unit_stride_axis = axis;
     const uint64_t physical_row_width = record.logical_dimensions.empty()
-        ? 0 : record.logical_dimensions[0];
+        ? 0 : record.logical_dimensions[unit_stride_axis];
     record.axis.row_stride_bytes = source.storage_type == ScalarType::U8
         ? tensor.layout.block_elements == 0
               ? 0
@@ -511,6 +519,27 @@ void test_runtime_carries_verified_physical_package(const ProductFixture& fixtur
     CHECK(runtime->physical_program_package() == physical);
     const auto bound = validate_physical_program_package_for_runtime(*runtime, *physical);
     CHECK(std::holds_alternative<std::monostate>(bound));
+    auto compiled_resource = compile_metal_physical_resource(*runtime, 0);
+    CHECK(std::holds_alternative<MetalPhysicalProgramExecutable>(compiled_resource));
+    if (std::holds_alternative<MetalPhysicalProgramExecutable>(compiled_resource)) {
+        MetalPhysicalProgramExecutable executable =
+            std::get<MetalPhysicalProgramExecutable>(std::move(compiled_resource));
+        const auto executed = executable.execute();
+        CHECK(std::holds_alternative<MetalPhysicalProgramResult>(executed));
+        if (const auto* result =
+                std::get_if<MetalPhysicalProgramResult>(&executed)) {
+            CHECK(result->value.type == ElementType::U32);
+            CHECK(result->value.extents.empty());
+            CHECK(result->value.bits.size() == 1);
+            CHECK(result->value.bits[0] == fixture.index.artifacts()[0].bytes()[0]);
+            CHECK(result->audit.explicit_upload_bytes == 0);
+            CHECK(result->audit.zero_copy_plane_bytes == 1);
+            CHECK(result->audit.persistent_plane_bytes == 1);
+            CHECK(result->audit.explicit_download_bytes == sizeof(uint32_t));
+            CHECK(result->audit.command_buffers == 1);
+            CHECK(result->audit.implicit_weight_copies == 0);
+        }
+    }
     auto session = create_product_runtime_session_for_testing(runtime, request());
     CHECK(std::holds_alternative<CompatibilityReport>(session));
     if (const auto* report = std::get_if<CompatibilityReport>(&session)) {
@@ -524,6 +553,456 @@ void test_runtime_carries_verified_physical_package(const ProductFixture& fixtur
     CHECK(std::holds_alternative<CompatibilityReport>(rejected));
     if (const auto* report = std::get_if<CompatibilityReport>(&rejected))
         CHECK(report->code == CompatibilityError::AUTHORITY_INVALID);
+    const auto unauthorized = compile_metal_physical_resource(*diagnostic, 0);
+    CHECK(std::holds_alternative<CompatibilityReport>(unauthorized));
+    if (const auto* report = std::get_if<CompatibilityReport>(&unauthorized))
+        CHECK(report->code == CompatibilityError::AUTHORITY_INVALID);
+    const auto missing = compile_metal_physical_resource(*runtime, 1);
+    CHECK(std::holds_alternative<CompatibilityReport>(missing));
+    if (const auto* report = std::get_if<CompatibilityReport>(&missing))
+        CHECK(report->code == CompatibilityError::IMPORT_TENSOR_UNMAPPED);
+}
+
+DimensionExpr program_dimension(uint64_t value) {
+    return {DimensionExpression::Constant, value, {}};
+}
+
+ValueType program_vector(uint64_t extent) {
+    return {ElementType::F32, {program_dimension(extent)}};
+}
+
+Program program_session_graph() {
+    const ValueType token{ElementType::U32, {}};
+    const ValueType scores = program_vector(10);
+    const ValueType scalar{ElementType::F32, {}};
+    Region body;
+    body.id = 20;
+    body.arguments = {{21, scalar}, {22, token}, {23, scalar}};
+    body.instructions = {
+        Instruction{24, {Primitive::Add, 1, 0}, {21, 23}, {{25, scalar}},
+                    {}, {}, NoAttributes{}}};
+    body.yields = {25};
+    StructuredTensorAttributes attributes;
+    attributes.source_count = 2;
+    attributes.iteration_dimensions = {program_dimension(10)};
+    attributes.iterator_kinds = {TensorIteratorKind::Parallel};
+    attributes.indexing_maps = {
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}},
+        TensorIndexMap{TensorBoundsMode::Reject, {}},
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}}};
+    Region root;
+    root.id = 1;
+    root.arguments = {{100, token}, {200, scores}};
+    root.instructions = {
+        Instruction{201, {Primitive::Constant, 1, 0}, {}, {{202, scores}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{203, {Primitive::StructuredTensor, 1, 0},
+                    {200, 100, 202}, {{204, scores}}, {20}, {},
+                    std::move(attributes)}};
+    root.yields = {204};
+    Program program;
+    program.minor = 1;
+    program.functions = {{10, 1, {std::move(body), std::move(root)},
+                          {scores}}};
+    program.exports = {{10, 0, scores}};
+    return program;
+}
+
+Program stateful_program_session_graph() {
+    const ValueType token{ElementType::U32, {}};
+    const ValueType scores = program_vector(10);
+    const ValueType state_type = program_vector(1);
+    const ValueType scalar{ElementType::F32, {}};
+
+    Region increment;
+    increment.id = 20;
+    increment.arguments = {{21, scalar}, {22, scalar}};
+    increment.instructions = {
+        Instruction{23, {Primitive::Constant, 1, 0}, {}, {{24, scalar}},
+                    {}, {}, ConstantAttributes{std::bit_cast<uint32_t>(1.0f)}},
+        Instruction{25, {Primitive::Add, 1, 0}, {21, 24}, {{26, scalar}},
+                    {}, {}, NoAttributes{}},
+        Instruction{27, {Primitive::Add, 1, 0}, {22, 26}, {{28, scalar}},
+                    {}, {}, NoAttributes{}}};
+    increment.yields = {28};
+
+    Region scores_body;
+    scores_body.id = 30;
+    scores_body.arguments = {
+        {31, scalar}, {32, scalar}, {33, scalar}};
+    scores_body.instructions = {
+        Instruction{34, {Primitive::Add, 1, 0}, {31, 32}, {{35, scalar}},
+                    {}, {}, NoAttributes{}},
+        Instruction{36, {Primitive::Add, 1, 0}, {33, 35}, {{37, scalar}},
+                    {}, {}, NoAttributes{}}};
+    scores_body.yields = {37};
+
+    StructuredTensorAttributes increment_attributes;
+    increment_attributes.source_count = 1;
+    increment_attributes.iteration_dimensions = {program_dimension(1)};
+    increment_attributes.iterator_kinds = {TensorIteratorKind::Parallel};
+    increment_attributes.indexing_maps = {
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}},
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}}};
+    StructuredTensorAttributes score_attributes;
+    score_attributes.source_count = 2;
+    score_attributes.iteration_dimensions = {program_dimension(10)};
+    score_attributes.iterator_kinds = {TensorIteratorKind::Parallel};
+    score_attributes.indexing_maps = {
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}},
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Constant, 0, {}}}},
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}}};
+
+    Region root;
+    root.id = 1;
+    root.arguments = {{100, token}, {200, scores}};
+    root.instructions = {
+        Instruction{201, {Primitive::StateRead, 1, 0}, {},
+                    {{202, state_type}}, {}, {}, StateAttributes{30}},
+        Instruction{203, {Primitive::Constant, 1, 0}, {},
+                    {{204, state_type}}, {}, {}, ConstantAttributes{0}},
+        Instruction{205, {Primitive::StructuredTensor, 1, 0}, {202, 204},
+                    {{206, state_type}}, {20}, {},
+                    std::move(increment_attributes)},
+        Instruction{207, {Primitive::StateWrite, 1, 0}, {206}, {}, {},
+                    {201}, StateAttributes{30}},
+        Instruction{208, {Primitive::Constant, 1, 0}, {}, {{209, scores}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{210, {Primitive::StructuredTensor, 1, 0},
+                    {200, 206, 209}, {{211, scores}}, {30}, {},
+                    std::move(score_attributes)}};
+    root.yields = {211};
+    Program program;
+    program.minor = 1;
+    program.state_references = {{30, state_type, UINT32_MAX, true}};
+    program.functions = {{10, 1,
+                          {std::move(increment), std::move(scores_body),
+                           std::move(root)},
+                          {scores}}};
+    program.exports = {{10, 0, scores}};
+    return program;
+}
+
+Program guarded_stateful_program_session_graph() {
+    Program program = stateful_program_session_graph();
+    Function& function = program.functions.front();
+    Region& scores_body = *std::find_if(
+        function.regions.begin(), function.regions.end(),
+        [](const Region& region) { return region.id == 30; });
+    const ValueType token{ElementType::U32, {}};
+    const ValueType scalar{ElementType::F32, {}};
+    scores_body.arguments = {
+        {31, scalar}, {38, scalar}, {39, token}, {32, scalar}, {33, scalar}};
+    Region& root = *std::find_if(
+        function.regions.begin(), function.regions.end(),
+        [](const Region& region) { return region.id == 1; });
+    Instruction& scores = *std::find_if(
+        root.instructions.begin(), root.instructions.end(),
+        [](const Instruction& instruction) { return instruction.id == 210; });
+    scores.inputs = {200, 200, 100, 206, 209};
+    auto& attributes = std::get<StructuredTensorAttributes>(scores.attributes);
+    attributes.source_count = 4;
+    TensorIndexExpr guarded_index;
+    guarded_index.expression = TensorIndexExpression::Add;
+    guarded_index.operands = {
+        {TensorIndexExpression::SourceScalar, 2, {}},
+        {TensorIndexExpression::Constant, 9, {}}};
+    attributes.indexing_maps = {
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}},
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {std::move(guarded_index)}},
+        TensorIndexMap{TensorBoundsMode::Reject, {}},
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Constant, 0, {}}}},
+        TensorIndexMap{TensorBoundsMode::Reject,
+                       {{TensorIndexExpression::Iterator, 0, {}}}}};
+    return program;
+}
+
+TokenProgramDefinition program_session_tokens() {
+    TokenProgramDefinition definition;
+    for (uint32_t value = 0; value != 256; ++value)
+        definition.byte_map[value] = static_cast<uint8_t>(value);
+    definition.unknown_token_id = 0;
+    definition.vocabulary = {
+        {"<unk>", static_cast<uint16_t>(VocabFlags::Special), 0},
+        {"a", 0, 0}, {"b", 0, 0}, {"ab", 0, 0}, {" ", 0, 0},
+        {"A", 0, 0},
+        {"<bos>", static_cast<uint16_t>(VocabFlags::Special), 0},
+        {"<eos>", static_cast<uint16_t>(VocabFlags::Special), 0},
+        {"x", 0, 0},
+        {"<x>", static_cast<uint16_t>(VocabFlags::Special), 0}};
+    definition.merges = {{1, 2, 3, 0}};
+    definition.prompt = {
+        {PromptOpcode::EmitUserText, {}},
+        {PromptOpcode::EmitGenerationPrompt, "!"},
+        {PromptOpcode::End, {}}};
+    definition.prompt_max_bytes = 128;
+    definition.normalizer.kind = NormalizerKind::None;
+    definition.pretokenizer.kind = PretokenizerKind::ByteLevel;
+    definition.postprocessor.kind = PostprocessorKind::None;
+    definition.decoder.kind = DecoderKind::ByteLevel;
+    return definition;
+}
+
+PhysicalProgram program_session_decoder() {
+    PhysicalProgram program;
+    program.logical_rank = 1;
+    program.planes.push_back({PhysicalPlaneStorage::External, 1, 0, 0});
+    program.policies.push_back({});
+    program.instructions = {
+        {PhysicalOpcode::Coordinate, PhysicalValueType::Index,
+         {kNoPhysicalValue, kNoPhysicalValue, kNoPhysicalValue},
+         kNoPhysicalPlane, kNoPhysicalPolicy, 0, 0,
+         PhysicalBitOrder::Lsb0Little},
+        {PhysicalOpcode::ConstIndex, PhysicalValueType::Index,
+         {kNoPhysicalValue, kNoPhysicalValue, kNoPhysicalValue},
+         kNoPhysicalPlane, kNoPhysicalPolicy, 32, 0,
+         PhysicalBitOrder::Lsb0Little},
+        {PhysicalOpcode::IndexMultiply, PhysicalValueType::Index,
+         {0, 1, kNoPhysicalValue}, kNoPhysicalPlane, kNoPhysicalPolicy, 0, 0,
+         PhysicalBitOrder::Lsb0Little},
+        {PhysicalOpcode::LoadBits, PhysicalValueType::U32,
+         {2, kNoPhysicalValue, kNoPhysicalValue}, 0, kNoPhysicalPolicy, 0, 32,
+         PhysicalBitOrder::Lsb0Little},
+        {PhysicalOpcode::BitsToF32, PhysicalValueType::F32,
+         {3, kNoPhysicalValue, kNoPhysicalValue}, kNoPhysicalPlane, 0, 0, 0,
+         PhysicalBitOrder::Lsb0Little}};
+    program.result = 4;
+    return program;
+}
+
+std::optional<VerifiedProgramPackage> make_program_session_package(
+    bool stateful = false, bool guarded = false) {
+    auto token_wire = serialize_token_program(program_session_tokens());
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(token_wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(token_wire))
+        return std::nullopt;
+    std::vector<uint8_t> weight_bytes;
+    for (float value : {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}) {
+        const uint32_t bits = std::bit_cast<uint32_t>(value);
+        for (unsigned shift = 0; shift != 32; shift += 8)
+            weight_bytes.push_back(static_cast<uint8_t>(bits >> shift));
+    }
+    char path[] = "/private/tmp/laplace-program-session-XXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd < 0) return std::nullopt;
+    CHECK(write(fd, weight_bytes.data(), weight_bytes.size()) ==
+          static_cast<ssize_t>(weight_bytes.size()));
+    CHECK(close(fd) == 0);
+    auto weights = ArtifactSet::load_single_file(path);
+    unlink(path);
+    CHECK(std::holds_alternative<ArtifactSet>(weights));
+    if (!std::holds_alternative<ArtifactSet>(weights)) return std::nullopt;
+    auto weight_view =
+        std::get<ArtifactSet>(std::move(weights)).view(ArtifactId{0});
+    auto token_view = ArtifactSet::make_owned_blob(
+        ArtifactId{2}, ArtifactRole::Shard,
+        std::get<std::vector<uint8_t>>(token_wire));
+    CHECK(std::holds_alternative<PackageView>(weight_view));
+    CHECK(std::holds_alternative<PackageView>(token_view));
+    if (!std::holds_alternative<PackageView>(weight_view) ||
+        !std::holds_alternative<PackageView>(token_view))
+        return std::nullopt;
+    const Sha256Digest token_digest =
+        std::get<PackageView>(token_view).digest();
+    ArtifactIndexInput index_input;
+    index_input.artifacts.push_back(
+        std::get<PackageView>(std::move(weight_view)));
+    index_input.artifacts.push_back(
+        std::get<PackageView>(std::move(token_view)));
+    auto index = ArtifactIndex::build(std::move(index_input));
+    CHECK(std::holds_alternative<ArtifactIndex>(index));
+    if (!std::holds_alternative<ArtifactIndex>(index)) return std::nullopt;
+    auto semantic = verify_and_canonicalize_program(
+        guarded ? guarded_stateful_program_session_graph()
+                : (stateful ? stateful_program_session_graph()
+                            : program_session_graph()));
+    CHECK(std::holds_alternative<VerifiedProgram>(semantic));
+    if (!std::holds_alternative<VerifiedProgram>(semantic))
+        return std::nullopt;
+    VerifiedProgram verified =
+        std::get<VerifiedProgram>(std::move(semantic));
+    StateSchema state_source;
+    if (stateful)
+        state_source.slots = {{30, ElementType::F32, {1}, 0}};
+    auto state = verify_state_schema(std::move(state_source), verified);
+    CHECK(std::holds_alternative<VerifiedStateSchema>(state));
+    if (!std::holds_alternative<VerifiedStateSchema>(state))
+        return std::nullopt;
+    const PhysicalProgram decoder = program_session_decoder();
+    auto wire = encode_physical_program(decoder);
+    auto digest = physical_program_digest(decoder);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    CHECK(std::holds_alternative<PhysicalProgramDigest>(digest));
+    if (!std::holds_alternative<std::vector<uint8_t>>(wire) ||
+        !std::holds_alternative<PhysicalProgramDigest>(digest))
+        return std::nullopt;
+    PhysicalProgramRecord record{
+        std::get<PhysicalProgramDigest>(digest),
+        std::get<std::vector<uint8_t>>(std::move(wire)),
+        {ElementType::F32, {10}}};
+    PhysicalResourceBinding resource;
+    resource.resource_id = 1;
+    resource.program_digest = record.digest;
+    resource.semantic_function_id = 10;
+    resource.semantic_value_id = 200;
+    resource.planes = {{0, ArtifactId{0}, 0, weight_bytes.size()}};
+    const std::array<TokenEndpointBinding, 2> endpoints = {
+        TokenEndpointBinding{TokenEndpointKind::InputToken, 10, 100},
+        TokenEndpointBinding{TokenEndpointKind::OutputScores, 10, 0}};
+    const TokenProgramSource token_source{
+        ArtifactId{2}, 0,
+        std::get<std::vector<uint8_t>>(token_wire).size(), token_digest};
+    auto package = build_program_package(
+        std::get<ArtifactIndex>(std::move(index)), std::move(verified),
+        std::get<VerifiedStateSchema>(std::move(state)), token_source,
+        endpoints, std::span<const PhysicalProgramRecord>(&record, 1),
+        std::span<const PhysicalResourceBinding>(&resource, 1));
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
+    if (!std::holds_alternative<VerifiedProgramPackage>(package))
+        return std::nullopt;
+    return std::get<VerifiedProgramPackage>(std::move(package));
+}
+
+void test_verified_program_package_creates_runtime_session() {
+    auto package = make_program_session_package();
+    CHECK(package.has_value());
+    if (!package) return;
+    SessionRequest program_request;
+    program_request.max_context = 4;
+    program_request.max_batch = 1;
+    program_request.enable_prefill = true;
+    program_request.enable_decode = true;
+    auto created = create_runtime_session(*package, program_request);
+    const auto* create_error = std::get_if<CompatibilityReport>(&created);
+    CHECK_MSG(std::holds_alternative<RuntimeSession>(created),
+              "program session create code=%u detail=%s",
+              create_error ? static_cast<unsigned>(create_error->code) : 0,
+              create_error ? create_error->detail.c_str() : "none");
+    if (!std::holds_alternative<RuntimeSession>(created)) return;
+    RuntimeSession session = std::get<RuntimeSession>(std::move(created));
+    const uint32_t first_token = 3;
+    auto first = session.prefill(
+        std::span<const uint32_t>(&first_token, 1));
+    CHECK(std::holds_alternative<RuntimeOutput>(first));
+    if (const auto* output = std::get_if<RuntimeOutput>(&first)) {
+        CHECK(output->logits ==
+              std::vector<float>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+        CHECK(output->token_history == std::vector<uint32_t>({3}));
+        CHECK(output->command_buffers == 1);
+        CHECK(output->host_result_bytes == 10 * sizeof(float));
+        CHECK(output->completed);
+    }
+    auto second = session.decode(4);
+    CHECK(std::holds_alternative<RuntimeOutput>(second));
+    CHECK(session.token_history() == std::vector<uint32_t>({3, 4}));
+    const std::array<uint32_t, 2> too_wide = {1, 2};
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        session.prefill(too_wide)));
+    CHECK(session.token_history() == std::vector<uint32_t>({3, 4}));
+    CHECK(std::holds_alternative<CompatibilityReport>(session.decode(10)));
+    CHECK(session.token_history() == std::vector<uint32_t>({3, 4}));
+}
+
+void test_stateful_program_package_publishes_gpu_state() {
+    auto package = make_program_session_package(true);
+    CHECK(package.has_value());
+    if (!package) return;
+    SessionRequest program_request;
+    program_request.max_context = 4;
+    program_request.max_batch = 1;
+    program_request.enable_prefill = true;
+    program_request.enable_decode = true;
+    auto created = create_runtime_session(*package, program_request);
+    const auto* create_error = std::get_if<CompatibilityReport>(&created);
+    CHECK_MSG(std::holds_alternative<RuntimeSession>(created),
+              "stateful program session create code=%u detail=%s",
+              create_error ? static_cast<unsigned>(create_error->code) : 0,
+              create_error ? create_error->detail.c_str() : "none");
+    if (!std::holds_alternative<RuntimeSession>(created)) return;
+    RuntimeSession session = std::get<RuntimeSession>(std::move(created));
+    const uint32_t first_token = 1;
+    auto first = session.prefill(
+        std::span<const uint32_t>(&first_token, 1));
+    CHECK(std::holds_alternative<RuntimeOutput>(first));
+    if (const auto* output = std::get_if<RuntimeOutput>(&first)) {
+        CHECK(output->logits ==
+              std::vector<float>({1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
+        CHECK(output->command_buffers == 1);
+        CHECK(output->completed);
+    }
+    auto second = session.decode(2);
+    CHECK(std::holds_alternative<RuntimeOutput>(second));
+    if (const auto* output = std::get_if<RuntimeOutput>(&second))
+        CHECK(output->logits ==
+              std::vector<float>({2, 3, 4, 5, 6, 7, 8, 9, 10, 11}));
+    CHECK(session.token_history() == std::vector<uint32_t>({1, 2}));
+
+    auto batch_package = make_program_session_package(true);
+    CHECK(batch_package.has_value());
+    if (!batch_package) return;
+    auto batch_created = create_runtime_session(*batch_package, program_request);
+    CHECK(std::holds_alternative<RuntimeSession>(batch_created));
+    if (!std::holds_alternative<RuntimeSession>(batch_created)) return;
+    RuntimeSession batch =
+        std::get<RuntimeSession>(std::move(batch_created));
+    const std::array<uint32_t, 2> prompt = {1, 2};
+    auto batched = batch.prefill(prompt);
+    CHECK(std::holds_alternative<RuntimeOutput>(batched));
+    if (const auto* output = std::get_if<RuntimeOutput>(&batched)) {
+        CHECK(output->logits ==
+              std::vector<float>({2, 3, 4, 5, 6, 7, 8, 9, 10, 11}));
+        CHECK(output->token_history == std::vector<uint32_t>({1, 2}));
+        CHECK(output->command_buffers == 1);
+        CHECK(output->completed);
+    }
+}
+
+void test_program_sequence_failure_does_not_publish_state() {
+    auto package = make_program_session_package(true, true);
+    CHECK(package.has_value());
+    if (!package) return;
+    SessionRequest program_request;
+    program_request.max_context = 4;
+    program_request.max_batch = 2;
+    program_request.enable_prefill = true;
+    program_request.enable_decode = true;
+    auto created = create_runtime_session(*package, program_request);
+    const auto* create_error = std::get_if<CompatibilityReport>(&created);
+    CHECK_MSG(std::holds_alternative<RuntimeSession>(created),
+              "guarded program session create code=%u detail=%s",
+              create_error ? static_cast<unsigned>(create_error->code) : 0,
+              create_error ? create_error->detail.c_str() : "none");
+    if (!std::holds_alternative<RuntimeSession>(created)) return;
+    RuntimeSession session = std::get<RuntimeSession>(std::move(created));
+
+    const std::array<uint32_t, 2> failing_prompt = {0, 1};
+    auto failed = session.prefill(failing_prompt);
+    CHECK(std::holds_alternative<CompatibilityReport>(failed));
+    CHECK(session.token_history().empty());
+
+    const uint32_t retry_token = 0;
+    auto retry = session.prefill(
+        std::span<const uint32_t>(&retry_token, 1));
+    CHECK(std::holds_alternative<RuntimeOutput>(retry));
+    if (const auto* output = std::get_if<RuntimeOutput>(&retry)) {
+        CHECK(output->logits ==
+              std::vector<float>({1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
+        CHECK(output->token_history == std::vector<uint32_t>({0}));
+        CHECK(output->command_buffers == 1);
+        CHECK(output->completed);
+    }
+    CHECK(session.token_history() == std::vector<uint32_t>({0}));
 }
 
 SemanticModel make_dense_model(Storage& storage, uint32_t hidden = 32,
@@ -1392,6 +1871,12 @@ void test_recurrent_product_device_sampler(const ProductFixture& fixture) {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::strcmp(argv[1], "--program-session") == 0) {
+        test_verified_program_package_creates_runtime_session();
+        test_stateful_program_package_publishes_gpu_state();
+        test_program_sequence_failure_does_not_publish_state();
+        return test_summary("test_runtime_session_product");
+    }
     Storage dense_storage;
     ProductFixture dense = make_closed_route_fixture(make_dense_model(dense_storage), std::move(dense_storage));
     if (argc == 2 && std::strcmp(argv[1], "--product-planner") == 0) {

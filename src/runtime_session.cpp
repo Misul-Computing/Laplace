@@ -1,9 +1,12 @@
 #include "runtime_session.h"
 
 #include "product_package.h"
+#include "program_package.h"
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cmath>
 #include <string>
 
 #if defined(LAPLACE_QUALIFICATION_RUNTIME)
@@ -141,6 +144,44 @@ SessionCreateResult create_runtime_session(const ProductPackage& package, Sessio
     return create_runtime_session_internal(package, request, fault);
 }
 
+SessionCreateResult create_runtime_session(
+    const VerifiedProgramPackage& package, SessionRequest request,
+    SessionFaultPoint fault) {
+    if (fault != SessionFaultPoint::None)
+        return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (!package.complete() || request.max_context == 0 ||
+        request.max_batch == 0 ||
+        (!request.enable_prefill && !request.enable_decode) ||
+        request.enable_streaming || request.enable_speculation ||
+        request.minimum_class != NumericalClass::ExactFp32 ||
+        (request.objective != RuntimeObjective::Latency &&
+         request.objective != RuntimeObjective::Throughput))
+        return session_error(CompatibilityError::RUNTIME_INPUT_INVALID);
+
+    uint32_t token_input = UINT32_MAX;
+    uint32_t score_result = UINT32_MAX;
+    for (const TokenEndpointBinding& endpoint : package.token_bindings()) {
+        if (endpoint.kind == TokenEndpointKind::InputToken)
+            token_input = endpoint.semantic_value;
+        else if (endpoint.kind == TokenEndpointKind::OutputScores)
+            score_result = endpoint.semantic_value;
+    }
+    if (token_input == UINT32_MAX || score_result == UINT32_MAX)
+        return session_error(CompatibilityError::IR_REFERENCE_INVALID);
+
+    auto owner = std::make_shared<const VerifiedProgramPackage>(package);
+    auto compiled = compile_metal_program(*owner);
+    if (const auto* report = std::get_if<CompatibilityReport>(&compiled))
+        return *report;
+    auto metal = std::make_unique<MetalProgramExecutable>(
+        std::get<MetalProgramExecutable>(std::move(compiled)));
+    RuntimeSession result(std::move(owner), request, std::move(metal),
+                          token_input, score_result);
+    result.product_store_id_ =
+        g_next_product_store_id.fetch_add(1, std::memory_order_relaxed);
+    return result;
+}
+
 #if defined(LAPLACE_METAL_TESTING)
 SessionCreateResult create_product_runtime_session_for_testing(
     std::shared_ptr<const RuntimePackage> package, SessionRequest request,
@@ -165,6 +206,10 @@ RuntimeSession::RuntimeSession(RuntimeSession&& other) noexcept
     : package_(std::move(other.package_)), request_(other.request_), plan_(std::move(other.plan_)),
       resources_(std::move(other.resources_)), state_(std::move(other.state_)), metal_(std::move(other.metal_)),
       product_route_(other.product_route_), physical_package_(std::move(other.physical_package_)),
+      program_package_(std::move(other.program_package_)),
+      program_metal_(std::move(other.program_metal_)),
+      program_token_input_value_(other.program_token_input_value_),
+      program_score_result_index_(other.program_score_result_index_),
       poisoned_(other.poisoned_), product_store_id_(other.product_store_id_),
       product_generation_(other.product_generation_), product_history_(std::move(other.product_history_))
 #if defined(LAPLACE_METAL_TESTING)
@@ -183,6 +228,10 @@ RuntimeSession& RuntimeSession::operator=(RuntimeSession&& other) noexcept {
     state_ = std::move(other.state_);
     metal_ = std::move(other.metal_);
     physical_package_ = std::move(other.physical_package_);
+    program_package_ = std::move(other.program_package_);
+    program_metal_ = std::move(other.program_metal_);
+    program_token_input_value_ = other.program_token_input_value_;
+    program_score_result_index_ = other.program_score_result_index_;
     product_route_ = other.product_route_;
     poisoned_ = other.poisoned_;
     product_store_id_ = other.product_store_id_;
@@ -201,6 +250,10 @@ void RuntimeSession::clear_after_move() noexcept {
     plan_ = {};
     metal_.reset();
     physical_package_.reset();
+    program_package_.reset();
+    program_metal_.reset();
+    program_token_input_value_ = UINT32_MAX;
+    program_score_result_index_ = UINT32_MAX;
     product_route_ = false;
     poisoned_ = true;
     product_store_id_ = 0;
@@ -213,6 +266,73 @@ void RuntimeSession::clear_after_move() noexcept {
 
 RuntimeRunResult RuntimeSession::execute(std::span<const uint32_t> token_ids,
                                          ExecutionPhase phase, bool sampled) {
+    if (program_package_) {
+        if (poisoned_ || !program_metal_ || sampled || token_ids.empty() ||
+            token_ids.size() >
+                request_.max_context -
+                    std::min<uint64_t>(product_history_.size(),
+                                       request_.max_context) ||
+            (phase == ExecutionPhase::Prefill && !request_.enable_prefill) ||
+            (phase == ExecutionPhase::Decode &&
+             (!request_.enable_decode || token_ids.size() != 1)))
+            return session_error(
+                poisoned_ ? CompatibilityError::SESSION_CONSTRUCTION_FAILED
+                          : CompatibilityError::RUNTIME_INPUT_INVALID);
+        const size_t vocabulary =
+            program_package_->token_program().definition().vocabulary.size();
+        if (std::any_of(token_ids.begin(), token_ids.end(),
+                        [&](uint32_t token) { return token >= vocabulary; }))
+            return session_error(CompatibilityError::RUNTIME_INPUT_INVALID);
+        MetalProgramExecutionResult executed = [&]() {
+            if (token_ids.size() == 1) {
+                const MetalProgramInput input{
+                    program_token_input_value_,
+                    MetalProgramValue{ElementType::U32, {},
+                                      {token_ids.front()}}};
+                return program_metal_->execute(
+                    std::span<const MetalProgramInput>(&input, 1));
+            }
+            std::vector<MetalProgramInputStep> steps;
+            steps.reserve(token_ids.size());
+            for (uint32_t token : token_ids)
+                steps.push_back({{MetalProgramInput{
+                    program_token_input_value_,
+                    MetalProgramValue{ElementType::U32, {}, {token}}}}});
+            return program_metal_->execute_sequence(steps);
+        }();
+        if (const auto* report = std::get_if<CompatibilityReport>(&executed))
+            return *report;
+        MetalProgramResult& program_result =
+            std::get<MetalProgramResult>(executed);
+        if (program_score_result_index_ >= program_result.exports.size())
+            return session_error(CompatibilityError::IR_REFERENCE_INVALID);
+        const MetalProgramValue& scores =
+            program_result.exports[program_score_result_index_];
+        if (scores.type != ElementType::F32 || scores.extents.size() != 1 ||
+            scores.extents.front() != vocabulary ||
+            scores.bits.size() != vocabulary)
+            return session_error(CompatibilityError::IR_SHAPE_MISMATCH);
+        RuntimeOutput output;
+        output.logits.reserve(scores.bits.size());
+        for (uint64_t bits : scores.bits) {
+            if (bits > UINT32_MAX)
+                return session_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE);
+            const float value =
+                std::bit_cast<float>(static_cast<uint32_t>(bits));
+            if (!std::isfinite(value))
+                return session_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE);
+            output.logits.push_back(value);
+        }
+        product_history_.insert(product_history_.end(), token_ids.begin(),
+                                token_ids.end());
+        output.token_history = product_history_;
+        output.host_result_bytes = output.logits.size() * sizeof(float);
+        output.command_buffers = program_result.audit.command_buffers;
+        output.peak_session_bytes =
+            program_result.audit.persistent_plane_bytes;
+        output.completed = true;
+        return output;
+    }
     if (!package_) return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
     if (product_route_) {
         if (poisoned_ || !metal_ || token_ids.empty() ||
@@ -442,13 +562,14 @@ RuntimeRunResult RuntimeSession::decode_sampled(uint32_t token_id) {
 }
 
 StateCursor RuntimeSession::checkpoint() const noexcept {
-    if (!package_) return {};
+    if (!package_ && !program_package_) return {};
     if (!product_route_) return state_.checkpoint();
     return {product_store_id_, product_generation_, static_cast<uint64_t>(product_history_.size()), 0};
 }
 
 StateMutationResult RuntimeSession::commit(StateCursor cursor) {
-    if (!package_) return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (!package_ && !program_package_)
+        return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
     if (!product_route_) return state_.commit(cursor);
     if (poisoned_ || cursor.store_id != product_store_id_ || cursor.generation != product_generation_ ||
         cursor.undo_count != 0 ||
@@ -459,7 +580,12 @@ StateMutationResult RuntimeSession::commit(StateCursor cursor) {
 }
 
 StateMutationResult RuntimeSession::rollback(StateCursor cursor) {
-    if (!package_) return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (!package_ && !program_package_)
+        return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (program_package_)
+        return session_error(
+            CompatibilityError::CACHE_MODE_UNQUALIFIED,
+            "program-session rollback requires retained GPU state generations");
     if (!product_route_) return state_.rollback(cursor);
     if (poisoned_ || !metal_ || cursor.store_id != product_store_id_ || cursor.generation != product_generation_ ||
         cursor.undo_count != 0 || cursor.accepted_tokens > UINT32_MAX ||
@@ -481,7 +607,7 @@ StateMutationResult RuntimeSession::rollback(StateCursor cursor) {
 
 const std::vector<uint32_t>& RuntimeSession::token_history() const noexcept {
     static const std::vector<uint32_t> empty;
-    if (!package_) return empty;
+    if (!package_ && !program_package_) return empty;
     return product_route_ ? product_history_ : state_.token_history();
 }
 
@@ -500,7 +626,12 @@ uint64_t RuntimeSession::implicit_weight_copy_count_for_testing() const noexcept
 #endif
 
 StateSaveResult RuntimeSession::save_state() const {
-    if (!package_) return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (!package_ && !program_package_)
+        return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (program_package_)
+        return session_error(
+            CompatibilityError::CACHE_MODE_UNQUALIFIED,
+            "program-session state save is not admitted by the current GPU state ABI");
     if (product_route_) {
         return session_error(CompatibilityError::CACHE_MODE_UNQUALIFIED,
                              "product Metal state save is not admitted by the current GPU state ABI");
@@ -509,7 +640,14 @@ StateSaveResult RuntimeSession::save_state() const {
 }
 
 StateMutationResult RuntimeSession::restore_state(std::span<const uint8_t> bytes) {
-    if (!package_) return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (!package_ && !program_package_)
+        return session_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED);
+    if (program_package_) {
+        (void)bytes;
+        return session_error(
+            CompatibilityError::CACHE_MODE_UNQUALIFIED,
+            "program-session state restore is not admitted by the current GPU state ABI");
+    }
     if (product_route_) {
         return session_error(CompatibilityError::CACHE_MODE_UNQUALIFIED,
                              "product Metal state restore is not admitted by the current GPU state ABI");

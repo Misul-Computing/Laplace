@@ -236,8 +236,11 @@ ArtifactTensorRecord structural_physical_record(const SemanticTensor& tensor) {
     record.planes.push_back({PlaneKind::Values, scalar,
                              {source.artifact_id, source.offset, source.length},
                              elements, bytes_per_element, 1, source.alignment});
+    size_t unit_stride_axis = 0;
+    for (size_t axis = 0; axis < record.logical_dimensions.size(); ++axis)
+        if (record.layout.strides[axis] == 1) unit_stride_axis = axis;
     record.axis.row_stride_bytes = record.logical_dimensions.empty()
-        ? 0 : record.logical_dimensions.front() * bytes_per_element;
+        ? 0 : record.logical_dimensions[unit_stride_axis] * bytes_per_element;
     return record;
 }
 

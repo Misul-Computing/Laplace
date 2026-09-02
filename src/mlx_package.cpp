@@ -1,10 +1,13 @@
 #include "mlx_package.h"
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include <dirent.h>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -337,13 +340,33 @@ bool checked_multiply(uint64_t left, uint64_t right, uint64_t& result) {
     return true;
 }
 
-std::optional<std::pair<ArtifactScalarType, uint32_t>>
-artifact_scalar_type(SafeTensorsDtype dtype) {
-    switch (dtype) {
-    case SafeTensorsDtype::F16: return std::pair{ArtifactScalarType::F16, 2u};
-    case SafeTensorsDtype::F32: return std::pair{ArtifactScalarType::F32, 4u};
-    default: return std::nullopt;
+void append_u32(std::vector<uint8_t>& bytes, uint32_t value) {
+    for (unsigned shift = 0; shift != 32; shift += 8) {
+        bytes.push_back(static_cast<uint8_t>(value >> shift));
     }
+}
+
+Sha256Digest storage_resources_digest(
+    const ArtifactIndex& physical,
+    std::span<const SafeTensorsStorageResource> resources) {
+    std::vector<uint8_t> bytes;
+    static constexpr std::array<uint8_t, 8> domain = {
+        'L', 'A', 'P', 'S', 'T', 'R', '1', '0'};
+    bytes.insert(bytes.end(), domain.begin(), domain.end());
+    bytes.insert(bytes.end(), physical.digest().bytes.begin(),
+                 physical.digest().bytes.end());
+    append_u32(bytes, static_cast<uint32_t>(resources.size()));
+    for (const SafeTensorsStorageResource& resource : resources) {
+        append_u32(bytes, resource.id);
+        append_u32(bytes, static_cast<uint32_t>(resource.tensor_ids.size()));
+        for (uint32_t tensor_id : resource.tensor_ids) {
+            append_u32(bytes, tensor_id);
+        }
+    }
+    Sha256Digest digest;
+    CC_SHA256(bytes.data(), static_cast<CC_LONG>(bytes.size()),
+              digest.bytes.data());
+    return digest;
 }
 
 bool digits_to_uint(std::string_view digits, uint32_t& value) {
@@ -455,11 +478,6 @@ combine_shard_indexes(const std::vector<PackageView>& artifacts,
             return report;
         }
         const SafeTensorsFile& file = std::get<SafeTensorsFile>(parsed);
-        const auto format = file.metadata().find("format");
-        if (format == file.metadata().end() || format->second != "mlx") {
-            return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
-                               "MLX shard does not declare metadata.format=mlx", shard.artifact_id());
-        }
         // The public single-file adapter requires a Primary artifact. Package
         // shards are intentionally not primary, so lower their verified wire
         // records here without changing that one-file contract.
@@ -491,7 +509,7 @@ combine_shard_indexes(const std::vector<PackageView>& artifacts,
                                        shard.artifact_id());
                 }
             }
-            const auto scalar = artifact_scalar_type(source.dtype);
+            const auto scalar = safetensors_physical_scalar(source.dtype);
             if (!scalar) {
                 return mlx_failure(CompatibilityError::IR_QUANTIZATION_UNSUPPORTED,
                                    "MLX SafeTensors dtype has no complete physical plane contract",
@@ -505,13 +523,21 @@ combine_shard_indexes(const std::vector<PackageView>& artifacts,
             ArtifactTensorRecord tensor;
             tensor.id = tensor_id;
             tensor.logical_type = scalar->first;
-            // SafeTensors records C row-major dimensions from the outermost
-            // axis to the contiguous innermost axis. Laplace's physical
-            // matrix ABI records the contiguous axis first, as GGUF does.
-            // Normalize the dimensions once at the source boundary. The
-            // physical axis contract describes the normalized strides, so it
-            // is identity after this conversion.
-            tensor.logical_dimensions.assign(source.shape.rbegin(), source.shape.rend());
+            if (scalar->first == ArtifactScalarType::F16 ||
+                scalar->first == ArtifactScalarType::F32) {
+                tensor.format.version = 1;
+                tensor.format.encoding = scalar->first == ArtifactScalarType::F16
+                    ? ArtifactPhysicalEncoding::F16
+                    : ArtifactPhysicalEncoding::F32;
+                tensor.format.value_type = scalar->first;
+                tensor.format.block_elements = 1;
+                tensor.format.block_bytes = scalar->second;
+            }
+            // Preserve the source tensor coordinate system. SafeTensors is C
+            // row-major: the last declared axis is contiguous. Semantic axis
+            // meaning and any transposition belong to the carried program,
+            // never to this role-free physical inventory.
+            tensor.logical_dimensions = source.shape;
             tensor.layout.kind = PhysicalLayoutKind::ContiguousRowMajor;
             tensor.layout.version = 1;
             tensor.layout.packing = PackingKind::None;
@@ -519,16 +545,13 @@ combine_shard_indexes(const std::vector<PackageView>& artifacts,
             // MLX SafeTensors uses C row-major source order. The physical
             // format is explicit; semantic axis meaning is manifest data.
             tensor.axis.source_rank = static_cast<uint8_t>(source.shape.size());
-            tensor.format.version = 1;
-            tensor.format.encoding = scalar->first == ArtifactScalarType::F16
-                ? ArtifactPhysicalEncoding::F16 : ArtifactPhysicalEncoding::F32;
-            tensor.format.value_type = scalar->first;
-            tensor.format.block_elements = 1;
-            tensor.format.block_bytes = scalar->second;
             uint64_t elements = 1;
             for (size_t axis = 0; axis != tensor.logical_dimensions.size(); ++axis) {
                 tensor.layout.axis_order[axis] = static_cast<uint8_t>(axis);
                 tensor.axis.source_axis_order[axis] = static_cast<uint8_t>(axis);
+            }
+            for (size_t reverse = tensor.logical_dimensions.size(); reverse != 0; --reverse) {
+                const size_t axis = reverse - 1;
                 tensor.layout.strides[axis] = elements;
                 if (!checked_multiply(elements, tensor.logical_dimensions[axis], elements)) {
                     return mlx_failure(CompatibilityError::IR_SHAPE_MISMATCH,
@@ -538,7 +561,7 @@ combine_shard_indexes(const std::vector<PackageView>& artifacts,
             }
             uint64_t row_stride_bytes = scalar->second;
             if (!tensor.logical_dimensions.empty() &&
-                !checked_multiply(tensor.logical_dimensions.front(), scalar->second,
+                !checked_multiply(tensor.logical_dimensions.back(), scalar->second,
                                   row_stride_bytes)) {
                 return mlx_failure(CompatibilityError::IR_SHAPE_MISMATCH,
                                    "MLX SafeTensors row stride overflows uint64",
@@ -695,13 +718,48 @@ MlxPhysicalPackageResult load_directory(std::string_view root) {
     if (auto map_error = verify_weight_map(named_shards, weight_map)) return *map_error;
     auto combined = combine_shard_indexes(artifacts, shards);
     if (const auto* report = std::get_if<CompatibilityReport>(&combined)) return *report;
-    return MlxPhysicalPackage(std::get<ArtifactIndex>(std::move(combined)));
+    ArtifactIndex physical = std::get<ArtifactIndex>(std::move(combined));
+
+    const std::string storage_path = directory + "/quantization_config.json";
+    struct stat storage_status {};
+    if (lstat(storage_path.c_str(), &storage_status) == 0) {
+        if (!S_ISREG(storage_status.st_mode) || S_ISLNK(storage_status.st_mode) ||
+            storage_status.st_size <= 0) {
+            return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                               "SafeTensors storage declaration is not a direct nonempty file");
+        }
+        auto declaration_set = ArtifactSet::load_single_file(storage_path);
+        if (const auto* report =
+                std::get_if<CompatibilityReport>(&declaration_set)) {
+            return *report;
+        }
+        auto declaration = std::get<ArtifactSet>(declaration_set).view(
+            ArtifactId{0});
+        if (const auto* report =
+                std::get_if<CompatibilityReport>(&declaration)) {
+            return *report;
+        }
+        auto storage = compile_safetensors_storage_resources(
+            physical, std::get<PackageView>(declaration));
+        if (const auto* report = std::get_if<CompatibilityReport>(&storage)) {
+            return *report;
+        }
+        return MlxPhysicalPackage(
+            std::move(physical),
+            std::get<VerifiedSafeTensorsStorageResources>(std::move(storage)));
+    }
+    if (errno != ENOENT) {
+        return mlx_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                           "SafeTensors storage declaration presence could not be determined");
+    }
+    return MlxPhysicalPackage(std::move(physical));
 }
 
 MlxProductPhysicalPackageResult load_product_directory(std::string_view root) {
     const std::string directory(root);
     const std::string manifest_path = directory + "/laplace.lapman";
     const std::string token_path = directory + "/laplace.laptok";
+    const std::string physical_package_path = directory + "/laplace.lappkg";
     struct stat manifest_status {};
     if (lstat(manifest_path.c_str(), &manifest_status) != 0 ||
         !S_ISREG(manifest_status.st_mode) || manifest_status.st_size <= 0) {
@@ -715,6 +773,21 @@ MlxProductPhysicalPackageResult load_product_directory(std::string_view root) {
         return mlx_failure(CompatibilityError::TOKENIZER_RUNTIME_UNSUPPORTED,
                            "MLX product closure lacks a regular nonempty laplace.laptok",
                            kMlxProductTokenArtifactId);
+    }
+    bool has_physical_package = false;
+    struct stat physical_package_status {};
+    if (lstat(physical_package_path.c_str(), &physical_package_status) == 0) {
+        if (!S_ISREG(physical_package_status.st_mode) ||
+            physical_package_status.st_size <= 0) {
+            return mlx_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                               "SafeTensors product physical-program carrier is not a direct nonempty file",
+                               kSafeTensorsProductPhysicalPackageArtifactId);
+        }
+        has_physical_package = true;
+    } else if (errno != ENOENT) {
+        return mlx_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                           "SafeTensors product physical-program carrier presence could not be determined",
+                           kSafeTensorsProductPhysicalPackageArtifactId);
     }
     auto physical_result = load_directory(root);
     if (const auto* report = std::get_if<CompatibilityReport>(&physical_result)) return *report;
@@ -742,7 +815,7 @@ MlxProductPhysicalPackageResult load_product_directory(std::string_view root) {
     const std::string index_path = directory + "/model.safetensors.index.json";
 
     std::vector<ArtifactSource> sources;
-    sources.reserve(leaves.size() + 4);
+    sources.reserve(leaves.size() + 5);
     sources.push_back({config_path, ArtifactRole::Primary, ArtifactId{0}});
     sources.push_back({index_path, ArtifactRole::Sidecar, ArtifactId{1}});
     std::vector<std::string> shard_paths;
@@ -756,6 +829,10 @@ MlxProductPhysicalPackageResult load_product_directory(std::string_view root) {
     sources.push_back({token_path, ArtifactRole::Shard, kMlxProductTokenArtifactId});
     sources.push_back({manifest_path, ArtifactRole::Sidecar,
                        kMlxProductManifestArtifactId});
+    if (has_physical_package) {
+        sources.push_back({physical_package_path, ArtifactRole::Sidecar,
+                           kSafeTensorsProductPhysicalPackageArtifactId});
+    }
     auto closure_result = ArtifactSet::load_graph(sources);
     if (const auto* report = std::get_if<CompatibilityReport>(&closure_result)) {
         if (report->artifact_id == kMlxProductManifestArtifactId) {
@@ -779,6 +856,17 @@ MlxProductPhysicalPackageResult load_product_directory(std::string_view root) {
     if (const auto* report = std::get_if<CompatibilityReport>(&closure_index)) return *report;
     if (const auto* report = std::get_if<CompatibilityReport>(&closure_manifest)) return *report;
     if (const auto* report = std::get_if<CompatibilityReport>(&closure_token)) return *report;
+    std::optional<PackageView> closure_physical_package;
+    if (has_physical_package) {
+        auto physical_package = closure.view(
+            kSafeTensorsProductPhysicalPackageArtifactId);
+        if (const auto* report =
+                std::get_if<CompatibilityReport>(&physical_package)) {
+            return *report;
+        }
+        closure_physical_package.emplace(
+            std::get<PackageView>(std::move(physical_package)));
+    }
     if (std::get<PackageView>(closure_config).digest() != primary->digest() ||
         std::get<PackageView>(closure_index).digest() != index->digest()) {
         return mlx_failure(CompatibilityError::PACKAGE_SOURCE_CHANGED,
@@ -800,17 +888,124 @@ MlxProductPhysicalPackageResult load_product_directory(std::string_view root) {
     if (const auto* report = std::get_if<CompatibilityReport>(&indexed)) return *report;
     return MlxProductPhysicalPackage{
         std::move(closure), std::get<ArtifactIndex>(std::move(indexed)),
-        std::get<PackageView>(std::move(closure_manifest))};
+        std::get<PackageView>(std::move(closure_manifest)),
+        std::move(closure_physical_package)};
 }
 
 } // namespace
 
 CompatibilityReport MlxPhysicalPackage::semantic_refusal() const {
     return compatibility_report(CompatibilityError::IMPORT_SEMANTICS_MISSING,
-                                "MLX physical package has no accepted semantic certificate or unique proof");
+                                "SafeTensors physical package has no carried semantic program or unique graph proof");
 }
 
-MlxPhysicalPackageResult load_mlx_physical_package(std::string_view path) {
+SafeTensorsStorageResourcesResult compile_safetensors_storage_resources(
+    const ArtifactIndex& physical, const PackageView& declaration) {
+    CompatibilityReport failure;
+    auto root = parse_json_object(declaration, failure);
+    if (!root) return failure;
+    const auto storage = root->object.find("tensor_storage");
+    if (storage == root->object.end() ||
+        storage->second.kind != JsonKind::Object ||
+        storage->second.object.empty()) {
+        return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                           "storage declaration has no nonempty tensor_storage object",
+                           declaration.artifact_id());
+    }
+
+    std::map<std::string, uint32_t> tensor_by_spelling;
+    for (const ArtifactDiagnostic& diagnostic : physical.diagnostics()) {
+        if (diagnostic.tensor_id == UINT32_MAX ||
+            diagnostic.tensor_spelling.empty()) {
+            continue;
+        }
+        if (!tensor_by_spelling.emplace(diagnostic.tensor_spelling,
+                                        diagnostic.tensor_id).second) {
+            return mlx_failure(CompatibilityError::IMPORT_TENSOR_DUPLICATE,
+                               "physical index has duplicate tensor spellings",
+                               declaration.artifact_id());
+        }
+    }
+
+    VerifiedSafeTensorsStorageResources verified;
+    std::set<uint32_t> consumed;
+    try {
+        verified.resources_.reserve(physical.tensors().size());
+        for (const auto& [source_group, group] : storage->second.object) {
+            (void)source_group;
+            if (group.kind != JsonKind::Object) {
+                return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                                   "storage resource declaration is not an object",
+                                   declaration.artifact_id());
+            }
+            const auto stored = group.object.find("stored_tensors");
+            if (stored == group.object.end() ||
+                stored->second.kind != JsonKind::Object ||
+                stored->second.object.empty()) {
+                return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                                   "storage resource has no nonempty stored_tensors object",
+                                   declaration.artifact_id());
+            }
+            SafeTensorsStorageResource resource;
+            resource.id = static_cast<uint32_t>(verified.resources_.size());
+            resource.tensor_ids.reserve(stored->second.object.size());
+            for (const auto& [source_tensor, descriptor] :
+                 stored->second.object) {
+                if (descriptor.kind != JsonKind::Object) {
+                    return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
+                                       "stored tensor declaration is not an object",
+                                       declaration.artifact_id());
+                }
+                const auto tensor = tensor_by_spelling.find(source_tensor);
+                if (tensor == tensor_by_spelling.end()) {
+                    return mlx_failure(CompatibilityError::IMPORT_TENSOR_UNMAPPED,
+                                       "storage declaration names an absent tensor",
+                                       declaration.artifact_id());
+                }
+                if (!consumed.insert(tensor->second).second) {
+                    return mlx_failure(CompatibilityError::IMPORT_TENSOR_DUPLICATE,
+                                       "storage declaration consumes one tensor more than once",
+                                       declaration.artifact_id());
+                }
+                resource.tensor_ids.push_back(tensor->second);
+            }
+            std::sort(resource.tensor_ids.begin(), resource.tensor_ids.end());
+            verified.resources_.push_back(std::move(resource));
+        }
+        verified.declared_resource_count_ =
+            static_cast<uint32_t>(verified.resources_.size());
+
+        std::vector<uint32_t> standalone;
+        standalone.reserve(physical.tensors().size() - consumed.size());
+        for (const ArtifactTensorRecord& tensor : physical.tensors()) {
+            if (!consumed.contains(tensor.id)) standalone.push_back(tensor.id);
+        }
+        std::sort(standalone.begin(), standalone.end());
+        for (uint32_t tensor_id : standalone) {
+            SafeTensorsStorageResource resource;
+            resource.id = static_cast<uint32_t>(verified.resources_.size());
+            resource.tensor_ids.push_back(tensor_id);
+            verified.resources_.push_back(std::move(resource));
+        }
+    } catch (const std::bad_alloc&) {
+        return mlx_failure(CompatibilityError::RULE_LIMIT_EXCEEDED,
+                           "storage resource compilation exhausted memory",
+                           declaration.artifact_id());
+    }
+
+    if (consumed.size() > physical.tensors().size() ||
+        verified.resources_.empty()) {
+        return mlx_failure(CompatibilityError::IMPORT_CLOSURE_INCOMPLETE,
+                           "storage resources do not cover the physical index",
+                           declaration.artifact_id());
+    }
+    verified.canonical_digest_ =
+        storage_resources_digest(physical, verified.resources_);
+    verified.declaration_digest_ = declaration.digest();
+    return verified;
+}
+
+MlxPhysicalPackageResult load_safetensors_physical_package(std::string_view path) {
     if (path.empty()) {
         return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
                            "MLX package path is empty");
@@ -828,7 +1023,7 @@ MlxPhysicalPackageResult load_mlx_physical_package(std::string_view path) {
 }
 
 MlxProductPhysicalPackageResult
-load_mlx_product_physical_package(std::string_view path) {
+load_safetensors_product_physical_package(std::string_view path) {
     if (path.empty()) {
         return mlx_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED,
                            "MLX product package path is empty");
@@ -841,6 +1036,15 @@ load_mlx_product_physical_package(std::string_view path) {
                            "MLX product package must be a direct directory");
     }
     return load_product_directory(path);
+}
+
+MlxPhysicalPackageResult load_mlx_physical_package(std::string_view path) {
+    return load_safetensors_physical_package(path);
+}
+
+MlxProductPhysicalPackageResult
+load_mlx_product_physical_package(std::string_view path) {
+    return load_safetensors_product_physical_package(path);
 }
 
 } // namespace Laplace

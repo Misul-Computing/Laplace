@@ -177,8 +177,11 @@ ArtifactTensorRecord physical_record(const SemanticTensor& tensor) {
     record.planes.push_back({PlaneKind::Values, ArtifactScalarType::F32,
                              {source.artifact_id, source.offset, source.length},
                              elements, 4, 1, source.alignment});
+    size_t unit_stride_axis = 0;
+    for (size_t axis = 0; axis < record.logical_dimensions.size(); ++axis)
+        if (record.layout.strides[axis] == 1) unit_stride_axis = axis;
     record.axis.row_stride_bytes = record.logical_dimensions.empty()
-        ? 0 : record.logical_dimensions.front() * sizeof(float);
+        ? 0 : record.logical_dimensions[unit_stride_axis] * sizeof(float);
     return record;
 }
 

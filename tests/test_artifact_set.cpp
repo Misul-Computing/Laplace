@@ -606,6 +606,49 @@ void test_owned_blob_is_immutable_and_self_contained() {
     }
 }
 
+void test_package_subview_retains_owner_and_bounds() {
+    const std::string path = make_path(".subview");
+    write_bytes(path, "0123456789", 10);
+    auto loaded = ArtifactSet::load_single_file(path);
+    CHECK(std::holds_alternative<ArtifactSet>(loaded));
+    if (!std::holds_alternative<ArtifactSet>(loaded)) {
+        unlink(path.c_str());
+        return;
+    }
+    auto source = std::get<ArtifactSet>(std::move(loaded)).view(ArtifactId{0});
+    CHECK(std::holds_alternative<PackageView>(source));
+    if (!std::holds_alternative<PackageView>(source)) {
+        unlink(path.c_str());
+        return;
+    }
+    auto sliced = ArtifactSet::make_subview(
+        std::get<PackageView>(source), ArtifactId{9}, ArtifactRole::Shard, 3, 4);
+    CHECK(std::holds_alternative<PackageView>(sliced));
+    source = CompatibilityReport{};
+    loaded = CompatibilityReport{};
+    if (const auto* view = std::get_if<PackageView>(&sliced)) {
+        CHECK(view->artifact_id() == ArtifactId{9});
+        CHECK(view->role() == ArtifactRole::Shard);
+        CHECK(std::string_view(reinterpret_cast<const char*>(view->bytes().data()),
+                               view->bytes().size()) == "3456");
+        const std::array<MappedReadRange, 1> valid = {{{1, 2}}};
+        const auto advised = view->advise_read_ranges(valid);
+        CHECK(advised.requested_ranges == 1);
+        CHECK(advised.requested_bytes == 2);
+        const std::array<MappedReadRange, 1> invalid = {{{3, 2}}};
+        const auto rejected = view->advise_read_ranges(invalid);
+        CHECK(rejected.error == EINVAL);
+        CHECK(rejected.requested_ranges == 0);
+    }
+    auto empty = ArtifactSet::make_subview(
+        std::get<PackageView>(sliced), ArtifactId{10}, ArtifactRole::Shard, 0, 0);
+    CHECK(std::holds_alternative<CompatibilityReport>(empty));
+    auto outside = ArtifactSet::make_subview(
+        std::get<PackageView>(sliced), ArtifactId{10}, ArtifactRole::Shard, 3, 2);
+    CHECK(std::holds_alternative<CompatibilityReport>(outside));
+    unlink(path.c_str());
+}
+
 } // namespace
 
 int main() {
@@ -625,5 +668,6 @@ int main() {
     test_rejected_graph_releases_candidate_mapping();
     test_source_rejections_and_identity();
     test_owned_blob_is_immutable_and_self_contained();
+    test_package_subview_retains_owner_and_bounds();
     return test_summary("test_artifact_set");
 }

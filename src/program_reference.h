@@ -49,6 +49,11 @@ ReferencePhysicalResult decode_reference_resource(
     const VerifiedPhysicalProgramPackage& package, uint32_t resource_id,
     std::span<const uint64_t> logical_coordinate);
 
+ReferenceExecutionResult execute_reference_program(
+    const VerifiedProgram& program,
+    ReferenceState& state,
+    std::span<const ReferenceInput> inputs);
+
 ReferenceExecutionResult execute_reference(
     const VerifiedPhysicalProgramPackage& package,
     ReferenceState& state,

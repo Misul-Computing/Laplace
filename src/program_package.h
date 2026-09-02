@@ -35,6 +35,14 @@ struct TokenEndpointBinding {
                            const TokenEndpointBinding&) = default;
 };
 
+struct ContainerArtifactSection {
+    uint32_t section_id = 0;
+    ArtifactId artifact_id{};
+    ArtifactRole role = ArtifactRole::Primary;
+    friend bool operator==(const ContainerArtifactSection&,
+                           const ContainerArtifactSection&) = default;
+};
+
 class VerifiedProgramPackage {
 public:
     VerifiedProgramPackage(const VerifiedProgramPackage&) = default;
@@ -98,6 +106,12 @@ ProgramPackageResult decode_container_program_package(
     ArtifactIndex physical,
     std::span<const ContainerSchemaProgram> schemas,
     std::span<const uint8_t> container,
+    uint32_t package_section_id);
+
+ProgramPackageResult load_container_program_package(
+    const PackageView& container,
+    std::span<const ContainerSchemaProgram> schemas,
+    std::span<const ContainerArtifactSection> artifact_sections,
     uint32_t package_section_id);
 
 } // namespace Laplace

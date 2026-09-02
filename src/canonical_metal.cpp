@@ -2276,6 +2276,11 @@ CanonicalMetalResourceDiagnostics CanonicalMetalProgram::resource_diagnostics() 
     if (impl_->metal_session) {
         const MetalResourceSnapshot current = metal_tok_session_resource_snapshot(*impl_->metal_session);
         diagnostics.implicit_weight_copies = current.implicit_weight_copies;
+        diagnostics.residency_allocated_size = current.residency_allocated_size;
+        diagnostics.residency_allocation_count = current.residency_allocation_count;
+        diagnostics.residency_set_supported = current.residency_set_supported;
+        diagnostics.residency_set_committed = current.residency_set_committed;
+        diagnostics.residency_requested = current.residency_requested;
     }
     return diagnostics;
 }
@@ -3600,6 +3605,7 @@ CanonicalMetalCreateResult create_canonical_metal_program_internal(
     // residency.  Product execution must fail at construction or binding if a
     // tensor is not covered; it must never create an implicit per-dispatch copy.
     metal_tok_session_require_registered_weights(*impl->metal_session, true);
+    (void)metal_tok_session_prepare_weight_residency(*impl->metal_session);
     impl->resource_diagnostics.after_session_construction =
         metal_tok_session_resource_snapshot(*impl->metal_session).current_allocated_size;
     impl->resource_diagnostics.registered_source_bytes = impl->original_source_registered;

@@ -279,12 +279,15 @@ ProductPackageLoadResult load_product_package(std::string_view package_path) {
         const std::string primary_path(package_path);
         struct stat status {};
         if (lstat(primary_path.c_str(), &status) == 0 && S_ISDIR(status.st_mode)) {
-            auto mlx = load_mlx_product_physical_package(package_path);
+            auto mlx = load_safetensors_product_physical_package(package_path);
             if (const auto* report = std::get_if<CompatibilityReport>(&mlx)) return *report;
             MlxProductPhysicalPackage package =
                 std::get<MlxProductPhysicalPackage>(std::move(mlx));
             return ProductPackage::finish_product_package(std::move(package.physical_index),
-                                                         std::move(package.manifest));
+                                                         std::move(package.manifest),
+                                                         package.physical_package
+                                                             ? &*package.physical_package
+                                                             : nullptr);
         }
         const std::string carrier_path = primary_path + ".lapman";
         const std::string token_path = primary_path + ".laptok";

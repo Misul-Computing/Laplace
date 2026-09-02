@@ -147,6 +147,43 @@ public:
     std::vector<uint8_t> bytes;
 };
 
+class ArtifactSubviewOwner {
+public:
+    std::shared_ptr<const void> parent;
+    size_t offset = 0;
+    size_t length = 0;
+    MappedReadAdviceResult (*advice)(
+        const void*, std::span<const MappedReadRange>) = nullptr;
+};
+
+MappedReadAdviceResult advise_subview_owner(
+    const void* raw_owner, std::span<const MappedReadRange> ranges) {
+    MappedReadAdviceResult rejected;
+    rejected.error = EINVAL;
+    if (raw_owner == nullptr) return rejected;
+    const auto& owner = *static_cast<const ArtifactSubviewOwner*>(raw_owner);
+    if (!owner.parent || owner.advice == nullptr) {
+        rejected.error = ENOTSUP;
+        return rejected;
+    }
+    try {
+        std::vector<MappedReadRange> translated;
+        translated.reserve(ranges.size());
+        for (const MappedReadRange& range : ranges) {
+            if (range.offset > owner.length ||
+                range.length > owner.length - range.offset ||
+                range.offset > std::numeric_limits<size_t>::max() - owner.offset) {
+                return rejected;
+            }
+            translated.push_back({owner.offset + range.offset, range.length});
+        }
+        return owner.advice(owner.parent.get(), translated);
+    } catch (const std::bad_alloc&) {
+        rejected.error = ENOMEM;
+        return rejected;
+    }
+}
+
 constexpr size_t kMaximumOwnedBlobBytes = size_t{1} << 30;
 
 CompatibilityReport package_failure(CompatibilityError code, ArtifactId id, std::string detail) {
@@ -223,6 +260,35 @@ ArtifactSet::make_owned_blob(ArtifactId id, ArtifactRole role,
     } catch (const std::bad_alloc&) {
         return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
                                "owned artifact blob allocation failed");
+    }
+}
+
+std::variant<PackageView, CompatibilityReport>
+ArtifactSet::make_subview(const PackageView& source, ArtifactId id,
+                          ArtifactRole role, size_t offset, size_t length) {
+    if (id.value == UINT32_MAX ||
+        (role != ArtifactRole::Primary && role != ArtifactRole::Shard &&
+         role != ArtifactRole::Sidecar)) {
+        return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
+                               "artifact subview has an invalid identity or role");
+    }
+    if (!source.owner_ || length == 0 || offset > source.bytes_.size() ||
+        length > source.bytes_.size() - offset) {
+        return package_failure(CompatibilityError::PACKAGE_BOUNDS_INVALID, id,
+                               "artifact subview range is empty or outside its source");
+    }
+    try {
+        auto owner = std::make_shared<ArtifactSubviewOwner>();
+        owner->parent = source.owner_;
+        owner->offset = offset;
+        owner->length = length;
+        owner->advice = source.advice_;
+        const std::span<const uint8_t> bytes = source.bytes_.subspan(offset, length);
+        return PackageView(id, role, bytes, digest_bytes(bytes), std::move(owner),
+                           source.advice_ == nullptr ? nullptr : advise_subview_owner);
+    } catch (const std::bad_alloc&) {
+        return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
+                               "artifact subview allocation failed");
     }
 }
 

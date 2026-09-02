@@ -96,6 +96,34 @@ def unseen_schema():
     }
 
 
+def unseen_product_schema():
+    return {
+        "major": 1,
+        "minor": 0,
+        "register_count": 6,
+        "predicate_count": 1,
+        "maximum_steps": 1_000_000,
+        "maximum_loop_iterations": 1_000_000,
+        "maximum_ranges": 65_536,
+        "instructions": [
+            instruction(1, literal=b"PRDX"),
+            instruction(3, destination=0),
+            instruction(3, destination=1),
+            instruction(3, destination=2),
+            instruction(5, destination=3),
+            instruction(12, input_a=3, input_b=0, section=41),
+            instruction(10, input_a=0),
+            instruction(5, destination=4),
+            instruction(12, input_a=4, input_b=1, section=42),
+            instruction(10, input_a=1),
+            instruction(5, destination=5),
+            instruction(12, input_a=5, input_b=2, section=23),
+            instruction(10, input_a=2),
+            instruction(15),
+        ],
+    }
+
+
 def run(command, expect_success=True):
     completed = subprocess.run(command, text=True, capture_output=True)
     if expect_success != (completed.returncode == 0):
@@ -123,6 +151,21 @@ def main():
         schema_path.write_bytes(encode_schema_set([unseen_schema()]))
         container_path.write_bytes(container)
         run([binary, "--load-container-schema", str(schema_path),
+             str(container_path)])
+
+        weights_path = root / "weights.bin"
+        token_path = root / "token.bin"
+        run([binary, "--emit-program-product", str(package_path),
+             str(weights_path), str(token_path)])
+        weights = weights_path.read_bytes()
+        token = token_path.read_bytes()
+        package = package_path.read_bytes()
+        container = (b"PRDX" + struct.pack("<QQQ", len(weights), len(token),
+                                           len(package)) + weights + token +
+                     package)
+        schema_path.write_bytes(encode_schema_set([unseen_product_schema()]))
+        container_path.write_bytes(container)
+        run([binary, "--load-container-product-schema", str(schema_path),
              str(container_path)])
 
         prefix_schema = unseen_schema()

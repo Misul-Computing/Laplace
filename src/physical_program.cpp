@@ -73,6 +73,8 @@ bool physical_opcode_shape(PhysicalOpcode opcode,
         case PhysicalOpcode::U32And:
         case PhysicalOpcode::U32Or:
         case PhysicalOpcode::U32Xor:
+        case PhysicalOpcode::U32Add:
+        case PhysicalOpcode::U32Multiply:
             *out = {2, false, false};
             return true;
         case PhysicalOpcode::IndexDivideConstant:
@@ -85,6 +87,7 @@ bool physical_opcode_shape(PhysicalOpcode opcode,
             *out = {1, false, false};
             return true;
         case PhysicalOpcode::Select:
+        case PhysicalOpcode::U32FunnelShiftRight:
             *out = {3, false, false};
             return true;
         case PhysicalOpcode::LoadBits:
@@ -98,6 +101,7 @@ bool physical_opcode_shape(PhysicalOpcode opcode,
         case PhysicalOpcode::F32ToU32:
         case PhysicalOpcode::F32ToI32:
         case PhysicalOpcode::F32Negate:
+        case PhysicalOpcode::F32RoundToF16:
             *out = {1, false, true};
             return true;
         case PhysicalOpcode::F32Add:
@@ -250,12 +254,21 @@ bool instruction_syntax_valid(const PhysicalProgram& program, size_t index,
         case PhysicalOpcode::U32And:
         case PhysicalOpcode::U32Or:
         case PhysicalOpcode::U32Xor:
+        case PhysicalOpcode::U32Add:
+        case PhysicalOpcode::U32Multiply:
             return binary(PhysicalValueType::U32, PhysicalValueType::U32) &&
                    no_immediate && default_bits;
         case PhysicalOpcode::U32ShiftLeftConstant:
         case PhysicalOpcode::U32ShiftRightConstant:
             return unary(PhysicalValueType::U32, PhysicalValueType::U32) &&
                    instruction.immediate < 32 && default_bits;
+        case PhysicalOpcode::U32FunnelShiftRight:
+            return shape.operands == 3 &&
+                   operand_type(0) == PhysicalValueType::U32 &&
+                   operand_type(1) == PhysicalValueType::U32 &&
+                   operand_type(2) == PhysicalValueType::Index &&
+                   instruction.result_type == PhysicalValueType::U32 &&
+                   no_immediate && default_bits;
         case PhysicalOpcode::SignExtend:
             return unary(PhysicalValueType::U32, PhysicalValueType::I32) &&
                    instruction.bit_width >= 1 && instruction.bit_width <= 32 &&
@@ -309,6 +322,11 @@ bool instruction_syntax_valid(const PhysicalProgram& program, size_t index,
                    canonical_float_policy(
                        program.policies[instruction.policy],
                        PhysicalContractionPolicy::Separate);
+        case PhysicalOpcode::F32RoundToF16:
+            return unary(PhysicalValueType::F32, PhysicalValueType::F32) &&
+                   no_immediate && default_bits &&
+                   program.policies[instruction.policy] ==
+                       PhysicalNumericPolicy{};
         case PhysicalOpcode::F32Clamp:
             return ternary(PhysicalValueType::F32, PhysicalValueType::F32) &&
                    no_immediate && default_bits &&

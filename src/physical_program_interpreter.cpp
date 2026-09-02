@@ -223,6 +223,8 @@ bool range_for_program(const PhysicalProgram& program,
             }
             case PhysicalOpcode::U32Or:
             case PhysicalOpcode::U32Xor:
+            case PhysicalOpcode::U32Add:
+            case PhysicalOpcode::U32Multiply:
                 range = {0, UINT32_MAX, true};
                 break;
             case PhysicalOpcode::U32ShiftLeftConstant:
@@ -241,6 +243,11 @@ bool range_for_program(const PhysicalProgram& program,
                     range = {input(0).lower >> instruction.immediate,
                              input(0).upper >> instruction.immediate, true};
                 break;
+            case PhysicalOpcode::U32FunnelShiftRight:
+                if (!input(2).known || input(2).upper >= 64)
+                    goto unproved_index;
+                range = {0, UINT32_MAX, true};
+                break;
             case PhysicalOpcode::F32ToU32:
                 range = {0, UINT32_MAX, true};
                 break;
@@ -257,6 +264,7 @@ bool range_for_program(const PhysicalProgram& program,
             case PhysicalOpcode::F32Fma:
             case PhysicalOpcode::F32Negate:
             case PhysicalOpcode::F32Clamp:
+            case PhysicalOpcode::F32RoundToF16:
                 break;
         }
         (*ranges)[index] = range;
@@ -323,6 +331,41 @@ uint32_t half_to_float_bits(uint16_t half) noexcept {
     if (exponent == 0x1fu)
         return sign | 0x7f800000u | fraction << 13;
     return sign | (exponent + 112u) << 23 | fraction << 13;
+}
+
+uint16_t float_to_half_nearest_even(uint32_t bits) noexcept {
+    const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+    const uint32_t exponent = (bits >> 23) & 0xffu;
+    const uint32_t fraction = bits & 0x007fffffu;
+    if (exponent == 0xffu)
+        return static_cast<uint16_t>(sign | 0x7c00u |
+                                     (fraction == 0 ? 0u : 0x0200u));
+
+    const int half_exponent = static_cast<int>(exponent) - 127 + 15;
+    if (half_exponent >= 31)
+        return static_cast<uint16_t>(sign | 0x7c00u);
+    if (half_exponent <= 0) {
+        if (half_exponent < -10) return sign;
+        const uint32_t significand = fraction | 0x00800000u;
+        const unsigned shift = static_cast<unsigned>(14 - half_exponent);
+        uint32_t rounded = significand >> shift;
+        const uint32_t remainder =
+            significand & ((uint32_t{1} << shift) - 1u);
+        const uint32_t halfway = uint32_t{1} << (shift - 1u);
+        if (remainder > halfway ||
+            (remainder == halfway && (rounded & 1u)))
+            ++rounded;
+        return static_cast<uint16_t>(sign | rounded);
+    }
+
+    uint32_t rounded = static_cast<uint32_t>(sign) |
+                       (static_cast<uint32_t>(half_exponent) << 10) |
+                       (fraction >> 13);
+    const uint32_t remainder = fraction & 0x1fffu;
+    if (remainder > 0x1000u ||
+        (remainder == 0x1000u && (rounded & 1u)))
+        ++rounded;
+    return static_cast<uint16_t>(rounded);
 }
 
 uint32_t unsigned_to_float_bits(uint32_t value) noexcept {
@@ -710,6 +753,16 @@ PhysicalInterpretResult interpret_physical_value(
                 result.bits = static_cast<uint32_t>(operand(instruction, 0).bits) ^
                               static_cast<uint32_t>(operand(instruction, 1).bits);
                 break;
+            case PhysicalOpcode::U32Add:
+                result.bits = static_cast<uint32_t>(
+                    static_cast<uint32_t>(operand(instruction, 0).bits) +
+                    static_cast<uint32_t>(operand(instruction, 1).bits));
+                break;
+            case PhysicalOpcode::U32Multiply:
+                result.bits = static_cast<uint32_t>(
+                    static_cast<uint32_t>(operand(instruction, 0).bits) *
+                    static_cast<uint32_t>(operand(instruction, 1).bits));
+                break;
             case PhysicalOpcode::U32ShiftLeftConstant:
                 result.bits = static_cast<uint32_t>(operand(instruction, 0).bits)
                               << instruction.immediate;
@@ -718,6 +771,18 @@ PhysicalInterpretResult interpret_physical_value(
                 result.bits = static_cast<uint32_t>(operand(instruction, 0).bits)
                               >> instruction.immediate;
                 break;
+            case PhysicalOpcode::U32FunnelShiftRight: {
+                const uint64_t low = static_cast<uint32_t>(
+                    operand(instruction, 0).bits);
+                const uint64_t high = static_cast<uint32_t>(
+                    operand(instruction, 1).bits);
+                const uint64_t shift = operand(instruction, 2).bits;
+                if (shift >= 64)
+                    return PhysicalInterpretError::ArithmeticOverflow;
+                result.bits = static_cast<uint32_t>(
+                    ((high << 32) | low) >> shift);
+                break;
+            }
             case PhysicalOpcode::SignExtend: {
                 const uint32_t width = instruction.bit_width;
                 const uint32_t mask = width == 32
@@ -828,6 +893,13 @@ PhysicalInterpretResult interpret_physical_value(
                     return PhysicalInterpretError::NumericalPolicyRejected;
                 result.bits = u32;
                 break;
+            case PhysicalOpcode::F32RoundToF16:
+                u32 = half_to_float_bits(float_to_half_nearest_even(
+                    static_cast<uint32_t>(operand(instruction, 0).bits)));
+                if (!apply_float_policy(u32, *policy, &u32))
+                    return PhysicalInterpretError::NumericalPolicyRejected;
+                result.bits = u32;
+                break;
             case PhysicalOpcode::F32Clamp: {
                 const float value = float_from_bits(static_cast<uint32_t>(
                     operand(instruction, 0).bits));
@@ -856,6 +928,29 @@ PhysicalInterpretResult interpret_physical_value(
 
     const RuntimeValue& result = values[program.result];
     return ScalarValue{logical_element_type(result.type), result.bits};
+}
+
+std::span<const uint8_t> physical_program_plane_bytes(
+    const VerifiedPhysicalProgram& verified, uint16_t plane) noexcept {
+    if (plane >= verified.program_.planes.size()) return {};
+    const PhysicalPlane& declaration = verified.program_.planes[plane];
+    if (declaration.storage == PhysicalPlaneStorage::Inline) {
+        if (declaration.inline_offset > verified.program_.inline_bytes.size() ||
+            declaration.byte_length >
+                verified.program_.inline_bytes.size() - declaration.inline_offset)
+            return {};
+        return std::span<const uint8_t>(verified.program_.inline_bytes)
+            .subspan(static_cast<size_t>(declaration.inline_offset),
+                     static_cast<size_t>(declaration.byte_length));
+    }
+    if (plane >= verified.bindings_.size()) return {};
+    const PhysicalPlaneBinding& binding = verified.bindings_[plane];
+    if (!binding.bytes || binding.offset > binding.bytes->size() ||
+        binding.length > binding.bytes->size() - binding.offset)
+        return {};
+    return std::span<const uint8_t>(*binding.bytes)
+        .subspan(static_cast<size_t>(binding.offset),
+                 static_cast<size_t>(binding.length));
 }
 
 } // namespace Laplace

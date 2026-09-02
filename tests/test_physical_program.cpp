@@ -4,6 +4,7 @@
 #include <array>
 #include <bit>
 #include <cfenv>
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <fstream>
@@ -191,6 +192,233 @@ void test_dynamic_codebook_plane() {
     const auto verified = verify_physical_program(
         program, bindings, {ElementType::F32, {}});
     CHECK(require_value(verified).bits == std::bit_cast<uint32_t>(-3.5f));
+}
+
+PhysicalProgram funnel_shift_program() {
+    PhysicalProgram program;
+    program.logical_rank = 1;
+    program.planes.push_back(external_plane());
+    program.instructions = {
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index),
+        instruction(PhysicalOpcode::LoadBits, PhysicalValueType::U32, {0}, 0,
+                    0, kNoPhysicalPolicy, 32),
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {},
+                    32),
+        instruction(PhysicalOpcode::LoadBits, PhysicalValueType::U32, {2}, 0,
+                    0, kNoPhysicalPolicy, 32),
+        instruction(PhysicalOpcode::Coordinate, PhysicalValueType::Index),
+        instruction(PhysicalOpcode::U32FunnelShiftRight,
+                    PhysicalValueType::U32, {1, 3, 4}),
+    };
+    program.result = 5;
+    return program;
+}
+
+void test_bounded_funnel_shift() {
+    const uint32_t low = 0x89abcdefu;
+    const uint32_t high = 0x01234567u;
+    const auto owner = u32_bytes({low, high});
+    const PhysicalProgram program = funnel_shift_program();
+    const auto verified = verify_one(program, owner, {ElementType::U32, {64}});
+    CHECK(std::holds_alternative<VerifiedPhysicalProgram>(verified));
+    if (std::holds_alternative<VerifiedPhysicalProgram>(verified)) {
+        const auto& value = std::get<VerifiedPhysicalProgram>(verified);
+        const uint64_t joined = (uint64_t{high} << 32) | low;
+        for (uint64_t shift : {uint64_t{0}, uint64_t{1}, uint64_t{31},
+                               uint64_t{32}, uint64_t{47}, uint64_t{63}}) {
+            const ScalarValue result = require_value(value, {&shift, 1});
+            CHECK(result.bits == static_cast<uint32_t>(joined >> shift));
+        }
+    }
+
+    const auto wire = encode_physical_program(program);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    if (const auto* encoded = std::get_if<std::vector<uint8_t>>(&wire)) {
+        const auto decoded = parse_physical_program(*encoded);
+        CHECK(std::holds_alternative<PhysicalProgram>(decoded));
+        if (const auto* parsed = std::get_if<PhysicalProgram>(&decoded))
+            CHECK(*parsed == program);
+    }
+
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        verify_one(program, owner, {ElementType::U32, {65}})));
+    PhysicalProgram wrong_shift = program;
+    wrong_shift.instructions[4] = instruction(
+        PhysicalOpcode::ConstU32, PhysicalValueType::U32, {}, 7);
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        canonicalize_physical_program(std::move(wrong_shift))));
+}
+
+PhysicalProgram circular_window_program() {
+    PhysicalProgram program;
+    program.logical_rank = 1;
+    program.planes.push_back(external_plane(4));
+    program.instructions = {
+        instruction(PhysicalOpcode::Coordinate, PhysicalValueType::Index),
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {}, 3),
+        instruction(PhysicalOpcode::IndexMultiply, PhysicalValueType::Index,
+                    {0, 1}),
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {},
+                    755),
+        instruction(PhysicalOpcode::IndexAdd, PhysicalValueType::Index, {2, 3}),
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {}, 16),
+        instruction(PhysicalOpcode::IndexAdd, PhysicalValueType::Index, {4, 5}),
+        instruction(PhysicalOpcode::IndexDivideConstant,
+                    PhysicalValueType::Index, {4}, 32),
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {}, 1),
+        instruction(PhysicalOpcode::IndexSubtract, PhysicalValueType::Index,
+                    {6, 8}),
+        instruction(PhysicalOpcode::IndexDivideConstant,
+                    PhysicalValueType::Index, {9}, 32),
+        instruction(PhysicalOpcode::IndexRemainderConstant,
+                    PhysicalValueType::Index, {7}, 24),
+        instruction(PhysicalOpcode::IndexRemainderConstant,
+                    PhysicalValueType::Index, {10}, 24),
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {}, 32),
+        instruction(PhysicalOpcode::IndexMultiply, PhysicalValueType::Index,
+                    {11, 13}),
+        instruction(PhysicalOpcode::IndexMultiply, PhysicalValueType::Index,
+                    {12, 13}),
+        instruction(PhysicalOpcode::LoadBits, PhysicalValueType::U32, {14}, 0,
+                    0, kNoPhysicalPolicy, 32),
+        instruction(PhysicalOpcode::LoadBits, PhysicalValueType::U32, {15}, 0,
+                    0, kNoPhysicalPolicy, 32),
+        instruction(PhysicalOpcode::IndexRemainderConstant,
+                    PhysicalValueType::Index, {6}, 32),
+        instruction(PhysicalOpcode::IndexSubtract, PhysicalValueType::Index,
+                    {13, 18}),
+        instruction(PhysicalOpcode::IndexRemainderConstant,
+                    PhysicalValueType::Index, {19}, 32),
+        instruction(PhysicalOpcode::U32FunnelShiftRight,
+                    PhysicalValueType::U32, {17, 16, 20}),
+        instruction(PhysicalOpcode::ConstU32, PhysicalValueType::U32, {},
+                    0xffff),
+        instruction(PhysicalOpcode::U32And, PhysicalValueType::U32, {21, 22}),
+    };
+    program.result = 23;
+    return program;
+}
+
+void test_circular_packed_window() {
+    std::vector<uint32_t> words(24);
+    for (uint32_t index = 0; index < words.size(); ++index)
+        words[index] = 0x9e3779b9u * (index + 1u) ^ 0xa5a5a5a5u;
+    std::vector<uint8_t> storage;
+    for (uint32_t word : words) {
+        for (unsigned shift = 0; shift != 32; shift += 8)
+            storage.push_back(static_cast<uint8_t>(word >> shift));
+    }
+    const auto owner =
+        std::make_shared<const std::vector<uint8_t>>(std::move(storage));
+    const auto verified = verify_one(circular_window_program(), owner,
+                                     {ElementType::U32, {256}});
+    CHECK(std::holds_alternative<VerifiedPhysicalProgram>(verified));
+    if (!std::holds_alternative<VerifiedPhysicalProgram>(verified)) return;
+    const auto& program = std::get<VerifiedPhysicalProgram>(verified);
+    for (uint64_t coordinate = 0; coordinate < 256; ++coordinate) {
+        const uint64_t begin = coordinate * 3 + 755;
+        const uint64_t end = begin + 16;
+        const uint64_t first = begin / 32;
+        const uint64_t last = (end - 1) / 32;
+        const uint64_t shift = ((last + 1) * 32 - end) % 32;
+        const uint64_t joined =
+            (uint64_t{words[first % words.size()]} << 32) |
+            words[last % words.size()];
+        const uint32_t expected = static_cast<uint32_t>(joined >> shift) &
+                                  0xffffu;
+        CHECK(require_value(program, {&coordinate, 1}).bits == expected);
+    }
+}
+
+PhysicalProgram procedural_codebook_program() {
+    PhysicalProgram program;
+    program.logical_rank = 1;
+    program.planes.push_back(external_plane(2));
+    PhysicalNumericPolicy fused = preserve_policy();
+    fused.contraction = PhysicalContractionPolicy::Fused;
+    program.policies = {preserve_policy(), fused};
+    program.instructions = {
+        instruction(PhysicalOpcode::Coordinate, PhysicalValueType::Index),
+        instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {}, 16),
+        instruction(PhysicalOpcode::IndexMultiply, PhysicalValueType::Index,
+                    {0, 1}),
+        instruction(PhysicalOpcode::LoadBits, PhysicalValueType::U32, {2}, 0,
+                    0, kNoPhysicalPolicy, 16),
+        instruction(PhysicalOpcode::ConstU32, PhysicalValueType::U32, {},
+                    0x83dcd12d),
+        instruction(PhysicalOpcode::U32Multiply, PhysicalValueType::U32,
+                    {3, 4}),
+        instruction(PhysicalOpcode::ConstU32, PhysicalValueType::U32, {}, 0xff),
+        instruction(PhysicalOpcode::U32And, PhysicalValueType::U32, {5, 6}),
+        instruction(PhysicalOpcode::U32ShiftRightConstant,
+                    PhysicalValueType::U32, {5}, 8),
+        instruction(PhysicalOpcode::U32And, PhysicalValueType::U32, {8, 6}),
+        instruction(PhysicalOpcode::U32ShiftRightConstant,
+                    PhysicalValueType::U32, {5}, 16),
+        instruction(PhysicalOpcode::U32And, PhysicalValueType::U32, {10, 6}),
+        instruction(PhysicalOpcode::U32ShiftRightConstant,
+                    PhysicalValueType::U32, {5}, 24),
+        instruction(PhysicalOpcode::U32And, PhysicalValueType::U32, {12, 6}),
+        instruction(PhysicalOpcode::U32Add, PhysicalValueType::U32, {7, 9}),
+        instruction(PhysicalOpcode::U32Add, PhysicalValueType::U32, {11, 13}),
+        instruction(PhysicalOpcode::U32Add, PhysicalValueType::U32, {14, 15}),
+        instruction(PhysicalOpcode::ConstU32, PhysicalValueType::U32, {}, 0x6400),
+        instruction(PhysicalOpcode::U32Add, PhysicalValueType::U32, {16, 17}),
+        instruction(PhysicalOpcode::U32ToF32, PhysicalValueType::F32, {18}, 0,
+                    kNoPhysicalPlane, 0),
+        instruction(PhysicalOpcode::F32RoundToF16,
+                    PhysicalValueType::F32, {19}, 0, kNoPhysicalPlane, 0),
+        instruction(PhysicalOpcode::ConstU32, PhysicalValueType::U32, {}, 0x1eee),
+        instruction(PhysicalOpcode::F16ToF32, PhysicalValueType::F32, {21}, 0,
+                    kNoPhysicalPlane, 0),
+        instruction(PhysicalOpcode::ConstU32, PhysicalValueType::U32, {}, 0xc931),
+        instruction(PhysicalOpcode::F16ToF32, PhysicalValueType::F32, {23}, 0,
+                    kNoPhysicalPlane, 0),
+        instruction(PhysicalOpcode::F32Fma, PhysicalValueType::F32,
+                    {20, 22, 24}, 0, kNoPhysicalPlane, 1),
+        instruction(PhysicalOpcode::F32RoundToF16,
+                    PhysicalValueType::F32, {25}, 0, kNoPhysicalPlane, 0),
+    };
+    program.result = 26;
+    return program;
+}
+
+void test_procedural_codebook_arithmetic() {
+    const std::array<uint16_t, 7> indices = {
+        0, 1, 2, 17, 0x1234, 0x8000, 0xffff};
+    std::vector<uint8_t> storage;
+    for (uint16_t value : indices) {
+        storage.push_back(static_cast<uint8_t>(value));
+        storage.push_back(static_cast<uint8_t>(value >> 8));
+    }
+    const auto owner =
+        std::make_shared<const std::vector<uint8_t>>(std::move(storage));
+    const auto verified = verify_one(procedural_codebook_program(), owner,
+                                     {ElementType::F32, {indices.size()}});
+    CHECK(std::holds_alternative<VerifiedPhysicalProgram>(verified));
+    if (!std::holds_alternative<VerifiedPhysicalProgram>(verified)) return;
+    const auto& program = std::get<VerifiedPhysicalProgram>(verified);
+    const float inverse = static_cast<float>(std::bit_cast<_Float16>(uint16_t{0x1eee}));
+    const float bias = static_cast<float>(std::bit_cast<_Float16>(uint16_t{0xc931}));
+    for (uint64_t coordinate = 0; coordinate < indices.size(); ++coordinate) {
+        const uint32_t product =
+            static_cast<uint32_t>(indices[coordinate]) * 0x83dcd12du;
+        const uint32_t sum = 0x6400u + (product & 0xffu) +
+                             ((product >> 8) & 0xffu) +
+                             ((product >> 16) & 0xffu) +
+                             ((product >> 24) & 0xffu);
+        const float rounded_sum = static_cast<float>(static_cast<_Float16>(sum));
+        const _Float16 expected_half =
+            static_cast<_Float16>(std::fma(rounded_sum, inverse, bias));
+        const uint32_t expected = std::bit_cast<uint32_t>(
+            static_cast<float>(expected_half));
+        CHECK(require_value(program, {&coordinate, 1}).bits == expected);
+    }
+
+    PhysicalProgram invalid = procedural_codebook_program();
+    invalid.policies[0].rounding = PhysicalRoundingMode::TowardZero;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        canonicalize_physical_program(std::move(invalid))));
 }
 
 void test_anonymous_plane_permutation() {
@@ -892,6 +1120,9 @@ int main(int argc, char** argv) {
     test_raw_unsigned_plane_and_wire();
     test_cross_byte_sign_extension();
     test_dynamic_codebook_plane();
+    test_bounded_funnel_shift();
+    test_circular_packed_window();
+    test_procedural_codebook_arithmetic();
     test_anonymous_plane_permutation();
     test_axis_permutation_and_unpadded_tail();
     test_inline_plane_and_narrow_conversions();

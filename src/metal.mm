@@ -13,6 +13,12 @@
 #include "column_grouped_affine_uint2_skip.h"
 #endif
 #include <Metal/Metal.h>
+#if __has_include(<Metal/MTLResidencySet.h>)
+#import <Metal/MTLResidencySet.h>
+#define LAPLACE_HAS_MTL_RESIDENCY_SET 1
+#else
+#define LAPLACE_HAS_MTL_RESIDENCY_SET 0
+#endif
 #if __has_include(<Metal/MTLTensor.h>)
 #import <Metal/MTLTensor.h>
 #define LAPLACE_HAS_MTL_TENSOR_API 1
@@ -536,10 +542,23 @@ struct MetalWeightContext {
     mutable std::mutex mutex;
     std::vector<MmapBuf> mmap_bufs;
     std::unordered_map<const void*, id<MTLBuffer>> copied_bufs;
+    id<MTLResidencySet> residency_set = nil;
+    id<MTLCommandQueue> residency_queue = nil;
     bool require_registered_weights = false;
     uint64_t implicit_copy_count = 0;
+    bool residency_committed = false;
+    bool residency_requested = false;
 
     ~MetalWeightContext() {
+#if LAPLACE_HAS_MTL_RESIDENCY_SET
+        if (@available(macOS 15.0, *)) {
+            if (residency_queue && residency_set)
+                [residency_queue removeResidencySet:residency_set];
+            if (residency_requested) [residency_set endResidency];
+        }
+#endif
+        [residency_queue release];
+        [residency_set release];
         for (const MmapBuf& buffer : mmap_bufs) [buffer.buf release];
         for (const auto& [_, buffer] : copied_bufs) [buffer release];
     }
@@ -3079,6 +3098,18 @@ static bool metal_register_mmap_impl(const void* base, size_t size,
         std::lock_guard<std::mutex> lk(context.mutex);
         context.mmap_bufs.reserve(context.mmap_bufs.size() + staged.size());
         context.mmap_bufs.insert(context.mmap_bufs.end(), staged.begin(), staged.end());
+#if LAPLACE_HAS_MTL_RESIDENCY_SET
+        if (@available(macOS 15.0, *)) {
+            if (context.residency_set) {
+                for (const MmapBuf& buffer : staged)
+                    [context.residency_set addAllocation:buffer.buf];
+                [context.residency_set commit];
+                if (context.residency_requested)
+                    [context.residency_set requestResidency];
+                context.residency_committed = true;
+            }
+        }
+#endif
     } catch (...) {
         for (const MmapBuf& buffer : staged) [buffer.buf release];
         return false;
@@ -3111,10 +3142,26 @@ void metal_unregister_weights(const void* base) {
     std::lock_guard<std::mutex> lk(context.mutex);
     auto first = std::remove_if(context.mmap_bufs.begin(), context.mmap_bufs.end(), [&](const MmapBuf& buffer) {
         if (buffer.registration_base != static_cast<const uint8_t*>(base)) return false;
+#if LAPLACE_HAS_MTL_RESIDENCY_SET
+        if (@available(macOS 15.0, *)) {
+            if (context.residency_set)
+                [context.residency_set removeAllocation:buffer.buf];
+        }
+#endif
         [buffer.buf release];
         return true;
     });
     context.mmap_bufs.erase(first, context.mmap_bufs.end());
+#if LAPLACE_HAS_MTL_RESIDENCY_SET
+    if (@available(macOS 15.0, *)) {
+        if (context.residency_set) {
+            [context.residency_set commit];
+            if (context.residency_requested)
+                [context.residency_set requestResidency];
+            context.residency_committed = true;
+        }
+    }
+#endif
 }
 
 // Look up a tensor pointer in the registered mmap buffers. Returns the Metal
@@ -3173,6 +3220,17 @@ static id<MTLBuffer> get_weight_buf(const void* ptr, size_t len, size_t& offset)
         if (buf) ++context.implicit_copy_count;
         if (buf && mmap_addr) {
             context.copied_bufs[ptr] = buf;
+#if LAPLACE_HAS_MTL_RESIDENCY_SET
+            if (@available(macOS 15.0, *)) {
+                if (context.residency_set) {
+                    [context.residency_set addAllocation:buf];
+                    [context.residency_set commit];
+                    if (context.residency_requested)
+                        [context.residency_set requestResidency];
+                    context.residency_committed = true;
+                }
+            }
+#endif
             static int ncopy = 0;
             if (ncopy++ < 4)
                 fprintf(stderr, "[metal] weight copy %.1f MB (mmap split)\n", len / 1e6);
@@ -7944,6 +8002,7 @@ private:
     friend bool metal_tok_session_moe_ready(MetalTokSession&);
     friend bool metal_tok_session_recurrent_ready(MetalTokSession&);
     friend bool metal_tok_session_register_weights(MetalTokSession&, const void*, size_t);
+    friend bool metal_tok_session_prepare_weight_residency(MetalTokSession&);
 #if defined(LAPLACE_TESTING)
     friend bool metal_tok_session_register_weights_for_testing(MetalTokSession&, const void*, size_t,
                                                                size_t, uint32_t);
@@ -8569,6 +8628,20 @@ MetalResourceSnapshot metal_tok_session_resource_snapshot(const MetalTokSession&
     snapshot.recommended_max_working_set_size = device ? device.recommendedMaxWorkingSetSize : 0;
     snapshot.registered_weight_bytes = session.weights_.byte_count();
     snapshot.implicit_weight_copies = session.weights_.implicit_copy_count;
+#if LAPLACE_HAS_MTL_RESIDENCY_SET
+    if (@available(macOS 15.0, *)) {
+        snapshot.residency_set_supported = session.weights_.residency_set != nil;
+        snapshot.residency_set_committed = session.weights_.residency_committed;
+        snapshot.residency_requested = session.weights_.residency_requested;
+        if (session.weights_.residency_set) {
+            snapshot.residency_allocated_size =
+                session.weights_.residency_set.allocatedSize;
+            const NSUInteger count = session.weights_.residency_set.allocationCount;
+            snapshot.residency_allocation_count =
+                count > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(count);
+        }
+    }
+#endif
     for (const ColumnGroupedAffineU2SkipResource& resource :
          session.token_.column_grouped_affine_u2_skip)
         if (resource.metadata) snapshot.session_owned_metadata_bytes += resource.metadata.length;
@@ -9942,6 +10015,57 @@ bool metal_tok_session_register_weights(MetalTokSession& session, const void* ba
     MetalTokScope scope(session.token_);
     if (!session.token_.lease_backed) init();
     return metal_register_mmap(base, size);
+}
+
+bool metal_tok_session_prepare_weight_residency(MetalTokSession& session) {
+#if !LAPLACE_HAS_MTL_RESIDENCY_SET
+    (void)session;
+    return false;
+#else
+    if (!@available(macOS 15.0, *)) return false;
+    MetalTokScope scope(session.token_);
+    id<MTLDevice> device = tok_device();
+    id<MTLCommandQueue> queue = session.token_.queue;
+    if (!device || !queue) return false;
+
+    std::lock_guard<std::mutex> lock(session.weights_.mutex);
+    if (session.weights_.residency_set)
+        return session.weights_.residency_committed &&
+               session.weights_.residency_requested;
+    if (session.weights_.mmap_bufs.empty() &&
+        session.weights_.copied_bufs.empty())
+        return false;
+    const uint64_t recommended = device.recommendedMaxWorkingSetSize;
+    if (recommended != 0 && device.currentAllocatedSize > recommended) return false;
+
+    const size_t allocation_count = session.weights_.mmap_bufs.size() +
+                                    session.weights_.copied_bufs.size();
+    MTLResidencySetDescriptor* descriptor = [MTLResidencySetDescriptor new];
+    descriptor.label = @"Laplace session weights";
+    descriptor.initialCapacity = allocation_count;
+    NSError* error = nil;
+    id<MTLResidencySet> residency =
+        [device newResidencySetWithDescriptor:descriptor error:&error];
+    [descriptor release];
+    if (!residency) {
+        if (error)
+            std::fprintf(stderr, "[metal] weight residency set: %s\n",
+                         [[error localizedDescription] UTF8String]);
+        return false;
+    }
+    for (const MmapBuf& buffer : session.weights_.mmap_bufs)
+        [residency addAllocation:buffer.buf];
+    for (const auto& [_, buffer] : session.weights_.copied_bufs)
+        [residency addAllocation:buffer];
+    [residency commit];
+    [queue addResidencySet:residency];
+    [residency requestResidency];
+    session.weights_.residency_set = residency;
+    session.weights_.residency_queue = [queue retain];
+    session.weights_.residency_committed = true;
+    session.weights_.residency_requested = true;
+    return true;
+#endif
 }
 
 #if defined(LAPLACE_TESTING)

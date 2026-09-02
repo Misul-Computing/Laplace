@@ -89,11 +89,14 @@ set(LAPLACE_SOURCES
     src/source_schema.cpp
     src/source_compiler_graph_proof.cpp
     src/program_ir.cpp
+    src/program_metal.mm
     src/physical_program.cpp
     src/physical_program_package.cpp
     src/program_package.cpp
     src/program_state.cpp
     src/container_schema_program.cpp
+    src/source_evidence.cpp
+    src/source_program_solver.cpp
     src/semantic_manifest.cpp
     src/token_contract.cpp
     src/sparse_selector_coeff.cpp
@@ -170,6 +173,12 @@ add_executable(test_container_schema_program
 target_include_directories(test_container_schema_program PRIVATE src tests)
 add_test(NAME test_container_schema_program COMMAND test_container_schema_program)
 
+add_executable(test_source_program_solver
+    tests/test_source_program_solver.cpp
+    src/source_program_solver.cpp src/compatibility_report.cpp)
+target_include_directories(test_source_program_solver PRIVATE src tests)
+add_test(NAME test_source_program_solver COMMAND test_source_program_solver)
+
 add_executable(test_program_ir tests/test_program_ir.cpp
     src/program_ir.cpp src/compatibility_report.cpp)
 target_include_directories(test_program_ir PRIVATE src tests)
@@ -222,6 +231,21 @@ add_executable(test_program_reference tests/test_program_reference.cpp
     src/artifact_set.cpp src/compatibility_report.cpp src/mmap.cpp)
 target_include_directories(test_program_reference PRIVATE src tests)
 add_test(NAME test_program_reference COMMAND test_program_reference)
+
+if(APPLE)
+    add_executable(test_program_metal tests/test_program_metal.cpp
+        src/program_metal.mm src/program_reference.cpp
+        src/physical_program_package.cpp src/physical_program.cpp
+        src/physical_program_interpreter.cpp src/program_ir.cpp
+        src/semantic_model.cpp src/semantic_manifest.cpp
+        src/source_compiler_graph_proof.cpp src/physical_codec.cpp
+        src/codec_certificate.cpp src/token_contract.cpp src/artifact_index.cpp
+        src/artifact_set.cpp src/compatibility_report.cpp src/mmap.cpp)
+    target_include_directories(test_program_metal PRIVATE src tests)
+    target_link_libraries(test_program_metal PRIVATE "-framework Metal"
+        "-framework Foundation")
+    add_test(NAME test_program_metal COMMAND test_program_metal)
+endif()
 add_test(NAME test_physical_program_unseen
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/tests/run_unseen_physical_program.py
@@ -616,13 +640,20 @@ if(APPLE)
         src/compatibility_report.cpp src/artifact_set.cpp src/artifact_index.cpp
         src/semantic_model.cpp src/semantic_manifest.cpp src/source_compiler_graph_proof.cpp
         src/token_contract.cpp src/product_authority.cpp src/mmap.cpp
-        src/physical_program.cpp src/physical_program_package.cpp src/program_ir.cpp)
+        src/physical_program.cpp src/physical_program_interpreter.cpp
+        src/physical_program_package.cpp src/program_ir.cpp src/program_metal.mm
+        src/program_package.cpp src/program_state.cpp src/token_program.cpp
+        src/container_schema_program.cpp)
     target_include_directories(test_runtime_session_product PRIVATE src tests)
     target_compile_definitions(test_runtime_session_product PRIVATE
         LAPLACE_TESTING=1 LAPLACE_METAL_TESTING=1 LAPLACE_RUNTIME_PACKAGE_TESTING=1)
     target_link_libraries(test_runtime_session_product PRIVATE ${LAPLACE_APPLE_FW})
     add_test(NAME test_runtime_session_product COMMAND test_runtime_session_product)
+    add_test(NAME test_runtime_program_session
+        COMMAND test_runtime_session_product --program-session)
     set_tests_properties(test_runtime_session_product PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP: product Metal device unavailable")
+    set_tests_properties(test_runtime_program_session PROPERTIES
         SKIP_REGULAR_EXPRESSION "SKIP: product Metal device unavailable")
 
     add_executable(test_product_metal_codec_capabilities

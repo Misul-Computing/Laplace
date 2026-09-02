@@ -44,11 +44,14 @@ set(LAPLACE_PRODUCT_SOURCES
     src/source_schema.cpp
     src/source_compiler_graph_proof.cpp
     src/program_ir.cpp
+    src/program_metal.mm
     src/physical_program.cpp
     src/physical_program_package.cpp
     src/program_package.cpp
     src/program_state.cpp
     src/container_schema_program.cpp
+    src/source_evidence.cpp
+    src/source_program_solver.cpp
     src/semantic_manifest.cpp
     src/token_contract.cpp
     src/sparse_selector_coeff.cpp

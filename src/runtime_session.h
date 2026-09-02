@@ -9,12 +9,14 @@
 #include "canonical_metal.h"
 #include "compat_rule.h"
 #include "execution_plan.h"
+#include "program_metal.h"
 #include "session_resources.h"
 #include "state_abi.h"
 
 namespace Laplace {
 
 class ProductPackage;
+class VerifiedProgramPackage;
 class VerifiedPhysicalProgramPackage;
 
 enum class SessionFaultPoint : uint8_t {
@@ -72,6 +74,8 @@ public:
 private:
     friend std::variant<RuntimeSession, CompatibilityReport> create_runtime_session(
         const ProductPackage&, SessionRequest, SessionFaultPoint);
+    friend std::variant<RuntimeSession, CompatibilityReport> create_runtime_session(
+        const VerifiedProgramPackage&, SessionRequest, SessionFaultPoint);
 #if defined(LAPLACE_QUALIFICATION_RUNTIME)
     friend std::variant<RuntimeSession, CompatibilityReport> create_qualification_runtime_session(
         std::shared_ptr<const RuntimePackage>, SessionRequest, SessionFaultPoint);
@@ -96,6 +100,15 @@ private:
         : package_(std::move(package)), request_(request), plan_(std::move(plan)), resources_(std::move(resources)),
           state_(std::move(state)), metal_(std::move(metal)), product_route_(product_route),
           physical_package_(std::move(physical_package)) {}
+    RuntimeSession(std::shared_ptr<const VerifiedProgramPackage> package,
+                   SessionRequest request,
+                   std::unique_ptr<MetalProgramExecutable> metal,
+                   uint32_t token_input_value, uint32_t score_result_index)
+        : request_(request), state_(SemanticModel{}), product_route_(true),
+          program_package_(std::move(package)),
+          program_metal_(std::move(metal)),
+          program_token_input_value_(token_input_value),
+          program_score_result_index_(score_result_index) {}
 
     RuntimeRunResult execute(std::span<const uint32_t> token_ids, ExecutionPhase phase,
                              bool sampled = false);
@@ -110,6 +123,10 @@ private:
     std::unique_ptr<CanonicalMetalProgram> metal_;
     bool product_route_ = false;
     std::shared_ptr<const VerifiedPhysicalProgramPackage> physical_package_;
+    std::shared_ptr<const VerifiedProgramPackage> program_package_;
+    std::unique_ptr<MetalProgramExecutable> program_metal_;
+    uint32_t program_token_input_value_ = UINT32_MAX;
+    uint32_t program_score_result_index_ = UINT32_MAX;
     bool poisoned_ = false;
     uint64_t product_store_id_ = 0;
     uint64_t product_generation_ = 1;
@@ -123,6 +140,9 @@ using SessionCreateResult = std::variant<RuntimeSession, CompatibilityReport>;
 
 SessionCreateResult create_runtime_session(const ProductPackage& package, SessionRequest request,
                                            SessionFaultPoint fault = SessionFaultPoint::None);
+SessionCreateResult create_runtime_session(
+    const VerifiedProgramPackage& package, SessionRequest request,
+    SessionFaultPoint fault = SessionFaultPoint::None);
 #if defined(LAPLACE_METAL_TESTING)
 SessionCreateResult create_product_runtime_session_for_testing(
     std::shared_ptr<const RuntimePackage> package, SessionRequest request,

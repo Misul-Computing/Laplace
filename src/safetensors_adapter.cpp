@@ -22,8 +22,10 @@ bool checked_multiply(uint64_t left, uint64_t right, uint64_t& result) {
     return true;
 }
 
+} // namespace
+
 std::optional<std::pair<ArtifactScalarType, uint32_t>>
-artifact_scalar_type(SafeTensorsDtype dtype) {
+safetensors_physical_scalar(SafeTensorsDtype dtype) noexcept {
     switch (dtype) {
         case SafeTensorsDtype::BOOL: return std::pair{ArtifactScalarType::Bool, 1u};
         case SafeTensorsDtype::U8: return std::pair{ArtifactScalarType::U8, 1u};
@@ -40,6 +42,8 @@ artifact_scalar_type(SafeTensorsDtype dtype) {
         default: return std::nullopt;
     }
 }
+
+namespace {
 
 CompatibilityReport adapter_failure(CompatibilityError code,
                                     const PackageView& artifact,
@@ -97,7 +101,7 @@ build_safetensors_artifact_index(const PackageView& artifact) {
                                        "SafeTensors contains physically indistinguishable tensor records");
             }
         }
-        const auto scalar = artifact_scalar_type(source.dtype);
+        const auto scalar = safetensors_physical_scalar(source.dtype);
         if (!scalar) {
             return adapter_failure(CompatibilityError::IR_QUANTIZATION_UNSUPPORTED,
                                    artifact, tensor_id,

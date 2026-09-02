@@ -59,6 +59,11 @@ struct CanonicalMetalResourceDiagnostics {
     uint64_t registration_overlap_bytes = 0;
     uint64_t atlas_bytes = 0;
     uint64_t implicit_weight_copies = 0;
+    uint64_t residency_allocated_size = 0;
+    uint32_t residency_allocation_count = 0;
+    bool residency_set_supported = false;
+    bool residency_set_committed = false;
+    bool residency_requested = false;
 };
 
 struct CanonicalMetalCursor {

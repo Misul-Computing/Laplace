@@ -569,6 +569,15 @@ static void test_weight_registration_is_transactional() {
     // published buffers and 60 registered pages.
     CHECK(registered.registered_weight_bytes == page * 60u);
     CHECK(metal_tok_session_weight_span_coverage(*session, first_mapping, page) > 0);
+    CHECK(metal_tok_session_prepare_weight_residency(*session));
+    const MetalResourceSnapshot resident =
+        metal_tok_session_resource_snapshot(*session);
+    CHECK(resident.residency_set_supported);
+    CHECK(resident.residency_set_committed);
+    CHECK(resident.residency_requested);
+    CHECK(resident.residency_allocation_count == 4);
+    CHECK(resident.residency_allocated_size >= registered.registered_weight_bytes);
+    CHECK(metal_tok_session_prepare_weight_residency(*session));
 
     const MetalResourceSnapshot before_failure = registered;
     CHECK(!metal_tok_session_register_weights_for_testing(
@@ -576,12 +585,24 @@ static void test_weight_registration_is_transactional() {
     const MetalResourceSnapshot after_failure = metal_tok_session_resource_snapshot(*session);
     CHECK(after_failure.registered_weight_bytes == before_failure.registered_weight_bytes);
     CHECK(after_failure.implicit_weight_copies == before_failure.implicit_weight_copies);
+    CHECK(after_failure.residency_allocation_count ==
+          resident.residency_allocation_count);
     CHECK(metal_tok_session_weight_span_coverage(*session, first_mapping, page) > 0);
     CHECK(metal_tok_session_weight_span_coverage(*session, failed_mapping, page) == 0);
+
+    CHECK(metal_tok_session_register_weights_for_testing(
+        *session, failed_mapping, bytes, chunk, UINT32_MAX));
+    const MetalResourceSnapshot after_add =
+        metal_tok_session_resource_snapshot(*session);
+    CHECK(after_add.residency_allocation_count == 8);
+    metal_tok_session_unregister_weights(*session, failed_mapping);
+    CHECK(metal_tok_session_resource_snapshot(*session)
+              .residency_allocation_count == 4);
 
     metal_tok_session_unregister_weights(*session, first_mapping);
     const MetalResourceSnapshot after_unregister = metal_tok_session_resource_snapshot(*session);
     CHECK(after_unregister.registered_weight_bytes == 0);
+    CHECK(after_unregister.residency_allocation_count == 0);
     for (size_t offset = 0; offset < bytes; offset += page * 12u) {
         const auto* address = static_cast<const uint8_t*>(first_mapping) + offset;
         CHECK(metal_tok_session_weight_span_coverage(*session, address, page) == 0);

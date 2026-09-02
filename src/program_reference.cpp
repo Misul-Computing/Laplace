@@ -1,5 +1,6 @@
 #include "program_reference.h"
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -9,6 +10,8 @@
 
 namespace Laplace {
 namespace {
+
+constexpr size_t kMaximumReferenceTensorIterations = size_t{1} << 24;
 
 CompatibilityReport reference_error(CompatibilityError code, const char* detail) {
     return compatibility_report(code, detail);
@@ -80,7 +83,8 @@ bool operand(const Evaluation& evaluation, uint32_t id, ReferenceValue* value) {
 }
 
 bool binary_elementwise(const Evaluation& evaluation, const Instruction& instruction,
-                        const ValueType& type, bool multiply, ReferenceValue* result) {
+                        const ValueType& type, Primitive primitive,
+                        ReferenceValue* result) {
     if (!result || instruction.inputs.size() != 2) return false;
     ReferenceValue left, right;
     if (!operand(evaluation, instruction.inputs[0], &left) ||
@@ -94,24 +98,39 @@ bool binary_elementwise(const Evaluation& evaluation, const Instruction& instruc
         if (type.element_type == ElementType::F32) {
             const float a = std::bit_cast<float>(static_cast<uint32_t>(left.bits[index]));
             const float b = std::bit_cast<float>(static_cast<uint32_t>(right.bits[index]));
-            const float value = multiply ? a * b : a + b;
+            if (!std::isfinite(a) || !std::isfinite(b)) return false;
+            float value = 0.0f;
+            switch (primitive) {
+            case Primitive::Add: value = a + b; break;
+            case Primitive::Multiply: value = a * b; break;
+            case Primitive::Subtract: value = a - b; break;
+            case Primitive::Divide: value = a / b; break;
+            case Primitive::Maximum: value = std::max(a, b); break;
+            default: return false;
+            }
             if (!std::isfinite(value)) return false;
             result->bits[index] = std::bit_cast<uint32_t>(value);
         } else if (type.element_type == ElementType::U32) {
             const uint64_t a = static_cast<uint32_t>(left.bits[index]);
             const uint64_t b = static_cast<uint32_t>(right.bits[index]);
+            const bool multiply = primitive == Primitive::Multiply;
+            if (!multiply && primitive != Primitive::Add) return false;
             const uint64_t value = multiply ? a * b : a + b;
             if (value > UINT32_MAX) return false;
             result->bits[index] = value;
         } else if (type.element_type == ElementType::I32) {
             const int64_t a = static_cast<int32_t>(left.bits[index]);
             const int64_t b = static_cast<int32_t>(right.bits[index]);
+            const bool multiply = primitive == Primitive::Multiply;
+            if (!multiply && primitive != Primitive::Add) return false;
             const int64_t value = multiply ? a * b : a + b;
             if (value < INT32_MIN || value > INT32_MAX) return false;
             result->bits[index] = static_cast<uint32_t>(static_cast<int32_t>(value));
         } else if (type.element_type == ElementType::U64) {
             const uint64_t a = left.bits[index];
             const uint64_t b = right.bits[index];
+            const bool multiply = primitive == Primitive::Multiply;
+            if (!multiply && primitive != Primitive::Add) return false;
             if ((!multiply && a > UINT64_MAX - b) ||
                 (multiply && a != 0 && b > UINT64_MAX / a))
                 return false;
@@ -120,6 +139,236 @@ bool binary_elementwise(const Evaluation& evaluation, const Instruction& instruc
             return false;
         }
     }
+    return true;
+}
+
+bool unary_elementwise(const Evaluation& evaluation,
+                       const Instruction& instruction, const ValueType& type,
+                       Primitive primitive, ReferenceValue* result) {
+    if (!result || instruction.inputs.size() != 1 ||
+        type.element_type != ElementType::F32)
+        return false;
+    ReferenceValue input;
+    if (!operand(evaluation, instruction.inputs.front(), &input) ||
+        !value_matches_type(input, type))
+        return false;
+    result->type = ElementType::F32;
+    result->extents = input.extents;
+    result->bits.resize(input.bits.size());
+    for (size_t index = 0; index < input.bits.size(); ++index) {
+        const float value = std::bit_cast<float>(
+            static_cast<uint32_t>(input.bits[index]));
+        if (!std::isfinite(value)) return false;
+        float computed = 0.0f;
+        switch (primitive) {
+        case Primitive::Negate: computed = -value; break;
+        case Primitive::Exp: computed = std::exp(value); break;
+        case Primitive::Log: computed = std::log(value); break;
+        case Primitive::Rsqrt: computed = 1.0f / std::sqrt(value); break;
+        case Primitive::Sin: computed = std::sin(value); break;
+        case Primitive::Cos: computed = std::cos(value); break;
+        default: return false;
+        }
+        if (!std::isfinite(computed)) return false;
+        result->bits[index] = std::bit_cast<uint32_t>(computed);
+    }
+    return true;
+}
+
+bool eval_region(const Function& function, uint32_t region_id,
+                 Evaluation* evaluation, std::vector<uint32_t>* yields,
+                 uint32_t depth);
+
+int64_t floor_divide_index(int64_t value, int64_t divisor) {
+    const int64_t quotient = value / divisor;
+    const int64_t remainder = value % divisor;
+    return quotient - static_cast<int64_t>(remainder < 0);
+}
+
+bool evaluate_tensor_index(const TensorIndexExpr& expression,
+                           std::span<const uint64_t> iterators,
+                           std::span<const ReferenceValue> sources,
+                           int64_t* result, uint32_t depth = 0) {
+    if (!result || depth > 32) return false;
+    switch (expression.expression) {
+    case TensorIndexExpression::Constant:
+        if (!expression.operands.empty()) return false;
+        *result = expression.value;
+        return true;
+    case TensorIndexExpression::Iterator:
+        if (!expression.operands.empty() || expression.value < 0 ||
+            static_cast<uint64_t>(expression.value) >= iterators.size() ||
+            iterators[static_cast<size_t>(expression.value)] >
+                static_cast<uint64_t>(INT64_MAX))
+            return false;
+        *result = static_cast<int64_t>(
+            iterators[static_cast<size_t>(expression.value)]);
+        return true;
+    case TensorIndexExpression::SourceScalar:
+        if (!expression.operands.empty() || expression.value < 0 ||
+            static_cast<uint64_t>(expression.value) >= sources.size())
+            return false;
+        {
+            const ReferenceValue& source =
+                sources[static_cast<size_t>(expression.value)];
+            if (source.type != ElementType::U32 || !source.extents.empty() ||
+                source.bits.size() != 1 || source.bits.front() > UINT32_MAX)
+                return false;
+            *result = static_cast<int64_t>(
+                static_cast<uint32_t>(source.bits.front()));
+        }
+        return true;
+    case TensorIndexExpression::Add:
+    case TensorIndexExpression::Multiply:
+    case TensorIndexExpression::FloorDivide:
+    case TensorIndexExpression::Remainder:
+        break;
+    default:
+        return false;
+    }
+    if (expression.value != 0 || expression.operands.size() != 2) return false;
+    int64_t left = 0;
+    int64_t right = 0;
+    if (!evaluate_tensor_index(expression.operands[0], iterators, sources, &left,
+                               depth + 1) ||
+        !evaluate_tensor_index(expression.operands[1], iterators, sources, &right,
+                               depth + 1))
+        return false;
+    if (expression.expression == TensorIndexExpression::Add ||
+        expression.expression == TensorIndexExpression::Multiply) {
+        const __int128 value = expression.expression == TensorIndexExpression::Add
+                                   ? static_cast<__int128>(left) + right
+                                   : static_cast<__int128>(left) * right;
+        if (value < INT64_MIN || value > INT64_MAX) return false;
+        *result = static_cast<int64_t>(value);
+        return true;
+    }
+    if (right <= 0) return false;
+    const int64_t quotient = floor_divide_index(left, right);
+    *result = expression.expression == TensorIndexExpression::FloorDivide
+                  ? quotient
+                  : left - quotient * right;
+    return true;
+}
+
+bool tensor_offset(const ReferenceValue& value, const TensorIndexMap& map,
+                   std::span<const uint64_t> iterators,
+                   std::span<const ReferenceValue> sources,
+                   size_t* offset, bool* zero) {
+    if (!offset || !zero || map.results.size() != value.extents.size()) return false;
+    *offset = 0;
+    *zero = false;
+    for (size_t axis = 0; axis < map.results.size(); ++axis) {
+        int64_t coordinate = 0;
+        if (!evaluate_tensor_index(map.results[axis], iterators, sources,
+                                   &coordinate))
+            return false;
+        if (coordinate < 0 || static_cast<uint64_t>(coordinate) >= value.extents[axis]) {
+            if (map.bounds != TensorBoundsMode::Zero) return false;
+            *zero = true;
+            return true;
+        }
+        if (*offset > (std::numeric_limits<size_t>::max() -
+                       static_cast<size_t>(coordinate)) /
+                          static_cast<size_t>(value.extents[axis]))
+            return false;
+        *offset = *offset * static_cast<size_t>(value.extents[axis]) +
+                  static_cast<size_t>(coordinate);
+    }
+    return *offset < value.bits.size();
+}
+
+bool eval_structured_tensor(const Function& function,
+                            const Instruction& instruction,
+                            Evaluation* evaluation, uint32_t depth) {
+    const auto* attributes =
+        std::get_if<StructuredTensorAttributes>(&instruction.attributes);
+    if (!attributes || instruction.regions.size() != 1 ||
+        instruction.inputs.size() !=
+            attributes->source_count + instruction.outputs.size() ||
+        attributes->indexing_maps.size() != instruction.inputs.size())
+        return false;
+    const Region* body = nullptr;
+    for (const Region& candidate : function.regions)
+        if (candidate.id == instruction.regions.front()) body = &candidate;
+    if (!body || body->arguments.size() != instruction.inputs.size() ||
+        body->yields.size() != instruction.outputs.size())
+        return false;
+
+    std::vector<uint64_t> iteration_extents;
+    iteration_extents.reserve(attributes->iteration_dimensions.size());
+    for (const DimensionExpr& dimension : attributes->iteration_dimensions) {
+        if (dimension.expression != DimensionExpression::Constant ||
+            dimension.value == 0)
+            return false;
+        iteration_extents.push_back(dimension.value);
+    }
+    size_t iteration_count = 0;
+    if (!element_count(iteration_extents, &iteration_count) ||
+        iteration_count > kMaximumReferenceTensorIterations)
+        return false;
+
+    std::vector<ReferenceValue> sources(attributes->source_count);
+    for (size_t source = 0; source < sources.size(); ++source) {
+        if (!operand(*evaluation, instruction.inputs[source], &sources[source]))
+            return false;
+    }
+    std::vector<ReferenceValue> destinations(instruction.outputs.size());
+    for (size_t result = 0; result < destinations.size(); ++result) {
+        if (!operand(*evaluation,
+                     instruction.inputs[attributes->source_count + result],
+                     &destinations[result]) ||
+            !value_matches_type(destinations[result],
+                                instruction.outputs[result].type))
+            return false;
+    }
+
+    std::vector<uint64_t> iterators(iteration_extents.size(), 0);
+    for (size_t flat = 0; flat < iteration_count; ++flat) {
+        size_t remainder = flat;
+        for (size_t axis = iteration_extents.size(); axis != 0; --axis) {
+            iterators[axis - 1] = remainder % iteration_extents[axis - 1];
+            remainder /= static_cast<size_t>(iteration_extents[axis - 1]);
+        }
+        for (size_t source = 0; source < sources.size(); ++source) {
+            size_t offset = 0;
+            bool zero = false;
+            if (!tensor_offset(sources[source], attributes->indexing_maps[source],
+                               iterators, sources, &offset, &zero))
+                return false;
+            evaluation->values[body->arguments[source].id] =
+                scalar_value(sources[source].type,
+                             zero ? 0 : sources[source].bits[offset]);
+        }
+        std::vector<size_t> destination_offsets(destinations.size(), 0);
+        for (size_t result = 0; result < destinations.size(); ++result) {
+            const size_t input = attributes->source_count + result;
+            bool zero = false;
+            if (!tensor_offset(destinations[result],
+                               attributes->indexing_maps[input], iterators,
+                               sources,
+                               &destination_offsets[result], &zero) || zero)
+                return false;
+            evaluation->values[body->arguments[input].id] =
+                scalar_value(destinations[result].type,
+                             destinations[result].bits[destination_offsets[result]]);
+        }
+        std::vector<uint32_t> body_yields;
+        if (!eval_region(function, body->id, evaluation, &body_yields, depth + 1) ||
+            body_yields.size() != destinations.size())
+            return false;
+        for (size_t result = 0; result < destinations.size(); ++result) {
+            ReferenceValue yielded;
+            if (!operand(*evaluation, body_yields[result], &yielded) ||
+                yielded.type != destinations[result].type ||
+                !yielded.extents.empty() || yielded.bits.size() != 1)
+                return false;
+            destinations[result].bits[destination_offsets[result]] = yielded.bits[0];
+        }
+    }
+    for (size_t result = 0; result < destinations.size(); ++result)
+        evaluation->values[instruction.outputs[result].id] =
+            std::move(destinations[result]);
     return true;
 }
 
@@ -136,21 +385,46 @@ bool eval_region(const Function& function, uint32_t region_id,
         ValueType type;
         switch (instruction.primitive.code) {
         case Primitive::Constant: {
-            if (!output_type(instruction, &id, &type) || !type.dimensions.empty()) return false;
+            if (!output_type(instruction, &id, &type)) return false;
             const auto* attributes = std::get_if<ConstantAttributes>(&instruction.attributes);
-            if (!attributes || !scalar_type_supported(type.element_type)) return false;
-            evaluation->values[id] = scalar_value(type.element_type, attributes->bits);
+            std::vector<uint64_t> extents;
+            size_t count = 0;
+            if (!attributes || !shape_for(type, &extents) ||
+                !element_count(extents, &count))
+                return false;
+            ReferenceValue value;
+            value.type = type.element_type;
+            value.extents = std::move(extents);
+            value.bits.assign(count, attributes->bits);
+            evaluation->values[id] = std::move(value);
             break;
         }
         case Primitive::Add:
-        case Primitive::Multiply: {
+        case Primitive::Multiply:
+        case Primitive::Subtract:
+        case Primitive::Divide:
+        case Primitive::Maximum: {
             if (!output_type(instruction, &id, &type)) return false;
             std::vector<uint64_t> extents;
             if (!shape_for(type, &extents)) return false;
             ReferenceValue value;
             if (!binary_elementwise(*evaluation, instruction, type,
-                                    instruction.primitive.code == Primitive::Multiply,
+                                    instruction.primitive.code,
                                     &value)) return false;
+            evaluation->values[id] = std::move(value);
+            break;
+        }
+        case Primitive::Negate:
+        case Primitive::Exp:
+        case Primitive::Log:
+        case Primitive::Rsqrt:
+        case Primitive::Sin:
+        case Primitive::Cos: {
+            if (!output_type(instruction, &id, &type)) return false;
+            ReferenceValue value;
+            if (!unary_elementwise(*evaluation, instruction, type,
+                                   instruction.primitive.code, &value))
+                return false;
             evaluation->values[id] = std::move(value);
             break;
         }
@@ -197,6 +471,10 @@ bool eval_region(const Function& function, uint32_t region_id,
             evaluation->values[id] = std::move(carried);
             break;
         }
+        case Primitive::StructuredTensor:
+            if (!eval_structured_tensor(function, instruction, evaluation, depth))
+                return false;
+            break;
         }
     }
     *yields = region->yields;
@@ -266,14 +544,14 @@ ReferencePhysicalResult decode_reference_resource(
                            "reference physical interpretation failed");
 }
 
-ReferenceExecutionResult execute_reference(
-    const VerifiedPhysicalProgramPackage& package,
+namespace {
+
+ReferenceExecutionResult execute_reference_impl(
+    const VerifiedProgram& semantic,
+    const VerifiedPhysicalProgramPackage* package,
     ReferenceState& state,
     std::span<const ReferenceInput> inputs) {
-    const auto& semantic = package.semantic_program();
-    if (!semantic) return reference_error(CompatibilityError::KERNEL_UNAVAILABLE,
-                                          "reference executor requires a verified semantic program");
-    const Program& program = program_definition(*semantic);
+    const Program& program = program_definition(semantic);
     if (program.functions.size() != 1 || program.exports.empty())
         return reference_error(CompatibilityError::IR_REFERENCE_INVALID,
                                "reference executor requires one exported function");
@@ -304,7 +582,9 @@ ReferenceExecutionResult execute_reference(
                     return reference_error(CompatibilityError::IR_REFERENCE_INVALID,
                                            "reference program has duplicate output values");
 
-    for (const PhysicalResourceBinding& resource : package.resources()) {
+    const std::span<const PhysicalResourceBinding> resources =
+        package ? package->resources() : std::span<const PhysicalResourceBinding>{};
+    for (const PhysicalResourceBinding& resource : resources) {
         if (resource.semantic_function_id != function.id)
             return reference_error(CompatibilityError::IR_REFERENCE_INVALID,
                                    "reference resource belongs to another function");
@@ -332,7 +612,7 @@ ReferenceExecutionResult execute_reference(
                 remainder /= static_cast<size_t>(extent);
             }
             const auto decoded = decode_reference_resource(
-                package, resource.resource_id, coordinate);
+                *package, resource.resource_id, coordinate);
             const auto* scalar = std::get_if<ScalarValue>(&decoded);
             if (!scalar || scalar->type != value.type)
                 return reference_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE,
@@ -414,6 +694,27 @@ ReferenceExecutionResult execute_reference(
     state.generation += 1;
     result.generation = state.generation;
     return result;
+}
+
+} // namespace
+
+ReferenceExecutionResult execute_reference_program(
+    const VerifiedProgram& program,
+    ReferenceState& state,
+    std::span<const ReferenceInput> inputs) {
+    return execute_reference_impl(program, nullptr, state, inputs);
+}
+
+ReferenceExecutionResult execute_reference(
+    const VerifiedPhysicalProgramPackage& package,
+    ReferenceState& state,
+    std::span<const ReferenceInput> inputs) {
+    const auto& semantic = package.semantic_program();
+    if (!semantic)
+        return reference_error(
+            CompatibilityError::KERNEL_UNAVAILABLE,
+            "reference executor requires a verified semantic program");
+    return execute_reference_impl(*semantic, &package, state, inputs);
 }
 
 } // namespace Laplace

@@ -84,6 +84,12 @@ public:
     static std::variant<PackageView, CompatibilityReport>
     make_owned_blob(ArtifactId id, ArtifactRole role, std::span<const uint8_t> bytes);
 
+    // Creates an immutable range view that retains the source owner. Mapped
+    // read advice remains relative to the returned view.
+    static std::variant<PackageView, CompatibilityReport>
+    make_subview(const PackageView& source, ArtifactId id, ArtifactRole role,
+                 size_t offset, size_t length);
+
     static std::variant<ArtifactSet, CompatibilityReport>
     load_single_file(std::string_view path);
     static std::variant<ArtifactSet, CompatibilityReport>

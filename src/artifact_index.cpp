@@ -596,17 +596,15 @@ std::variant<ArtifactIndex, CompatibilityReport> ArtifactIndex::build(ArtifactIn
         for (uint8_t axis = 0; axis != tensor.layout.rank; ++axis) {
             identity_axes = identity_axes && tensor.layout.axis_order[axis] == axis;
         }
-        // GGUF uses first-axis-fastest strides. SafeTensors keeps C row-major
-        // strides even when it carries source-axis provenance.
-        const bool gguf_source_layout = tensor.axis.source_rank != 0 &&
-            (tensor.layout.kind == PhysicalLayoutKind::GgufBlocked ||
-             tensor.format.encoding != ArtifactPhysicalEncoding::Unknown);
+        // A contiguous physical tensor may declare either axis zero or the
+        // last axis as its unit-stride axis. The explicit strides carry that
+        // fact; the scalar encoding does not identify a source container.
         const bool grouped_affine_layout =
             tensor.layout.kind == PhysicalLayoutKind::GroupedAffine ||
             tensor.layout.kind == PhysicalLayoutKind::ColumnGroupedAffineUInt2Skip;
         const bool exact_strides = grouped_affine_layout
             ? grouped_affine_layout_is_exact(tensor)
-            : (gguf_source_layout ? gguf_layout_is_exact(tensor) : row_major_layout_is_exact(tensor));
+            : (row_major_layout_is_exact(tensor) || gguf_layout_is_exact(tensor));
         const bool exact_axes = grouped_affine_layout
             ? tensor.layout.axis_order[0] == 1 && tensor.layout.axis_order[1] == 0
             : identity_axes;
@@ -742,8 +740,14 @@ std::variant<ArtifactIndex, CompatibilityReport> ArtifactIndex::build(ArtifactIn
                                          {}, tensor.id);
                 }
             } else if (!tensor.logical_dimensions.empty()) {
-                const uint64_t block_dimension = tensor.logical_dimensions[quantized
-                    ? tensor.axis.block_axis : 0];
+                size_t physical_axis = tensor.axis.block_axis;
+                if (!quantized) {
+                    physical_axis = row_major_layout_is_exact(tensor)
+                        ? tensor.logical_dimensions.size() - 1
+                        : 0;
+                }
+                const uint64_t block_dimension =
+                    tensor.logical_dimensions[physical_axis];
                 const uint64_t units = block_dimension / tensor.format.block_elements;
                 if (!checked_multiply(units, tensor.format.block_bytes, expected_row_stride)) {
                     return index_failure(CompatibilityError::IR_SHAPE_MISMATCH,

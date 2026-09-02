@@ -33,6 +33,8 @@ constexpr size_t kMaximumStateReferences = 1u << 20;
 constexpr size_t kMaximumExports = 1u << 20;
 constexpr size_t kMaximumShapeDepth = 32;
 constexpr size_t kMaximumDimensions = 32;
+constexpr size_t kMaximumStructuredOperands = 64;
+constexpr size_t kMaximumIndexExpressionNodes = 4096;
 
 struct Bounds {
     uint64_t lower = 0;
@@ -170,7 +172,7 @@ public:
     explicit Verifier(const Program& program) : program_(program) {}
 
     bool run() {
-        if (program_.major != 1 || program_.minor != 0) {
+        if (program_.major != 1 || program_.minor > 1) {
             return reject(CompatibilityError::IR_VERSION_UNSUPPORTED,
                           "program version is unsupported");
         }
@@ -546,6 +548,341 @@ private:
         return found == info.values.end() ? nullptr : found->second.type;
     }
 
+    struct IndexBounds {
+        int64_t lower = 0;
+        int64_t upper = 0;
+        bool empty = false;
+        bool dynamic = false;
+    };
+
+    bool checked_index_value(__int128 value, int64_t* result) {
+        if (value < std::numeric_limits<int64_t>::min() ||
+            value > std::numeric_limits<int64_t>::max()) {
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "tensor index expression overflows I64");
+        }
+        *result = static_cast<int64_t>(value);
+        return true;
+    }
+
+    static int64_t floor_divide_index(int64_t value, int64_t divisor) {
+        const int64_t quotient = value / divisor;
+        const int64_t remainder = value % divisor;
+        return quotient - static_cast<int64_t>(remainder < 0);
+    }
+
+    bool index_bounds(const TensorIndexExpr& expression,
+                      std::span<const Bounds> iterator_bounds,
+                      size_t depth, size_t* nodes, IndexBounds* result) {
+        if (!nodes || !result || depth > kMaximumShapeDepth ||
+            ++*nodes > kMaximumIndexExpressionNodes) {
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "tensor index expression exceeds its bound");
+        }
+        switch (expression.expression) {
+        case TensorIndexExpression::Constant:
+            if (!expression.operands.empty()) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor constant index has operands");
+            }
+            result->lower = expression.value;
+            result->upper = expression.value;
+            return true;
+        case TensorIndexExpression::Iterator:
+            if (!expression.operands.empty() || expression.value < 0 ||
+                static_cast<uint64_t>(expression.value) >= iterator_bounds.size()) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor iterator index is invalid");
+            }
+            if (iterator_bounds[static_cast<size_t>(expression.value)].upper == 0) {
+                result->empty = true;
+                return true;
+            }
+            result->lower = 0;
+            return checked_index_value(
+                static_cast<__int128>(
+                    iterator_bounds[static_cast<size_t>(expression.value)].upper) - 1,
+                &result->upper);
+        case TensorIndexExpression::SourceScalar:
+            if (!expression.operands.empty() || expression.value < 0) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor source scalar index is invalid");
+            }
+            result->dynamic = true;
+            return true;
+        case TensorIndexExpression::Add:
+        case TensorIndexExpression::Multiply:
+        case TensorIndexExpression::FloorDivide:
+        case TensorIndexExpression::Remainder:
+            break;
+        default:
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "tensor index expression is unsupported");
+        }
+        if (expression.value != 0 || expression.operands.size() != 2) {
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "tensor index expression arity is invalid");
+        }
+        IndexBounds left;
+        IndexBounds right;
+        if (!index_bounds(expression.operands[0], iterator_bounds, depth + 1,
+                          nodes, &left) ||
+            !index_bounds(expression.operands[1], iterator_bounds, depth + 1,
+                          nodes, &right)) {
+            return false;
+        }
+        if (left.empty || right.empty) {
+            result->empty = true;
+            return true;
+        }
+        result->dynamic = left.dynamic || right.dynamic;
+        if (expression.expression == TensorIndexExpression::Add) {
+            if (result->dynamic) return true;
+            return checked_index_value(static_cast<__int128>(left.lower) + right.lower,
+                                       &result->lower) &&
+                   checked_index_value(static_cast<__int128>(left.upper) + right.upper,
+                                       &result->upper);
+        }
+        if (expression.expression == TensorIndexExpression::Multiply) {
+            const bool left_constant =
+                expression.operands[0].expression == TensorIndexExpression::Constant;
+            const bool right_constant =
+                expression.operands[1].expression == TensorIndexExpression::Constant;
+            if (left_constant == right_constant) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor index multiplication requires one constant");
+            }
+            if (result->dynamic) return true;
+            const std::array<__int128, 4> products = {
+                static_cast<__int128>(left.lower) * right.lower,
+                static_cast<__int128>(left.lower) * right.upper,
+                static_cast<__int128>(left.upper) * right.lower,
+                static_cast<__int128>(left.upper) * right.upper};
+            const auto [minimum, maximum] =
+                std::minmax_element(products.begin(), products.end());
+            return checked_index_value(*minimum, &result->lower) &&
+                   checked_index_value(*maximum, &result->upper);
+        }
+        if (expression.operands[1].expression != TensorIndexExpression::Constant ||
+            right.lower <= 0 || right.lower != right.upper) {
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "tensor index divisor must be a positive constant");
+        }
+        if (left.dynamic) return true;
+        if (expression.expression == TensorIndexExpression::FloorDivide) {
+            result->lower = floor_divide_index(left.lower, right.lower);
+            result->upper = floor_divide_index(left.upper, right.lower);
+            return true;
+        }
+        result->lower = 0;
+        result->upper = right.lower - 1;
+        return true;
+    }
+
+    static bool exact_iterator(const TensorIndexExpr& expression,
+                               uint32_t* iterator) {
+        if (!iterator || expression.expression != TensorIndexExpression::Iterator ||
+            !expression.operands.empty() || expression.value < 0 ||
+            expression.value > UINT32_MAX)
+            return false;
+        *iterator = static_cast<uint32_t>(expression.value);
+        return true;
+    }
+
+    bool validate_source_scalar_indices(
+        const TensorIndexExpr& expression, const Instruction& item,
+        const StructuredTensorAttributes& attributes,
+        const FunctionInfo& info, size_t depth = 0) {
+        if (depth > kMaximumShapeDepth) {
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "tensor source scalar index exceeds its bound");
+        }
+        if (expression.expression == TensorIndexExpression::SourceScalar) {
+            if (!expression.operands.empty() || expression.value < 0) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor source scalar index is malformed");
+            }
+            if (static_cast<uint64_t>(expression.value) >=
+                attributes.source_count) {
+                return reject(CompatibilityError::IR_REFERENCE_INVALID,
+                              "tensor source scalar reference is invalid");
+            }
+            const ValueType* type = input_type(
+                item, static_cast<uint32_t>(expression.value), info);
+            if (!type || *type != ValueType{ElementType::U32, {}}) {
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "tensor source scalar must be scalar U32");
+            }
+            return true;
+        }
+        for (const TensorIndexExpr& operand : expression.operands) {
+            if (!validate_source_scalar_indices(operand, item, attributes,
+                                                info, depth + 1))
+                return false;
+        }
+        return true;
+    }
+
+    bool validate_structured_tensor(const Instruction& item,
+                                    const FunctionInfo& info) {
+        const auto* attributes =
+            std::get_if<StructuredTensorAttributes>(&item.attributes);
+        if (program_.minor < 1) {
+            return reject(CompatibilityError::IR_VERSION_UNSUPPORTED,
+                          "structured tensor requires program V1.1");
+        }
+        if (!attributes || attributes->source_count == 0 || item.outputs.empty() ||
+            item.inputs.size() != attributes->source_count + item.outputs.size() ||
+            item.inputs.size() > kMaximumStructuredOperands ||
+            item.regions.size() != 1 || !item.effect_predecessors.empty() ||
+            attributes->iteration_dimensions.empty() ||
+            attributes->iteration_dimensions.size() > kMaximumDimensions ||
+            attributes->iterator_kinds.size() !=
+                attributes->iteration_dimensions.size() ||
+            attributes->indexing_maps.size() != item.inputs.size()) {
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "structured tensor contract is invalid");
+        }
+
+        std::vector<Bounds> iterator_bounds(attributes->iteration_dimensions.size());
+        size_t parallel_count = 0;
+        for (size_t index = 0; index < attributes->iteration_dimensions.size();
+             ++index) {
+            if (!dimension_bounds(attributes->iteration_dimensions[index], 0,
+                                  &iterator_bounds[index]))
+                return false;
+            switch (attributes->iterator_kinds[index]) {
+            case TensorIteratorKind::Parallel:
+                ++parallel_count;
+                break;
+            case TensorIteratorKind::Reduction:
+                break;
+            default:
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "structured tensor iterator kind is invalid");
+            }
+        }
+
+        const Region& body = *info.regions.at(item.regions.front());
+        if (body.arguments.size() != item.inputs.size() ||
+            body.yields.size() != item.outputs.size()) {
+            return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                          "structured tensor body signature is invalid");
+        }
+        for (const Instruction& body_item : body.instructions) {
+            const Primitive code = body_item.primitive.code;
+            if ((code != Primitive::Constant && code != Primitive::Add &&
+                 code != Primitive::Multiply && code != Primitive::Subtract &&
+                 code != Primitive::Divide && code != Primitive::Maximum &&
+                 code != Primitive::Negate && code != Primitive::Exp &&
+                 code != Primitive::Log && code != Primitive::Rsqrt &&
+                 code != Primitive::Sin && code != Primitive::Cos) ||
+                !body_item.regions.empty() || !body_item.effect_predecessors.empty()) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "structured tensor body is not scalar and pure");
+            }
+            for (const TypedValue& output : body_item.outputs) {
+                if (!output.type.dimensions.empty()) {
+                    return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                                  "structured tensor body output is not scalar");
+                }
+            }
+        }
+
+        for (size_t input = 0; input < item.inputs.size(); ++input) {
+            const ValueType* type = input_type(item, static_cast<uint32_t>(input), info);
+            if (!type || !body.arguments[input].type.dimensions.empty() ||
+                body.arguments[input].type.element_type != type->element_type ||
+                attributes->indexing_maps[input].results.size() !=
+                    type->dimensions.size()) {
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "structured tensor operand or body type is invalid");
+            }
+            const TensorIndexMap& map = attributes->indexing_maps[input];
+            if (map.bounds != TensorBoundsMode::Reject &&
+                map.bounds != TensorBoundsMode::Zero) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "structured tensor bounds mode is invalid");
+            }
+            for (size_t axis = 0; axis < map.results.size(); ++axis) {
+                size_t nodes = 0;
+                IndexBounds bounds;
+                if (!validate_source_scalar_indices(map.results[axis], item,
+                                                    *attributes, info))
+                    return false;
+                if (!index_bounds(map.results[axis], iterator_bounds, 0, &nodes,
+                                  &bounds))
+                    return false;
+                uint32_t iterator = UINT32_MAX;
+                const bool identity_dimension =
+                    exact_iterator(map.results[axis], &iterator) &&
+                    iterator < attributes->iteration_dimensions.size() &&
+                    type->dimensions[axis] ==
+                        attributes->iteration_dimensions[iterator];
+                Bounds operand_bounds;
+                if (!dimension_bounds(type->dimensions[axis], 0, &operand_bounds))
+                    return false;
+                if (map.bounds == TensorBoundsMode::Reject && !bounds.empty &&
+                    !bounds.dynamic &&
+                    !identity_dimension &&
+                    (bounds.lower < 0 ||
+                     static_cast<uint64_t>(bounds.upper) >= operand_bounds.lower)) {
+                    return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                                  "structured tensor source map is not provably in bounds");
+                }
+            }
+        }
+
+        for (size_t result = 0; result < item.outputs.size(); ++result) {
+            const size_t destination = attributes->source_count + result;
+            const ValueType* initial =
+                input_type(item, static_cast<uint32_t>(destination), info);
+            const ValueType& output = item.outputs[result].type;
+            if (!initial || *initial != output ||
+                output.dimensions.size() != parallel_count ||
+                body.arguments[destination].type !=
+                    ValueType{output.element_type, {}}) {
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "structured tensor destination type is invalid");
+            }
+            const TensorIndexMap& map = attributes->indexing_maps[destination];
+            if (map.bounds != TensorBoundsMode::Reject ||
+                map.results.size() != parallel_count) {
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "structured tensor destination map is invalid");
+            }
+            std::vector<bool> seen(attributes->iteration_dimensions.size(), false);
+            for (size_t axis = 0; axis < map.results.size(); ++axis) {
+                uint32_t iterator = UINT32_MAX;
+                if (!exact_iterator(map.results[axis], &iterator) ||
+                    iterator >= attributes->iterator_kinds.size() ||
+                    attributes->iterator_kinds[iterator] !=
+                        TensorIteratorKind::Parallel || seen[iterator] ||
+                    output.dimensions[axis] !=
+                        attributes->iteration_dimensions[iterator]) {
+                    return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                                  "structured tensor destination is not an injective parallel map");
+                }
+                seen[iterator] = true;
+            }
+            for (size_t iterator = 0; iterator < seen.size(); ++iterator) {
+                if (attributes->iterator_kinds[iterator] ==
+                        TensorIteratorKind::Parallel &&
+                    !seen[iterator]) {
+                    return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                                  "structured tensor destination omits a parallel iterator");
+                }
+            }
+            const auto yielded = info.values.find(body.yields[result]);
+            if (yielded == info.values.end() ||
+                *yielded->second.type != ValueType{output.element_type, {}}) {
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "structured tensor body result type is invalid");
+            }
+        }
+        return true;
+    }
+
     bool known_primitive(Primitive code) const {
         switch (code) {
         case Primitive::Constant:
@@ -554,6 +891,16 @@ private:
         case Primitive::BoundedLoop:
         case Primitive::StateRead:
         case Primitive::StateWrite:
+        case Primitive::StructuredTensor:
+        case Primitive::Subtract:
+        case Primitive::Divide:
+        case Primitive::Maximum:
+        case Primitive::Negate:
+        case Primitive::Exp:
+        case Primitive::Log:
+        case Primitive::Rsqrt:
+        case Primitive::Sin:
+        case Primitive::Cos:
             return true;
         }
         return false;
@@ -574,7 +921,9 @@ private:
         case Primitive::Constant:
             if (!std::holds_alternative<ConstantAttributes>(item.attributes) ||
                 !item.inputs.empty() || item.outputs.size() != 1 ||
-                !item.outputs.front().type.dimensions.empty() || !item.regions.empty() ||
+                (program_.minor < 1 &&
+                 !item.outputs.front().type.dimensions.empty()) ||
+                !item.regions.empty() ||
                 !item.effect_predecessors.empty()) {
                 return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
                               "constant primitive contract is invalid");
@@ -600,6 +949,45 @@ private:
                 *left != item.outputs.front().type) {
                 return reject(CompatibilityError::IR_SHAPE_MISMATCH,
                               "arithmetic value types do not match");
+            }
+            return true;
+        }
+        case Primitive::Subtract:
+        case Primitive::Divide:
+        case Primitive::Maximum: {
+            if (!std::holds_alternative<NoAttributes>(item.attributes) ||
+                item.inputs.size() != 2 || item.outputs.size() != 1 ||
+                !item.regions.empty() || !item.effect_predecessors.empty()) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "F32 binary primitive contract is invalid");
+            }
+            const ValueType* left = input_type(item, 0, info);
+            const ValueType* right = input_type(item, 1, info);
+            if (left == nullptr || right == nullptr || *left != *right ||
+                *left != item.outputs.front().type ||
+                left->element_type != ElementType::F32) {
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "F32 binary value types do not match");
+            }
+            return true;
+        }
+        case Primitive::Negate:
+        case Primitive::Exp:
+        case Primitive::Log:
+        case Primitive::Rsqrt:
+        case Primitive::Sin:
+        case Primitive::Cos: {
+            if (!std::holds_alternative<NoAttributes>(item.attributes) ||
+                item.inputs.size() != 1 || item.outputs.size() != 1 ||
+                !item.regions.empty() || !item.effect_predecessors.empty()) {
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "F32 unary primitive contract is invalid");
+            }
+            const ValueType* input = input_type(item, 0, info);
+            if (input == nullptr || *input != item.outputs.front().type ||
+                input->element_type != ElementType::F32) {
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "F32 unary value types do not match");
             }
             return true;
         }
@@ -672,6 +1060,8 @@ private:
             }
             return true;
         }
+        case Primitive::StructuredTensor:
+            return validate_structured_tensor(item, info);
         }
         return false;
     }
@@ -1066,6 +1456,33 @@ private:
         }
     }
 
+    static void encode_tensor_index(const TensorIndexExpr& expression,
+                                    Encoder& encoder) {
+        encoder.u8(static_cast<uint8_t>(expression.expression));
+        encoder.u64(static_cast<uint64_t>(expression.value));
+        encoder.u32(static_cast<uint32_t>(expression.operands.size()));
+        for (const TensorIndexExpr& operand : expression.operands)
+            encode_tensor_index(operand, encoder);
+    }
+
+    void encode_structured_tensor(const StructuredTensorAttributes& attributes,
+                                  Encoder& encoder) {
+        encoder.u32(attributes.source_count);
+        encoder.u32(static_cast<uint32_t>(attributes.iteration_dimensions.size()));
+        for (size_t index = 0; index < attributes.iteration_dimensions.size();
+             ++index) {
+            encode_dimension(attributes.iteration_dimensions[index], encoder);
+            encoder.u8(static_cast<uint8_t>(attributes.iterator_kinds[index]));
+        }
+        encoder.u32(static_cast<uint32_t>(attributes.indexing_maps.size()));
+        for (const TensorIndexMap& map : attributes.indexing_maps) {
+            encoder.u8(static_cast<uint8_t>(map.bounds));
+            encoder.u32(static_cast<uint32_t>(map.results.size()));
+            for (const TensorIndexExpr& result : map.results)
+                encode_tensor_index(result, encoder);
+        }
+    }
+
     void encode_attributes(const Instruction& item, Encoder& encoder) {
         encoder.u8(static_cast<uint8_t>(item.attributes.index()));
         if (const auto* value = std::get_if<ConstantAttributes>(&item.attributes)) {
@@ -1097,6 +1514,9 @@ private:
                     encoder.u32(alias->second);
                 }
             }
+        } else if (const auto* value =
+                       std::get_if<StructuredTensorAttributes>(&item.attributes)) {
+            encode_structured_tensor(*value, encoder);
         }
     }
 
@@ -1126,6 +1546,24 @@ private:
         }
     }
 
+    void preview_encode_structured_tensor(
+        const StructuredTensorAttributes& attributes, Encoder& encoder) const {
+        encoder.u32(attributes.source_count);
+        encoder.u32(static_cast<uint32_t>(attributes.iteration_dimensions.size()));
+        for (size_t index = 0; index < attributes.iteration_dimensions.size();
+             ++index) {
+            preview_encode_dimension(attributes.iteration_dimensions[index], encoder);
+            encoder.u8(static_cast<uint8_t>(attributes.iterator_kinds[index]));
+        }
+        encoder.u32(static_cast<uint32_t>(attributes.indexing_maps.size()));
+        for (const TensorIndexMap& map : attributes.indexing_maps) {
+            encoder.u8(static_cast<uint8_t>(map.bounds));
+            encoder.u32(static_cast<uint32_t>(map.results.size()));
+            for (const TensorIndexExpr& result : map.results)
+                encode_tensor_index(result, encoder);
+        }
+    }
+
     void preview_encode_attributes(const Instruction& item,
                                    Encoder& encoder) const {
         encoder.u8(static_cast<uint8_t>(item.attributes.index()));
@@ -1141,6 +1579,9 @@ private:
             preview_encode_type(state.type, encoder);
             encoder.u8(state.writable ? 1 : 0);
             encoder.u8(state.alias_group == UINT32_MAX ? 0 : 1);
+        } else if (const auto* value =
+                       std::get_if<StructuredTensorAttributes>(&item.attributes)) {
+            preview_encode_structured_tensor(*value, encoder);
         }
     }
 
@@ -1512,6 +1953,32 @@ void write_ids(ProgramWireWriter& writer, std::span<const uint32_t> ids) {
     for (uint32_t id : ids) writer.u32(id);
 }
 
+void write_tensor_index(ProgramWireWriter& writer,
+                        const TensorIndexExpr& expression) {
+    writer.u8(static_cast<uint8_t>(expression.expression));
+    writer.u64(static_cast<uint64_t>(expression.value));
+    writer.u32(static_cast<uint32_t>(expression.operands.size()));
+    for (const TensorIndexExpr& operand : expression.operands)
+        write_tensor_index(writer, operand);
+}
+
+void write_structured_tensor(ProgramWireWriter& writer,
+                             const StructuredTensorAttributes& attributes) {
+    writer.u32(attributes.source_count);
+    writer.u32(static_cast<uint32_t>(attributes.iteration_dimensions.size()));
+    for (size_t index = 0; index < attributes.iteration_dimensions.size(); ++index) {
+        write_dimension(writer, attributes.iteration_dimensions[index]);
+        writer.u8(static_cast<uint8_t>(attributes.iterator_kinds[index]));
+    }
+    writer.u32(static_cast<uint32_t>(attributes.indexing_maps.size()));
+    for (const TensorIndexMap& map : attributes.indexing_maps) {
+        writer.u8(static_cast<uint8_t>(map.bounds));
+        writer.u32(static_cast<uint32_t>(map.results.size()));
+        for (const TensorIndexExpr& result : map.results)
+            write_tensor_index(writer, result);
+    }
+}
+
 void write_instruction(ProgramWireWriter& writer, const Instruction& instruction) {
     writer.u32(instruction.id);
     writer.u16(static_cast<uint16_t>(instruction.primitive.code));
@@ -1526,6 +1993,9 @@ void write_instruction(ProgramWireWriter& writer, const Instruction& instruction
         writer.u64(value->step);
     } else if (const auto* value = std::get_if<StateAttributes>(&instruction.attributes)) {
         writer.u32(value->state_id);
+    } else if (const auto* value =
+                   std::get_if<StructuredTensorAttributes>(&instruction.attributes)) {
+        write_structured_tensor(writer, *value);
     }
     write_ids(writer, instruction.inputs);
     writer.u32(static_cast<uint32_t>(instruction.outputs.size()));
@@ -1590,6 +2060,61 @@ bool read_ids(ProgramWireReader& reader, std::vector<uint32_t>* ids,
     return true;
 }
 
+bool read_tensor_index(ProgramWireReader& reader, TensorIndexExpr* expression,
+                       size_t depth, size_t* nodes) {
+    if (!expression || !nodes || depth > kMaximumShapeDepth ||
+        ++*nodes > kMaximumIndexExpressionNodes)
+        return false;
+    uint8_t kind = 0;
+    uint64_t value = 0;
+    uint32_t operands = 0;
+    if (!reader.u8(&kind) || !reader.u64(&value) || !reader.u32(&operands) ||
+        operands > 2)
+        return false;
+    expression->expression = static_cast<TensorIndexExpression>(kind);
+    expression->value = static_cast<int64_t>(value);
+    expression->operands.resize(operands);
+    for (TensorIndexExpr& operand : expression->operands)
+        if (!read_tensor_index(reader, &operand, depth + 1, nodes)) return false;
+    return true;
+}
+
+bool read_structured_tensor(ProgramWireReader& reader,
+                            StructuredTensorAttributes* attributes) {
+    if (!attributes || !reader.u32(&attributes->source_count)) return false;
+    uint32_t iterations = 0;
+    if (!reader.u32(&iterations) || iterations == 0 ||
+        iterations > kMaximumDimensions)
+        return false;
+    attributes->iteration_dimensions.resize(iterations);
+    attributes->iterator_kinds.resize(iterations);
+    for (uint32_t index = 0; index < iterations; ++index) {
+        uint8_t kind = 0;
+        if (!read_dimension(reader, &attributes->iteration_dimensions[index], 0) ||
+            !reader.u8(&kind))
+            return false;
+        attributes->iterator_kinds[index] =
+            static_cast<TensorIteratorKind>(kind);
+    }
+    uint32_t maps = 0;
+    if (!reader.u32(&maps) || maps == 0 || maps > kMaximumStructuredOperands)
+        return false;
+    attributes->indexing_maps.resize(maps);
+    size_t nodes = 0;
+    for (TensorIndexMap& map : attributes->indexing_maps) {
+        uint8_t bounds = 0;
+        uint32_t results = 0;
+        if (!reader.u8(&bounds) || !reader.u32(&results) ||
+            results > kMaximumDimensions)
+            return false;
+        map.bounds = static_cast<TensorBoundsMode>(bounds);
+        map.results.resize(results);
+        for (TensorIndexExpr& result : map.results)
+            if (!read_tensor_index(reader, &result, 0, &nodes)) return false;
+    }
+    return true;
+}
+
 bool read_instruction(ProgramWireReader& reader, Instruction* instruction) {
     if (!instruction) return false;
     uint16_t primitive = 0;
@@ -1621,6 +2146,12 @@ bool read_instruction(ProgramWireReader& reader, Instruction* instruction) {
         StateAttributes value;
         if (!reader.u32(&value.state_id)) return false;
         instruction->attributes = value;
+        break;
+    }
+    case 4: {
+        StructuredTensorAttributes value;
+        if (!read_structured_tensor(reader, &value)) return false;
+        instruction->attributes = std::move(value);
         break;
     }
     default:
