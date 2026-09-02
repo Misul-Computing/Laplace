@@ -222,6 +222,19 @@ add_test(NAME test_unseen_container_schema
         ${CMAKE_SOURCE_DIR}/tests/run_unseen_container_schema.py
         $<TARGET_FILE:test_program_package>)
 
+add_executable(test_source_evidence tests/test_source_evidence.cpp
+    src/source_evidence.cpp
+    src/program_package.cpp src/container_schema_program.cpp
+    src/physical_program_package.cpp
+    src/physical_program.cpp src/physical_program_interpreter.cpp
+    src/program_state.cpp src/program_ir.cpp src/token_program.cpp
+    src/semantic_manifest.cpp src/source_compiler_graph_proof.cpp
+    src/physical_codec.cpp src/codec_certificate.cpp src/token_contract.cpp
+    src/semantic_model.cpp src/artifact_index.cpp src/artifact_set.cpp
+    src/compatibility_report.cpp src/mmap.cpp)
+target_include_directories(test_source_evidence PRIVATE src tests)
+add_test(NAME test_source_evidence COMMAND test_source_evidence)
+
 add_executable(test_program_reference tests/test_program_reference.cpp
     src/program_reference.cpp src/physical_program_package.cpp src/physical_program.cpp
     src/physical_program_interpreter.cpp
@@ -510,6 +523,19 @@ if(APPLE)
     target_link_libraries(test_execution_plan PRIVATE ${LAPLACE_APPLE_FW})
 endif()
 add_test(NAME test_execution_plan COMMAND test_execution_plan)
+
+add_executable(test_scalar_executor tests/test_scalar_executor.cpp
+    src/scalar_executor.cpp
+    src/execution_plan.cpp src/semantic_dispatch_program.cpp
+    src/codec_certificate.cpp
+    src/physical_codec.cpp src/semantic_manifest.cpp
+    src/source_compiler_graph_proof.cpp src/token_contract.cpp
+    src/semantic_model.cpp src/artifact_index.cpp src/artifact_set.cpp
+    src/compatibility_report.cpp src/mmap.cpp)
+target_include_directories(test_scalar_executor PRIVATE src tests)
+target_compile_definitions(test_scalar_executor PRIVATE
+    LAPLACE_TESTING=1 LAPLACE_RUNTIME_PACKAGE_TESTING=1)
+add_test(NAME test_scalar_executor COMMAND test_scalar_executor)
 
 if(LAPLACE_ENABLE_QUALIFICATION_TESTS)
     add_executable(test_runtime_session tests/test_runtime_session.cpp tests/reference_fp32.cpp

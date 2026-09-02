@@ -254,9 +254,11 @@ ArtifactSet::make_owned_blob(ArtifactId id, ArtifactRole role,
         auto owner = std::make_shared<ArtifactBlobOwner>();
         owner->bytes.assign(bytes.begin(), bytes.end());
         const Sha256Digest digest = digest_bytes(owner->bytes);
-        return PackageView(id, role,
-                           std::span<const uint8_t>(owner->bytes.data(), owner->bytes.size()),
-                           digest, std::move(owner));
+        // Materialize the span before transferring ownership: the move is
+        // indeterminately sequenced with sibling argument evaluation, so a
+        // dereference of `owner` after std::move(owner) is undefined behavior.
+        std::span<const uint8_t> owned_bytes(owner->bytes.data(), owner->bytes.size());
+        return PackageView(id, role, owned_bytes, digest, std::move(owner));
     } catch (const std::bad_alloc&) {
         return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
                                "owned artifact blob allocation failed");
