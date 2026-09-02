@@ -90,6 +90,8 @@ Run a fixed native sample with phase-separated measurement:
 
 The `--bench` option reports prefill and decode separately.
 
+Run `./build/laplace --help` for the full option list with defaults.
+
 See [Architecture](docs/architecture.md), [Support](docs/support.md), and
 [Benchmarks](docs/benchmarks.md) for the execution model, support levels, and
 measurement contract.

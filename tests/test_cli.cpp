@@ -326,8 +326,19 @@ void test_help_lists_only_the_v1_product_route() {
              "--laplace-kv-q4", "--kv-fp16", "--kv-fp32", "--eval-file",
              "--eval-limit", "--eval-preliminary", "--no-spec", "--draft",
              "--draft-mode", "--no-im-start", "--raw-channels", "-j"}) {
-        CHECK(help.find(removed) == std::string::npos);
+         CHECK(help.find(removed) == std::string::npos);
     }
+}
+
+void test_help_alias_and_option_position() {
+    int status = 0;
+    const std::string alias = run_cli("-h", &status);
+    CHECK(status == 0);
+    CHECK(alias.find("usage:") != std::string::npos);
+    CHECK(alias.find("default: 200") != std::string::npos);
+    const std::string positioned = run_cli("model.gguf --help", &status);
+    CHECK(status == 0);
+    CHECK(positioned.find("usage:") != std::string::npos);
 }
 
 void test_removed_flags_fail_in_the_model_position() {
@@ -373,6 +384,29 @@ void test_invalid_prompt_file_fails_before_model_open() {
     CHECK(status != 0);
     CHECK(output.find("prompt file must be a regular file") != std::string::npos);
     CHECK(output.find("failed to open missing.gguf") == std::string::npos);
+}
+
+void test_conflicting_prompt_sources_fail_closed() {
+    int status = 0;
+    const std::string output = run_cli(
+        "missing.gguf -p a --prompt-file prompt.txt", &status);
+    CHECK(status != 0);
+    CHECK(output.find("use either -p or --prompt-file") != std::string::npos);
+}
+
+void test_explicit_empty_prompt_still_enters_generation() {
+    constexpr const char* path = "/private/tmp/laplace-test-cli-empty-prompt.gguf";
+    std::remove(path);
+    write_generic_canonical_model(path);
+    int status = 0;
+    const std::string output = run_cli(
+        std::string(path) + " -p '' -n 1 --greedy", &status);
+    CHECK(status != 0);
+    // The package graph error, not the metadata dump: an explicit (even
+    // empty) -p must enter the generation route.
+    CHECK(output.find("typed normalized GGUF facts do not form an executable semantic graph") !=
+          std::string::npos);
+    std::remove(path);
 }
 
 void test_removed_product_flags_fail_as_unknown_options() {
@@ -491,10 +525,13 @@ void test_native_required_mode_is_not_skippable() {
 
 int main() {
     test_help_lists_only_the_v1_product_route();
+    test_help_alias_and_option_position();
     test_removed_product_flags_fail_as_unknown_options();
     test_removed_flags_fail_in_the_model_position();
     test_malformed_numeric_values_fail_closed();
     test_invalid_prompt_file_fails_before_model_open();
+    test_conflicting_prompt_sources_fail_closed();
+    test_explicit_empty_prompt_still_enters_generation();
     test_raw_gguf_with_incomplete_tokenizer_contract_fails_closed();
     test_untrusted_package_cannot_supply_a_context_limit();
     test_incomplete_codec_manifest_cannot_enter_default_generation();

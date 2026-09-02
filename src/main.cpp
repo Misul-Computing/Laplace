@@ -75,11 +75,49 @@ static bool parse_float_value(const char* text, double minimum, double maximum, 
 
 static void print_usage(const char* program) {
     fprintf(stderr,
+        "usage: %s <model-path> [options]\n"
+        "try '%s --help' for all options\n",
+        program, program);
+}
+
+static void print_help(const char* program) {
+    printf(
         "laplace - Apple Silicon native Metal inference engine\n"
-        "usage: %s <model-path> [-p prompt] [--prompt-file PATH] [-n N]\n"
-        "       [-t T] [--top-k K] [--top-p P] [--greedy] [--seed N]\n"
-        "       [--max-seq L] [--program-manifest PATH] [--raw-prompt] [--bench]\n",
-        program);
+        "\n"
+        "usage: %s <model-path> [options]\n"
+        "       %s -- <model-path> [options]   when the model path starts with '-'\n"
+        "\n"
+        "With no prompt options, prints package metadata and exits.\n"
+        "\n"
+        "prompt:\n"
+        "  -p <text>              generate from the given prompt text\n"
+        "  --prompt-file <path>   read prompt text from a file (max 16 MB)\n"
+        "  --raw-prompt           tokenize the prompt as-is, without the\n"
+        "                         model's chat template\n"
+        "  --program-manifest <path>\n"
+        "                         load a verified program package instead of\n"
+        "                         compiling the model package on the fly\n"
+        "\n"
+        "generation:\n"
+        "  -n <count>             tokens to generate (default: 200)\n"
+        "  --max-seq <length>     maximum sequence length, prompt included\n"
+        "                         (default: the package context, capped at 2048)\n"
+        "  --bench                report prefill and decode timing separately\n"
+        "\n"
+        "sampling:\n"
+        "  -t <value>             temperature; 0 selects greedy decoding\n"
+        "                         (default: 0.7)\n"
+        "  --top-k <count>        top-k filter, 0 = off (default: 40)\n"
+        "  --top-p <value>        nucleus probability mass, 0 < p <= 1\n"
+        "                         (default: 0.9)\n"
+        "  --greedy               greedy decoding; same as -t 0\n"
+        "  --seed <value>         sampler seed; 0 picks a fresh seed each run\n"
+        "                         (default: 0)\n"
+        "\n"
+        "example:\n"
+        "  %s /path/to/model.gguf -p \"Hello, Laplace\" -n 32 \\\n"
+        "      --greedy --seed 7 --max-seq 2048 --bench\n",
+        program, program, program);
 }
 
 static constexpr size_t kMaxPromptFileBytes = 16 * 1024 * 1024;
@@ -131,8 +169,8 @@ int main(int argc, char** argv) {
         print_usage(argv[0]);
         return 1;
     }
-    if (std::string(argv[1]) == "--help") {
-        print_usage(argv[0]);
+    if (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
+        print_help(argv[0]);
         return 0;
     }
 
@@ -152,6 +190,8 @@ int main(int argc, char** argv) {
 
     std::string prompt;
     std::string prompt_file;
+    bool prompt_from_arg = false;
+    bool prompt_from_file = false;
     std::string program_manifest;
     int n_tokens = 200;
     std::optional<uint32_t> requested_max_seq;
@@ -175,10 +215,15 @@ int main(int argc, char** argv) {
             const char* value = next_value("-p");
             if (!value) return 1;
             prompt = value;
+            prompt_from_arg = true;
         } else if (option == "--prompt-file") {
             const char* value = next_value("--prompt-file");
             if (!value) return 1;
             prompt_file = value;
+            prompt_from_file = true;
+        } else if (option == "-h" || option == "--help") {
+            print_help(argv[0]);
+            return 0;
         } else if (option == "-n") {
             const char* value = next_value("-n");
             if (!value) return 1;
@@ -244,7 +289,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (prompt.empty() && prompt_file.empty() && program_manifest.empty())
+    if (prompt_from_arg && prompt_from_file) {
+        fprintf(stderr, "use either -p or --prompt-file, not both\n");
+        return 1;
+    }
+    if (!prompt_from_arg && !prompt_from_file && program_manifest.empty())
         return run_dump(model_path);
     if (!prompt_file.empty() && !read_prompt_file(prompt_file, prompt)) return 1;
     return run_generate(model_path, program_manifest, prompt, n_tokens, sp,
@@ -253,7 +302,7 @@ int main(int argc, char** argv) {
 
 static int run_dump(const std::string& path) {
     GGUFContext ctx;
-    if (!ctx.open(path.c_str())) { fprintf(stderr, "failed to open %s\n", path.c_str()); return 1; }
+    if (!ctx.open(path.c_str())) { fprintf(stderr, "cannot load %s\n", path.c_str()); return 1; }
     const auto& m = ctx.metadata();
 
     auto arch = meta_str(m, "general.architecture");
