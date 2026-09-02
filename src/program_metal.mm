@@ -1397,10 +1397,9 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
         buffers.reserve(ordered.size());
         uint64_t upload_bytes = impl_->persistent_upload_bytes;
         for (const MetalProgramInput* input : ordered) {
-            std::vector<uint32_t> bits;
-            bits.reserve(input->value.bits.size());
-            for (uint64_t value : input->value.bits)
-                bits.push_back(static_cast<uint32_t>(value));
+            std::vector<uint32_t> bits(input->value.bits.size(), 0);
+            for (size_t index = 0; index < input->value.bits.size(); ++index)
+                bits[index] = static_cast<uint32_t>(input->value.bits[index]);
             const NSUInteger bytes = bits.size() * sizeof(uint32_t);
             id<MTLBuffer> buffer = [impl_->device
                 newBufferWithBytes:bits.data()
@@ -1606,11 +1605,11 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
             MetalProgramValue value;
             value.type = ElementType::F32;
             value.extents = impl_->output_extents;
-            value.bits.reserve(impl_->output_count);
+            value.bits.resize(impl_->output_count);
             const auto* output_data =
                 static_cast<const uint32_t*>(exported->second.contents);
             for (size_t index = 0; index < impl_->output_count; ++index)
-                value.bits.push_back(output_data[index]);
+                value.bits[index] = output_data[index];
             result.exports.push_back(std::move(value));
             result.audit.program_digest = impl_->digest;
             result.audit.lowering_digest = impl_->lowering;
@@ -1715,10 +1714,10 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
         MetalProgramValue value;
         value.type = ElementType::F32;
         value.extents = impl_->output_extents;
-        value.bits.reserve(impl_->output_count);
+        value.bits.resize(impl_->output_count);
         const auto* output_data = static_cast<const uint32_t*>(output.contents);
         for (size_t index = 0; index < impl_->output_count; ++index)
-            value.bits.push_back(output_data[index]);
+            value.bits[index] = output_data[index];
         result.exports.push_back(std::move(value));
         result.audit.program_digest = impl_->digest;
         result.audit.lowering_digest = impl_->lowering;
@@ -1794,10 +1793,10 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
             std::vector<id<MTLBuffer>> buffers;
             buffers.reserve(ordered.size());
             for (const MetalProgramInput* input : ordered) {
-                std::vector<uint32_t> bits;
-                bits.reserve(input->value.bits.size());
-                for (uint64_t value : input->value.bits)
-                    bits.push_back(static_cast<uint32_t>(value));
+                std::vector<uint32_t> bits(input->value.bits.size(), 0);
+                for (size_t index = 0; index < input->value.bits.size(); ++index)
+                    bits[index] =
+                        static_cast<uint32_t>(input->value.bits[index]);
                 const NSUInteger bytes = bits.size() * sizeof(uint32_t);
                 id<MTLBuffer> buffer = [impl_->device
                     newBufferWithBytes:bits.data()
@@ -2012,11 +2011,11 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
         MetalProgramValue value;
         value.type = ElementType::F32;
         value.extents = impl_->output_extents;
-        value.bits.reserve(impl_->output_count);
+        value.bits.resize(impl_->output_count);
         const auto* output_data =
             static_cast<const uint32_t*>(final_output.contents);
         for (size_t index = 0; index < impl_->output_count; ++index)
-            value.bits.push_back(output_data[index]);
+            value.bits[index] = output_data[index];
         result.exports.push_back(std::move(value));
         result.audit.program_digest = impl_->digest;
         result.audit.lowering_digest = impl_->lowering;
@@ -2116,8 +2115,9 @@ static MetalProgramCompileResult compile(
                 return metal_error(CompatibilityError::CAPABILITY_MISSING,
                                    "host page size is unavailable");
             const size_t page = static_cast<size_t>(raw_page);
-            std::vector<uint64_t> offsets;
-            offsets.reserve(lowering.physical_planes.size());
+            std::vector<uint64_t> offsets(
+                lowering.physical_planes.size(), 0);
+            size_t offset_index = 0;
             impl->planes.reserve(lowering.physical_planes.size());
             for (const Lowering::PhysicalPlane& requested :
                  lowering.physical_planes) {
@@ -2211,7 +2211,7 @@ static MetalProgramCompileResult compile(
                     return metal_error(
                         CompatibilityError::PLAN_MEMORY_EXCEEDED,
                         "Metal bound physical plane allocation failed");
-                offsets.push_back(plane.byte_offset);
+                offsets[offset_index++] = plane.byte_offset;
                 impl->persistent_plane_bytes += plane.length;
                 impl->planes.push_back(plane);
             }
@@ -2424,8 +2424,8 @@ static MetalProgramCompileResult compile(MultiLowering lowering,
             compiled.output_extents = std::move(stage.output_extents);
             compiled.output_count = stage.output_count;
             compiled.output_value_id = stage.output_value_id;
-            std::vector<uint64_t> offsets;
-            offsets.reserve(stage.physical_planes.size());
+            std::vector<uint64_t> offsets(stage.physical_planes.size(), 0);
+            size_t offset_index = 0;
             compiled.physical_plane_indices.reserve(
                 stage.physical_planes.size());
             for (const Lowering::PhysicalPlane& plane :
@@ -2436,7 +2436,8 @@ static MetalProgramCompileResult compile(MultiLowering lowering,
                     return *report;
                 const size_t plane_index = std::get<size_t>(bound);
                 compiled.physical_plane_indices.push_back(plane_index);
-                offsets.push_back(impl->planes[plane_index].byte_offset);
+                offsets[offset_index++] =
+                    impl->planes[plane_index].byte_offset;
             }
             if (!offsets.empty()) {
                 compiled.plane_offsets = [device

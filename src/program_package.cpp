@@ -665,6 +665,247 @@ ProgramPackageResult decode_container_program_package(
                           static_cast<size_t>(package_range->length)));
 }
 
+ProgramPackageWireResult encode_program_ingress_manifest(
+    const ProgramIngressManifest& manifest) {
+    if (manifest.major != 1 || manifest.minor != 0 ||
+        manifest.schemas.empty() || manifest.artifact_sections.empty()) {
+        return package_error(CompatibilityError::IMPORT_MANIFEST_INVALID,
+                             "program ingress manifest header is invalid");
+    }
+    try {
+        struct CanonicalSchema {
+            ContainerSchemaDigest digest;
+            ContainerSchemaProgram program;
+        };
+        std::vector<CanonicalSchema> schemas;
+        schemas.reserve(manifest.schemas.size());
+        for (const ContainerSchemaProgram& program : manifest.schemas) {
+            auto digest = container_schema_digest(program);
+            if (const auto* report =
+                    std::get_if<CompatibilityReport>(&digest))
+                return *report;
+            schemas.push_back({
+                std::get<ContainerSchemaDigest>(digest), program});
+        }
+        std::sort(schemas.begin(), schemas.end(),
+                  [](const CanonicalSchema& left,
+                     const CanonicalSchema& right) {
+                      return left.digest.bytes < right.digest.bytes;
+                  });
+        for (size_t index = 1; index < schemas.size(); ++index) {
+            if (schemas[index - 1].digest == schemas[index].digest) {
+                return package_error(
+                    CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS,
+                    "program ingress manifest repeats a container schema");
+            }
+        }
+        std::vector<ContainerSchemaProgram> canonical_schemas;
+        canonical_schemas.reserve(schemas.size());
+        for (CanonicalSchema& schema : schemas)
+            canonical_schemas.push_back(std::move(schema.program));
+        auto schema_wire = encode_container_schema_set(canonical_schemas);
+        if (const auto* report =
+                std::get_if<CompatibilityReport>(&schema_wire))
+            return *report;
+        const auto& encoded_schemas =
+            std::get<std::vector<uint8_t>>(schema_wire);
+        if (encoded_schemas.size() > UINT32_MAX ||
+            manifest.artifact_sections.size() > UINT32_MAX) {
+            return package_error(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                                 "program ingress manifest exceeds wire bounds");
+        }
+
+        std::vector<ContainerArtifactSection> sections =
+            manifest.artifact_sections;
+        std::sort(sections.begin(), sections.end(),
+                  [](const ContainerArtifactSection& left,
+                     const ContainerArtifactSection& right) {
+                      return std::tie(left.section_id,
+                                      left.artifact_id.value,
+                                      left.role) <
+                             std::tie(right.section_id,
+                                      right.artifact_id.value,
+                                      right.role);
+                  });
+        std::vector<uint32_t> artifact_ids;
+        artifact_ids.reserve(sections.size());
+        for (size_t index = 0; index < sections.size(); ++index) {
+            const ContainerArtifactSection& section = sections[index];
+            if (section.section_id == manifest.package_section_id ||
+                section.artifact_id.value == UINT32_MAX ||
+                (section.role != ArtifactRole::Primary &&
+                 section.role != ArtifactRole::Shard &&
+                 section.role != ArtifactRole::Sidecar)) {
+                return package_error(
+                    CompatibilityError::IMPORT_MANIFEST_INVALID,
+                    "program ingress artifact binding is invalid");
+            }
+            if (index != 0 &&
+                sections[index - 1].section_id == section.section_id) {
+                return package_error(
+                    CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS,
+                    "program ingress artifact section is repeated");
+            }
+            artifact_ids.push_back(section.artifact_id.value);
+        }
+        std::sort(artifact_ids.begin(), artifact_ids.end());
+        if (std::adjacent_find(artifact_ids.begin(), artifact_ids.end()) !=
+            artifact_ids.end()) {
+            return package_error(
+                CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS,
+                "program ingress artifact identity is repeated");
+        }
+
+        WireWriter writer;
+        static constexpr std::array<uint8_t, 8> magic = {
+            'L','A','P','I','N','G','0','1'};
+        writer.bytes(magic);
+        writer.u16(manifest.major);
+        writer.u16(manifest.minor);
+        writer.u32(0);
+        writer.u32(manifest.package_section_id);
+        writer.u32(static_cast<uint32_t>(sections.size()));
+        writer.u32(static_cast<uint32_t>(encoded_schemas.size()));
+        for (const ContainerArtifactSection& section : sections) {
+            writer.u32(section.section_id);
+            writer.u32(section.artifact_id.value);
+            writer.u8(static_cast<uint8_t>(section.role));
+            writer.u8(0);
+            writer.u16(0);
+        }
+        writer.bytes(encoded_schemas);
+        writer.bytes(std::array<uint8_t, 32>{});
+        std::vector<uint8_t> wire = writer.finish();
+        if (wire.size() > kProgramPackageWireLimit) {
+            return package_error(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                                 "program ingress manifest exceeds its bounded size");
+        }
+        const Sha256Digest digest = digest_bytes(
+            std::span<const uint8_t>(wire).first(wire.size() - 32));
+        std::copy(digest.bytes.begin(), digest.bytes.end(), wire.end() - 32);
+        return wire;
+    } catch (const std::bad_alloc&) {
+        return package_error(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                             "program ingress manifest allocation failed");
+    }
+}
+
+ProgramIngressManifestResult decode_program_ingress_manifest(
+    std::span<const uint8_t> wire) {
+    static constexpr std::array<uint8_t, 8> magic = {
+        'L','A','P','I','N','G','0','1'};
+    constexpr size_t minimum_size = 8 + 2 + 2 + 4 + 4 + 4 + 4 + 12 + 32;
+    if (wire.size() < minimum_size || wire.size() > kProgramPackageWireLimit ||
+        !std::equal(magic.begin(), magic.end(), wire.begin())) {
+        return package_error(CompatibilityError::PACKAGE_BAD_MAGIC,
+                             "program ingress manifest header is invalid");
+    }
+    const auto expected_digest = wire.last(32);
+    if (!std::equal(expected_digest.begin(), expected_digest.end(),
+                    digest_bytes(wire.first(wire.size() - 32)).bytes.begin())) {
+        return package_error(CompatibilityError::PACKAGE_CHECKSUM_MISMATCH,
+                             "program ingress manifest checksum does not match");
+    }
+    try {
+        WireReader reader(wire.subspan(8, wire.size() - 8 - 32));
+        ProgramIngressManifest manifest;
+        uint32_t total = 0;
+        uint32_t artifact_count = 0;
+        uint32_t schema_length = 0;
+        if (!reader.u16(&manifest.major) || !reader.u16(&manifest.minor) ||
+            !reader.u32(&total) ||
+            !reader.u32(&manifest.package_section_id) ||
+            !reader.u32(&artifact_count) || !reader.u32(&schema_length) ||
+            manifest.major != 1 || manifest.minor != 0 ||
+            total != wire.size() || artifact_count == 0 ||
+            artifact_count > 65'536) {
+            return package_error(CompatibilityError::IMPORT_MANIFEST_INVALID,
+                                 "program ingress manifest fields are invalid");
+        }
+        manifest.artifact_sections.reserve(artifact_count);
+        for (uint32_t index = 0; index < artifact_count; ++index) {
+            ContainerArtifactSection section;
+            uint8_t role = 0;
+            uint8_t reserved8 = 0;
+            uint16_t reserved16 = 0;
+            if (!reader.u32(&section.section_id) ||
+                !reader.u32(&section.artifact_id.value) ||
+                !reader.u8(&role) || !reader.u8(&reserved8) ||
+                !reader.u16(&reserved16) || reserved8 != 0 ||
+                reserved16 != 0) {
+                return package_error(
+                    CompatibilityError::IMPORT_MANIFEST_INVALID,
+                    "program ingress artifact binding is malformed");
+            }
+            section.role = static_cast<ArtifactRole>(role);
+            manifest.artifact_sections.push_back(section);
+        }
+        std::span<const uint8_t> schema_wire;
+        if (!reader.take(schema_length, &schema_wire) || !reader.finished()) {
+            return package_error(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                                 "program ingress schema range is invalid");
+        }
+        auto schemas = decode_container_schema_set(schema_wire);
+        if (const auto* report = std::get_if<CompatibilityReport>(&schemas))
+            return *report;
+        manifest.schemas =
+            std::get<std::vector<ContainerSchemaProgram>>(std::move(schemas));
+
+        auto canonical = encode_program_ingress_manifest(manifest);
+        if (const auto* report = std::get_if<CompatibilityReport>(&canonical))
+            return *report;
+        const auto& canonical_wire =
+            std::get<std::vector<uint8_t>>(canonical);
+        if (canonical_wire.size() != wire.size() ||
+            !std::equal(canonical_wire.begin(), canonical_wire.end(),
+                        wire.begin())) {
+            return package_error(CompatibilityError::IMPORT_MANIFEST_INVALID,
+                                 "program ingress manifest is not canonical");
+        }
+        return manifest;
+    } catch (const std::bad_alloc&) {
+        return package_error(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                             "program ingress manifest allocation failed");
+    }
+}
+
+ProgramPackageResult load_program_package(
+    const PackageView& container, std::span<const uint8_t> ingress_manifest) {
+    auto decoded = decode_program_ingress_manifest(ingress_manifest);
+    if (const auto* report = std::get_if<CompatibilityReport>(&decoded))
+        return *report;
+    ProgramIngressManifest manifest =
+        std::get<ProgramIngressManifest>(std::move(decoded));
+    return load_container_program_package(
+        container, manifest.schemas, manifest.artifact_sections,
+        manifest.package_section_id);
+}
+
+ProgramPackageResult load_program_package(
+    std::string_view container_path, std::string_view ingress_manifest_path) {
+    if (container_path.empty() || ingress_manifest_path.empty()) {
+        return package_error(CompatibilityError::RUNTIME_INPUT_INVALID,
+                             "program package paths are empty");
+    }
+    const std::array<ArtifactSource, 2> sources = {{
+        {container_path, ArtifactRole::Primary, ArtifactId{0}},
+        {ingress_manifest_path, ArtifactRole::Sidecar, ArtifactId{1}},
+    }};
+    auto loaded = ArtifactSet::load_graph(sources);
+    if (const auto* report = std::get_if<CompatibilityReport>(&loaded))
+        return *report;
+    ArtifactSet artifacts = std::get<ArtifactSet>(std::move(loaded));
+    auto container = artifacts.view(ArtifactId{0});
+    auto manifest = artifacts.view(ArtifactId{1});
+    if (const auto* report = std::get_if<CompatibilityReport>(&container))
+        return *report;
+    if (const auto* report = std::get_if<CompatibilityReport>(&manifest))
+        return *report;
+    const PackageView& container_view = std::get<PackageView>(container);
+    const PackageView& manifest_view = std::get<PackageView>(manifest);
+    return load_program_package(container_view, manifest_view.bytes());
+}
+
 ProgramPackageResult load_container_program_package(
     const PackageView& container,
     std::span<const ContainerSchemaProgram> schemas,

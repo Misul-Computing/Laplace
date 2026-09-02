@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -41,6 +42,14 @@ struct ContainerArtifactSection {
     ArtifactRole role = ArtifactRole::Primary;
     friend bool operator==(const ContainerArtifactSection&,
                            const ContainerArtifactSection&) = default;
+};
+
+struct ProgramIngressManifest {
+    uint16_t major = 1;
+    uint16_t minor = 0;
+    uint32_t package_section_id = 0;
+    std::vector<ContainerSchemaProgram> schemas;
+    std::vector<ContainerArtifactSection> artifact_sections;
 };
 
 class VerifiedProgramPackage {
@@ -88,6 +97,8 @@ using ProgramPackageResult =
     std::variant<VerifiedProgramPackage, CompatibilityReport>;
 using ProgramPackageWireResult =
     std::variant<std::vector<uint8_t>, CompatibilityReport>;
+using ProgramIngressManifestResult =
+    std::variant<ProgramIngressManifest, CompatibilityReport>;
 
 ProgramPackageResult build_program_package(
     ArtifactIndex physical, VerifiedProgram semantic,
@@ -113,5 +124,17 @@ ProgramPackageResult load_container_program_package(
     std::span<const ContainerSchemaProgram> schemas,
     std::span<const ContainerArtifactSection> artifact_sections,
     uint32_t package_section_id);
+
+ProgramPackageWireResult encode_program_ingress_manifest(
+    const ProgramIngressManifest& manifest);
+
+ProgramIngressManifestResult decode_program_ingress_manifest(
+    std::span<const uint8_t> wire);
+
+ProgramPackageResult load_program_package(
+    const PackageView& container, std::span<const uint8_t> ingress_manifest);
+
+ProgramPackageResult load_program_package(
+    std::string_view container_path, std::string_view ingress_manifest_path);
 
 } // namespace Laplace

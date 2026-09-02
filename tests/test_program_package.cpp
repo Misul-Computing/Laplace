@@ -549,6 +549,80 @@ void test_container_handoff_uses_verified_package_decoder() {
         CHECK(failure->code == CompatibilityError::IMPORT_SCHEMA_AMBIGUOUS);
 }
 
+ProgramIngressManifest product_ingress_manifest() {
+    ProgramIngressManifest manifest;
+    manifest.package_section_id = 23;
+    manifest.schemas = {product_container_schema()};
+    manifest.artifact_sections = {
+        {41, ArtifactId{7}, ArtifactRole::Primary},
+        {42, ArtifactId{2}, ArtifactRole::Shard},
+    };
+    return manifest;
+}
+
+void test_external_ingress_manifest_drives_verified_loader() {
+    Fixture source = fixture();
+    auto package = build(source);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
+    if (!std::holds_alternative<VerifiedProgramPackage>(package)) return;
+    auto package_wire = encode_program_package(
+        std::get<VerifiedProgramPackage>(package));
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(package_wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(package_wire)) return;
+
+    const auto container_bytes = product_container(
+        source.index, std::get<std::vector<uint8_t>>(package_wire));
+    auto container = ArtifactSet::make_owned_blob(
+        ArtifactId{99}, ArtifactRole::Primary, container_bytes);
+    CHECK(std::holds_alternative<PackageView>(container));
+    if (!std::holds_alternative<PackageView>(container)) return;
+
+    const ProgramIngressManifest manifest = product_ingress_manifest();
+    auto ingress_wire = encode_program_ingress_manifest(manifest);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(ingress_wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(ingress_wire)) return;
+    const auto& wire = std::get<std::vector<uint8_t>>(ingress_wire);
+    auto decoded = decode_program_ingress_manifest(wire);
+    CHECK(std::holds_alternative<ProgramIngressManifest>(decoded));
+    if (const auto* value = std::get_if<ProgramIngressManifest>(&decoded)) {
+        CHECK(value->package_section_id == manifest.package_section_id);
+        CHECK(value->artifact_sections == manifest.artifact_sections);
+        CHECK(value->schemas.size() == manifest.schemas.size());
+    }
+
+    auto loaded = load_program_package(
+        std::get<PackageView>(container), wire);
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(loaded));
+    if (const auto* verified = std::get_if<VerifiedProgramPackage>(&loaded))
+        CHECK(verified->digest() ==
+              std::get<VerifiedProgramPackage>(package).digest());
+
+    auto corrupt = wire;
+    corrupt.back() ^= 1;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        decode_program_ingress_manifest(corrupt)));
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        load_program_package(std::get<PackageView>(container), corrupt)));
+
+    ProgramIngressManifest duplicate = manifest;
+    duplicate.artifact_sections[1].section_id =
+        duplicate.artifact_sections[0].section_id;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_program_ingress_manifest(duplicate)));
+
+    ProgramIngressManifest invalid_role = manifest;
+    invalid_role.artifact_sections[0].role =
+        static_cast<ArtifactRole>(UINT8_MAX);
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_program_ingress_manifest(invalid_role)));
+
+    ProgramIngressManifest colliding_package = manifest;
+    colliding_package.artifact_sections[0].section_id =
+        colliding_package.package_section_id;
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        encode_program_ingress_manifest(colliding_package)));
+}
+
 bool write_bytes(const char* path, std::span<const uint8_t> bytes) {
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
     output.write(reinterpret_cast<const char*>(bytes.data()),
@@ -621,30 +695,9 @@ int load_external_container(const char* schema_path, const char* container_path)
     return test_summary("test_unseen_container_schema");
 }
 
-int load_external_product_container(const char* schema_path,
+int load_external_product_container(const char* manifest_path,
                                     const char* container_path) {
-    const auto schema_wire = read_bytes(schema_path);
-    const auto decoded_schemas = decode_container_schema_set(schema_wire);
-    CHECK(std::holds_alternative<std::vector<ContainerSchemaProgram>>(
-        decoded_schemas));
-    auto loaded = ArtifactSet::load_single_file(container_path);
-    CHECK(std::holds_alternative<ArtifactSet>(loaded));
-    if (!std::holds_alternative<std::vector<ContainerSchemaProgram>>(
-            decoded_schemas) ||
-        !std::holds_alternative<ArtifactSet>(loaded))
-        return test_summary("test_unseen_container_product");
-    auto container = std::get<ArtifactSet>(std::move(loaded)).view(ArtifactId{0});
-    CHECK(std::holds_alternative<PackageView>(container));
-    if (!std::holds_alternative<PackageView>(container))
-        return test_summary("test_unseen_container_product");
-    const std::array<ContainerArtifactSection, 2> sections = {{
-        {41, ArtifactId{7}, ArtifactRole::Primary},
-        {42, ArtifactId{2}, ArtifactRole::Shard},
-    }};
-    const auto package = load_container_program_package(
-        std::get<PackageView>(container),
-        std::get<std::vector<ContainerSchemaProgram>>(decoded_schemas),
-        sections, 23);
+    const auto package = load_program_package(container_path, manifest_path);
     CHECK(std::holds_alternative<VerifiedProgramPackage>(package));
     if (const auto* verified = std::get_if<VerifiedProgramPackage>(&package))
         CHECK(verified->complete());
@@ -760,5 +813,6 @@ int main(int argc, char** argv) {
     test_token_binding_and_provenance_counterexamples();
     test_container_handoff_uses_verified_package_decoder();
     test_container_loader_builds_artifact_index();
+    test_external_ingress_manifest_drives_verified_loader();
     return test_summary("test_program_package");
 }

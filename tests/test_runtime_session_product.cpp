@@ -874,6 +874,185 @@ std::optional<VerifiedProgramPackage> make_program_session_package(
     return std::get<VerifiedProgramPackage>(std::move(package));
 }
 
+ContainerSchemaProgram program_session_container_schema(uint64_t page_size) {
+    ContainerSchemaProgram program;
+    program.register_count = 7;
+    program.predicate_count = 1;
+    ContainerSchemaInstruction match;
+    match.opcode = ContainerSchemaOpcode::MatchBytes;
+    match.literal = {'L', 'P', 'S', 'X'};
+    ContainerSchemaInstruction weight_length;
+    weight_length.opcode = ContainerSchemaOpcode::ReadU64Le;
+    weight_length.destination = 0;
+    ContainerSchemaInstruction token_length = weight_length;
+    token_length.destination = 1;
+    ContainerSchemaInstruction package_length = weight_length;
+    package_length.destination = 2;
+    ContainerSchemaInstruction alignment;
+    alignment.opcode = ContainerSchemaOpcode::SetConstant;
+    alignment.destination = 6;
+    alignment.immediate = page_size;
+    ContainerSchemaInstruction align;
+    align.opcode = ContainerSchemaOpcode::AlignCursor;
+    align.input_a = 6;
+    const auto emit = [](uint32_t cursor_register, uint32_t length_register,
+                         uint32_t section_id) {
+        std::array<ContainerSchemaInstruction, 3> result;
+        result[0].opcode = ContainerSchemaOpcode::CaptureCursor;
+        result[0].destination = cursor_register;
+        result[1].opcode = ContainerSchemaOpcode::EmitRange;
+        result[1].input_a = cursor_register;
+        result[1].input_b = length_register;
+        result[1].section_id = section_id;
+        result[2].opcode = ContainerSchemaOpcode::Advance;
+        result[2].input_a = length_register;
+        return result;
+    };
+    const auto weights = emit(3, 0, 41);
+    const auto tokens = emit(4, 1, 42);
+    const auto package = emit(5, 2, 23);
+    ContainerSchemaInstruction end;
+    end.opcode = ContainerSchemaOpcode::RequireCursorEnd;
+    program.instructions = {
+        match, weight_length, token_length, package_length,
+        alignment, align,
+        weights[0], weights[1], weights[2],
+        align,
+        tokens[0], tokens[1], tokens[2],
+        align,
+        package[0], package[1], package[2], end};
+    return program;
+}
+
+std::vector<uint8_t> program_session_container(
+    const VerifiedProgramPackage& package,
+    std::span<const uint8_t> package_wire, size_t page_size) {
+    const ArtifactIndex& index = package.physical_package().physical_index();
+    const PackageView* weights = nullptr;
+    const PackageView* tokens = nullptr;
+    for (const PackageView& artifact : index.artifacts()) {
+        if (artifact.artifact_id() == ArtifactId{0}) weights = &artifact;
+        if (artifact.artifact_id() == ArtifactId{2}) tokens = &artifact;
+    }
+    CHECK(weights != nullptr);
+    CHECK(tokens != nullptr);
+    if (!weights || !tokens) return {};
+    std::vector<uint8_t> result = {'L', 'P', 'S', 'X'};
+    const auto append_u64 = [&](uint64_t value) {
+        for (unsigned shift = 0; shift != 64; shift += 8)
+            result.push_back(static_cast<uint8_t>(value >> shift));
+    };
+    append_u64(weights->bytes().size());
+    append_u64(tokens->bytes().size());
+    append_u64(package_wire.size());
+    const auto align = [&](std::vector<uint8_t>& bytes) {
+        const size_t remainder = bytes.size() % page_size;
+        if (remainder != 0) bytes.resize(bytes.size() + page_size - remainder, 0);
+    };
+    align(result);
+    result.insert(result.end(), weights->bytes().begin(), weights->bytes().end());
+    align(result);
+    result.insert(result.end(), tokens->bytes().begin(), tokens->bytes().end());
+    align(result);
+    result.insert(result.end(), package_wire.begin(), package_wire.end());
+    return result;
+}
+
+void test_program_ingress_creates_runtime_session() {
+    auto source = make_program_session_package();
+    CHECK(source.has_value());
+    if (!source) return;
+    auto package_wire = encode_program_package(*source);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(package_wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(package_wire)) return;
+    const long native_page_size = sysconf(_SC_PAGESIZE);
+    CHECK(native_page_size > 0);
+    if (native_page_size <= 0) return;
+    const size_t page_size = static_cast<size_t>(native_page_size);
+    const auto container = program_session_container(
+        *source, std::get<std::vector<uint8_t>>(package_wire), page_size);
+
+    ProgramIngressManifest manifest;
+    manifest.package_section_id = 23;
+    manifest.schemas = {
+        program_session_container_schema(static_cast<uint64_t>(page_size))};
+    manifest.artifact_sections = {
+        {41, ArtifactId{0}, ArtifactRole::Primary},
+        {42, ArtifactId{2}, ArtifactRole::Shard},
+    };
+    auto ingress_wire = encode_program_ingress_manifest(manifest);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(ingress_wire));
+    if (!std::holds_alternative<std::vector<uint8_t>>(ingress_wire)) return;
+
+    const std::string container_path = temporary_path(
+        "/private/tmp/laplace-program-ingress-container-XXXXXX");
+    const std::string manifest_path = temporary_path(
+        "/private/tmp/laplace-program-ingress-manifest-XXXXXX");
+    CHECK(write_bytes(container_path, container));
+    CHECK(write_bytes(manifest_path,
+                      std::get<std::vector<uint8_t>>(ingress_wire)));
+    auto loaded = load_program_package(container_path, manifest_path);
+    unlink(container_path.c_str());
+    unlink(manifest_path.c_str());
+    CHECK(std::holds_alternative<VerifiedProgramPackage>(loaded));
+    if (!std::holds_alternative<VerifiedProgramPackage>(loaded)) return;
+    VerifiedProgramPackage verified =
+        std::get<VerifiedProgramPackage>(std::move(loaded));
+    CHECK(verified.digest() == source->digest());
+
+    SessionRequest program_request;
+    program_request.max_context = 4;
+    program_request.max_batch = 1;
+    program_request.enable_prefill = true;
+    program_request.enable_decode = true;
+    auto created = create_runtime_session(verified, program_request);
+    const auto* create_error = std::get_if<CompatibilityReport>(&created);
+    CHECK_MSG(std::holds_alternative<RuntimeSession>(created),
+              "ingress program session create code=%u detail=%s",
+              create_error ? static_cast<unsigned>(create_error->code) : 0,
+              create_error ? create_error->detail.c_str() : "none");
+    if (!std::holds_alternative<RuntimeSession>(created)) return;
+    RuntimeSession session = std::get<RuntimeSession>(std::move(created));
+    const uint32_t token = 3;
+    auto output = session.prefill(std::span<const uint32_t>(&token, 1));
+    CHECK(std::holds_alternative<RuntimeOutput>(output));
+    if (const auto* result = std::get_if<RuntimeOutput>(&output)) {
+        CHECK(result->logits ==
+              std::vector<float>({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
+        CHECK(result->token_history == std::vector<uint32_t>({3}));
+        CHECK(result->command_buffers == 1);
+        CHECK(result->completed);
+    }
+}
+
+bool emit_program_ingress_fixture(const std::string& container_path,
+                                  const std::string& manifest_path) {
+    auto source = make_program_session_package();
+    if (!source) return false;
+    auto package_wire = encode_program_package(*source);
+    if (!std::holds_alternative<std::vector<uint8_t>>(package_wire))
+        return false;
+    const long native_page_size = sysconf(_SC_PAGESIZE);
+    if (native_page_size <= 0) return false;
+    const size_t page_size = static_cast<size_t>(native_page_size);
+    const auto container = program_session_container(
+        *source, std::get<std::vector<uint8_t>>(package_wire), page_size);
+    ProgramIngressManifest manifest;
+    manifest.package_section_id = 23;
+    manifest.schemas = {
+        program_session_container_schema(static_cast<uint64_t>(page_size))};
+    manifest.artifact_sections = {
+        {41, ArtifactId{0}, ArtifactRole::Primary},
+        {42, ArtifactId{2}, ArtifactRole::Shard},
+    };
+    auto ingress_wire = encode_program_ingress_manifest(manifest);
+    if (!std::holds_alternative<std::vector<uint8_t>>(ingress_wire))
+        return false;
+    return write_bytes(container_path, container) &&
+           write_bytes(manifest_path,
+                       std::get<std::vector<uint8_t>>(ingress_wire));
+}
+
 void test_verified_program_package_creates_runtime_session() {
     auto package = make_program_session_package();
     CHECK(package.has_value());
@@ -1871,7 +2050,10 @@ void test_recurrent_product_device_sampler(const ProductFixture& fixture) {
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 4 && std::strcmp(argv[1], "--emit-program-ingress") == 0)
+        return emit_program_ingress_fixture(argv[2], argv[3]) ? 0 : 1;
     if (argc == 2 && std::strcmp(argv[1], "--program-session") == 0) {
+        test_program_ingress_creates_runtime_session();
         test_verified_program_package_creates_runtime_session();
         test_stateful_program_package_publishes_gpu_state();
         test_program_sequence_failure_does_not_publish_state();

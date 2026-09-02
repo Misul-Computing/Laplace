@@ -6,7 +6,7 @@
 // Usage:
 //   laplace <model-path> [-p prompt] [--prompt-file PATH] [-n N]
 //          [-t T] [--top-k K] [--top-p P] [--greedy] [--seed N]
-//          [--max-seq L] [--raw-prompt] [--bench]
+//          [--max-seq L] [--program-manifest PATH] [--raw-prompt] [--bench]
 //
 // If no prompt is given, dumps model metadata.
 #include <algorithm>
@@ -31,6 +31,7 @@
 #include "gguf.h"
 #include "generation_loop.h"
 #include "product_package.h"
+#include "program_package.h"
 #include "runtime_session.h"
 #include "sampler.h"
 
@@ -38,13 +39,14 @@
 using namespace Laplace;
 
 static int run_dump(const std::string& path);
-static int run_generate_canonical(const std::string& path,
-                                  const std::string& prompt,
-                                  int n_tokens,
-                                  const SamplerParams& sp,
-                                  std::optional<uint32_t> requested_max_seq,
-                                  bool use_template,
-                                  bool bench);
+static int run_generate(const std::string& path,
+                        const std::string& program_manifest,
+                        const std::string& prompt,
+                        int n_tokens,
+                        const SamplerParams& sp,
+                        std::optional<uint32_t> requested_max_seq,
+                        bool use_template,
+                        bool bench);
 
 static bool parse_int_value(const char* text, int minimum, int maximum, int& value) {
     if (!text || *text == '\0') return false;
@@ -76,7 +78,7 @@ static void print_usage(const char* program) {
         "laplace - Apple Silicon native Metal inference engine\n"
         "usage: %s <model-path> [-p prompt] [--prompt-file PATH] [-n N]\n"
         "       [-t T] [--top-k K] [--top-p P] [--greedy] [--seed N]\n"
-        "       [--max-seq L] [--raw-prompt] [--bench]\n",
+        "       [--max-seq L] [--program-manifest PATH] [--raw-prompt] [--bench]\n",
         program);
 }
 
@@ -150,6 +152,7 @@ int main(int argc, char** argv) {
 
     std::string prompt;
     std::string prompt_file;
+    std::string program_manifest;
     int n_tokens = 200;
     std::optional<uint32_t> requested_max_seq;
     bool use_template = true;
@@ -227,6 +230,10 @@ int main(int argc, char** argv) {
                 return 1;
             }
             requested_max_seq = static_cast<uint32_t>(parsed);
+        } else if (option == "--program-manifest") {
+            const char* value = next_value("--program-manifest");
+            if (!value) return 1;
+            program_manifest = value;
         } else if (option == "--raw-prompt") {
             use_template = false;
         } else if (option == "--bench") {
@@ -237,10 +244,11 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (prompt.empty() && prompt_file.empty()) return run_dump(model_path);
+    if (prompt.empty() && prompt_file.empty() && program_manifest.empty())
+        return run_dump(model_path);
     if (!prompt_file.empty() && !read_prompt_file(prompt_file, prompt)) return 1;
-    return run_generate_canonical(model_path, prompt, n_tokens, sp, requested_max_seq,
-                                  use_template, bench);
+    return run_generate(model_path, program_manifest, prompt, n_tokens, sp,
+                        requested_max_seq, use_template, bench);
 }
 
 static int run_dump(const std::string& path) {
@@ -259,65 +267,120 @@ static int run_dump(const std::string& path) {
     return 0;
 }
 
-static int run_generate_canonical(const std::string& path,
-                                  const std::string& prompt,
-                                  int n_tokens,
-                                  const SamplerParams& sp,
-                                  std::optional<uint32_t> requested_max_seq,
-                                  bool use_template,
-                                  bool bench) {
+static int run_generate(const std::string& path,
+                        const std::string& program_manifest,
+                        const std::string& prompt,
+                        int n_tokens,
+                        const SamplerParams& sp,
+                        std::optional<uint32_t> requested_max_seq,
+                        bool use_template,
+                        bool bench) {
     if (n_tokens < 0) {
         fprintf(stderr, "canonical: invalid generation bounds\n");
         return 1;
     }
 
-    auto loaded = load_product_package(path);
-    if (const auto* report = std::get_if<CompatibilityReport>(&loaded)) {
-        fprintf(stderr, "product package: code=%u artifact=%u detail=%s\n",
-                static_cast<unsigned>(report->code), report->artifact_id.value,
-                report->detail.c_str());
-        return 1;
-    }
-    ProductPackage product = std::get<ProductPackage>(std::move(loaded));
-    const std::shared_ptr<const RuntimePackage> package = product.runtime_package();
-    const TokenProgram& tokenizer = product.token_program();
-    const SemanticModel& semantics = package->semantics();
-    const uint32_t max_seq = requested_max_seq.value_or(
-        std::min<uint32_t>(2048, semantics.maximum_context));
-    if (max_seq == 0 || max_seq > semantics.maximum_context) {
-        if (requested_max_seq) {
-            fprintf(stderr, "max-seq %u exceeds package maximum %u\n",
-                    *requested_max_seq, semantics.maximum_context);
-        } else {
-            fprintf(stderr, "canonical: package maximum context is invalid\n");
-        }
-        return 1;
-    }
+    std::optional<ProductPackage> product;
+    std::optional<VerifiedProgramPackage> program;
+    std::shared_ptr<const RuntimePackage> legacy_package;
+    const TokenProgram* tokenizer = nullptr;
+    uint32_t vocabulary_size = 0;
+    uint32_t eos_id = kTokenProgramNoTokenId;
+    std::vector<uint32_t> stop_ids;
+    uint32_t route_units = 0;
+    const char* route_name = nullptr;
+    bool device_greedy = false;
+    uint32_t max_seq = 0;
+
     SessionRequest request;
-    request.max_context = max_seq;
     request.max_batch = 1;
     request.memory_limit = UINT64_MAX;
     request.enable_prefill = true;
     request.enable_decode = true;
     request.minimum_class = NumericalClass::ExactFp32;
     request.objective = RuntimeObjective::Latency;
-    auto created = create_runtime_session(product, request);
-    if (const auto* report = std::get_if<CompatibilityReport>(&created)) {
-        fprintf(stderr, "runtime session: code=%u operator=%u detail=%s\n",
-                static_cast<unsigned>(report->code), report->operator_id, report->detail.c_str());
-        return 1;
+
+    std::optional<RuntimeSession> session_owner;
+    if (!program_manifest.empty()) {
+        auto loaded = load_program_package(path, program_manifest);
+        if (const auto* report = std::get_if<CompatibilityReport>(&loaded)) {
+            fprintf(stderr, "program package: code=%u artifact=%u detail=%s\n",
+                    static_cast<unsigned>(report->code), report->artifact_id.value,
+                    report->detail.c_str());
+            return 1;
+        }
+        program.emplace(
+            std::get<VerifiedProgramPackage>(std::move(loaded)));
+        tokenizer = &program->token_program();
+        vocabulary_size = static_cast<uint32_t>(
+            tokenizer->definition().vocabulary.size());
+        eos_id = tokenizer->definition().postprocessor.eos_token_id;
+        stop_ids = tokenizer->definition().stop_ids;
+        max_seq = requested_max_seq.value_or(2048);
+        request.max_context = max_seq;
+        auto created = create_runtime_session(*program, request);
+        if (const auto* report = std::get_if<CompatibilityReport>(&created)) {
+            fprintf(stderr, "runtime session: code=%u operator=%u detail=%s\n",
+                    static_cast<unsigned>(report->code), report->operator_id,
+                    report->detail.c_str());
+            return 1;
+        }
+        session_owner.emplace(
+            std::get<RuntimeSession>(std::move(created)));
+        route_units = static_cast<uint32_t>(
+            program_definition(program->semantic_program()).functions.size());
+        route_name = "program";
+    } else {
+        auto loaded = load_product_package(path);
+        if (const auto* report = std::get_if<CompatibilityReport>(&loaded)) {
+            fprintf(stderr, "product package: code=%u artifact=%u detail=%s\n",
+                    static_cast<unsigned>(report->code), report->artifact_id.value,
+                    report->detail.c_str());
+            return 1;
+        }
+        product.emplace(std::get<ProductPackage>(std::move(loaded)));
+        legacy_package = product->runtime_package();
+        tokenizer = &product->token_program();
+        const SemanticModel& semantics = legacy_package->semantics();
+        vocabulary_size = semantics.vocabulary_size;
+        eos_id = semantics.eos_id;
+        stop_ids = semantics.stop_ids;
+        max_seq = requested_max_seq.value_or(
+            std::min<uint32_t>(2048, semantics.maximum_context));
+        if (max_seq == 0 || max_seq > semantics.maximum_context) {
+            if (requested_max_seq) {
+                fprintf(stderr, "max-seq %u exceeds package maximum %u\n",
+                        *requested_max_seq, semantics.maximum_context);
+            } else {
+                fprintf(stderr, "canonical: package maximum context is invalid\n");
+            }
+            return 1;
+        }
+        request.max_context = max_seq;
+        auto created = create_runtime_session(*product, request);
+        if (const auto* report = std::get_if<CompatibilityReport>(&created)) {
+            fprintf(stderr, "runtime session: code=%u operator=%u detail=%s\n",
+                    static_cast<unsigned>(report->code), report->operator_id,
+                    report->detail.c_str());
+            return 1;
+        }
+        session_owner.emplace(
+            std::get<RuntimeSession>(std::move(created)));
+        route_units = static_cast<uint32_t>(semantics.layers.size());
+        route_name = "canonical";
+        device_greedy = sp.temperature == 0.0f;
     }
-    RuntimeSession session = std::get<RuntimeSession>(std::move(created));
-    const bool device_greedy = sp.temperature == 0.0f;
-    fprintf(stderr, "[canonical] Metal session: %u layers, vocab=%u, FP32 persistent state\n",
-            static_cast<unsigned>(package->semantics().layers.size()),
-            package->semantics().vocabulary_size);
-    fprintf(stderr, "[canonical] sampling: %s\n",
+    if (!tokenizer || !session_owner || vocabulary_size == 0 || max_seq == 0)
+        return 1;
+    RuntimeSession session = std::move(*session_owner);
+    fprintf(stderr, "[%s] Metal session: %u program units, vocab=%u, transactional state\n",
+            route_name, route_units, vocabulary_size);
+    fprintf(stderr, "[%s] sampling: %s\n", route_name,
             device_greedy ? "Metal greedy (16-byte host result)" : "host sampling (full logits)");
 
     std::string rendered_prompt = prompt;
     if (use_template) {
-        auto rendered = tokenizer.render_prompt(prompt);
+        auto rendered = tokenizer->render_prompt(prompt);
         if (const auto* status = std::get_if<TokenProgramStatus>(&rendered)) {
             fprintf(stderr, "tokenizer prompt: code=%u detail=%s\n",
                     static_cast<unsigned>(status->error), status->detail.c_str());
@@ -325,7 +388,7 @@ static int run_generate_canonical(const std::string& path,
         }
         rendered_prompt = std::get<std::string>(std::move(rendered));
     }
-    auto encoded = tokenizer.encode(rendered_prompt);
+    auto encoded = tokenizer->encode(rendered_prompt);
     if (const auto* status = std::get_if<TokenProgramStatus>(&encoded)) {
         fprintf(stderr, "tokenizer encode: code=%u detail=%s\n",
                 static_cast<unsigned>(status->error), status->detail.c_str());
@@ -337,7 +400,7 @@ static int run_generate_canonical(const std::string& path,
         return 1;
     }
     for (uint32_t token : prompt_tokens) {
-        if (token >= package->semantics().vocabulary_size) {
+        if (token >= vocabulary_size) {
             fprintf(stderr, "RUNTIME_INPUT_INVALID: tokenizer produced token outside canonical vocabulary\n");
             return 1;
         }
@@ -372,7 +435,7 @@ static int run_generate_canonical(const std::string& path,
     if (!device_greedy) sampler.emplace(sp);
     auto emit = [&](uint32_t token) {
         const std::array<uint32_t, 1> one = {token};
-        auto decoded = tokenizer.decode(one);
+        auto decoded = tokenizer->decode(one);
         if (const auto* status = std::get_if<TokenProgramStatus>(&decoded)) {
             fprintf(stderr, "tokenizer decode: code=%u detail=%s\n",
                     static_cast<unsigned>(status->error), status->detail.c_str());
@@ -383,15 +446,16 @@ static int run_generate_canonical(const std::string& path,
         return true;
     };
     const auto is_stop = [&](int token) {
-        if (token < 0 || static_cast<uint32_t>(token) == semantics.eos_id) return true;
-        return std::find(semantics.stop_ids.begin(), semantics.stop_ids.end(),
-                         static_cast<uint32_t>(token)) != semantics.stop_ids.end();
+        if (token < 0) return true;
+        const uint32_t value = static_cast<uint32_t>(token);
+        if (eos_id != kTokenProgramNoTokenId && value == eos_id) return true;
+        return std::find(stop_ids.begin(), stop_ids.end(), value) != stop_ids.end();
     };
 
     const auto select_token = [&](const RuntimeOutput& output, int& token) {
         if (device_greedy) {
             if (!output.sampled || output.host_result_bytes != 16 ||
-                output.sampled_token_id >= semantics.vocabulary_size ||
+                output.sampled_token_id >= vocabulary_size ||
                 output.sampled_token_id > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
                 fprintf(stderr, "canonical sampler returned an invalid Metal result\n");
                 return false;

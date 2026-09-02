@@ -74,6 +74,19 @@ def encode_schema_set(programs):
     return header + body + set_digest.digest()
 
 
+def encode_ingress_manifest(schema_wire, package_section, bindings):
+    bindings = sorted(bindings)
+    body = bytearray()
+    for section, artifact, role in bindings:
+        body.extend(struct.pack("<IIBBH", section, artifact, role, 0, 0))
+    body.extend(schema_wire)
+    total = 28 + len(body) + 32
+    header = struct.pack("<8sHHIIII", b"LAPING01", 1, 0, total,
+                         package_section, len(bindings), len(schema_wire))
+    prefix = header + body
+    return prefix + hashlib.sha256(prefix).digest()
+
+
 def unseen_schema():
     return {
         "major": 1,
@@ -163,7 +176,9 @@ def main():
         container = (b"PRDX" + struct.pack("<QQQ", len(weights), len(token),
                                            len(package)) + weights + token +
                      package)
-        schema_path.write_bytes(encode_schema_set([unseen_product_schema()]))
+        product_schema = encode_schema_set([unseen_product_schema()])
+        schema_path.write_bytes(encode_ingress_manifest(
+            product_schema, 23, [(41, 7, 1), (42, 2, 2)]))
         container_path.write_bytes(container)
         run([binary, "--load-container-product-schema", str(schema_path),
              str(container_path)])

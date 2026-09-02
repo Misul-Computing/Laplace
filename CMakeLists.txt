@@ -651,9 +651,16 @@ if(APPLE)
     add_test(NAME test_runtime_session_product COMMAND test_runtime_session_product)
     add_test(NAME test_runtime_program_session
         COMMAND test_runtime_session_product --program-session)
+    add_test(NAME test_program_cli
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_SOURCE_DIR}/tests/run_program_cli.py
+            $<TARGET_FILE:laplace>
+            $<TARGET_FILE:test_runtime_session_product>)
     set_tests_properties(test_runtime_session_product PROPERTIES
         SKIP_REGULAR_EXPRESSION "SKIP: product Metal device unavailable")
     set_tests_properties(test_runtime_program_session PROPERTIES
+        SKIP_REGULAR_EXPRESSION "SKIP: product Metal device unavailable")
+    set_tests_properties(test_program_cli PROPERTIES
         SKIP_REGULAR_EXPRESSION "SKIP: product Metal device unavailable")
 
     add_executable(test_product_metal_codec_capabilities
