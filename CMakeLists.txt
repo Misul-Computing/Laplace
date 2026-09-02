@@ -986,6 +986,9 @@ if(APPLE)
     target_link_libraries(bench_kvcache PRIVATE ${LAPLACE_ACCELERATE_FW})
 endif()
 
+add_executable(bench_sampler tests/bench_sampler.cpp src/sampler.cpp)
+target_include_directories(bench_sampler PRIVATE src)
+
 # Tools
 add_executable(dump_meta tools/dump_meta.cpp src/gguf.cpp src/mmap.cpp)
 target_include_directories(dump_meta PRIVATE src)
