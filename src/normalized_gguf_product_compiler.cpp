@@ -333,6 +333,7 @@ std::optional<SemanticTensor> semantic_tensor(const ArtifactTensorRecord& physic
 
 struct LayerRefs {
     uint32_t attn_norm, q, k, v, q_norm, k_norm, attn_out, ffn_norm, gate, up, down;
+    uint32_t q_bias, k_bias, v_bias;
     uint32_t route_scale, router, expert_norm, expert_up, expert_down, reduce;
     uint32_t post_dense, post_moe, post_output, output_scale;
 };
@@ -445,6 +446,8 @@ std::vector<uint8_t> certificate_for_tensor(const SemanticTensor& tensor) {
         return make_q4_k_codec_certificate();
     if (has_gguf_physical_tuple(tensor, 32, 22, static_cast<ScalarType>(0)))
         return make_q5_0_codec_certificate();
+    if (has_gguf_physical_tuple(tensor, 32, 34, static_cast<ScalarType>(0)))
+        return make_q8_0_codec_certificate();
     if (has_gguf_physical_tuple(tensor, 256, 210, static_cast<ScalarType>(0)))
         return make_q6_k_codec_certificate();
     return {};
@@ -527,13 +530,24 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     const auto rope_base = fact_f32(physical, rope_freq_base);
     const auto bos = fact_u32(physical, bos_token_id);
     const auto eos = fact_u32(physical, eos_token_id);
-    if (!layers || !hidden || !experts || !selected || !expert_inter || !epsilon ||
+    const auto sliding_window = fact_u32(physical, attention_sliding_window);
+    if (!layers || !hidden || !epsilon ||
         !maximum_context || !q_heads_fact || !rope_base || !bos || !eos ||
-        *layers == 0 || *layers > 4096 || *hidden == 0 || *experts == 0 || *selected == 0 ||
-        *selected > *experts || *selected > 16 || *expert_inter == 0 ||
+        *layers == 0 || *layers > 4096 || *hidden == 0 ||
         *maximum_context == 0 || *maximum_context > 262144 || *q_heads_fact == 0) {
         return std::nullopt;
     }
+    // Routed-expert facts are all-or-nothing: a source either carries the
+    // complete routed contract or is a plain dense model.
+    const bool moe_source = experts.has_value() || selected.has_value() || expert_inter.has_value();
+    if (moe_source && (!experts || !selected || !expert_inter ||
+                   *experts == 0 || *selected == 0 ||
+                   *selected > *experts || *selected > 16 || *expert_inter == 0)) {
+        return std::nullopt;
+    }
+    // Windowed attention needs a windowed cache graph; fail closed instead
+    // of silently building a global-attention plan for a windowed source.
+    if (sliding_window && *sliding_window != 0) return std::nullopt;
 
     // Vocabulary and projection geometry come from typed tensor coordinates
     // and declared dimensions.  This is also the cross-check that prevents a
@@ -550,15 +564,16 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         k_tensor->logical_dimensions.size() != 2 || v_tensor->logical_dimensions.size() != 2 ||
         q_tensor->logical_dimensions[0] != *hidden ||
         k_tensor->logical_dimensions[0] != *hidden || v_tensor->logical_dimensions[0] != *hidden ||
-        !q_norm_tensor || q_norm_tensor->logical_dimensions.size() != 1 ||
-        q_norm_tensor->logical_dimensions[0] == 0 || q_norm_tensor->logical_dimensions[0] > UINT32_MAX) {
+        (q_norm_tensor && (q_norm_tensor->logical_dimensions.size() != 1 ||
+                           q_norm_tensor->logical_dimensions[0] == 0 ||
+                           q_norm_tensor->logical_dimensions[0] > UINT32_MAX))) {
         return std::nullopt;
     }
     const uint32_t q_width = static_cast<uint32_t>(q_tensor->logical_dimensions[1]);
     const uint32_t kv_width = static_cast<uint32_t>(k_tensor->logical_dimensions[1]);
     if (q_width == 0 || kv_width == 0 || q_width % *q_heads_fact != 0) return std::nullopt;
     const uint32_t head_dim = q_width / *q_heads_fact;
-    if (head_dim == 0 || q_norm_tensor->logical_dimensions[0] != head_dim ||
+    if (head_dim == 0 || (q_norm_tensor && q_norm_tensor->logical_dimensions[0] != head_dim) ||
         v_tensor->logical_dimensions[1] != kv_width) return std::nullopt;
     const uint32_t kv_heads = kv_heads_fact.value_or(
         (kv_width % head_dim == 0 ? kv_width / head_dim : 0));
@@ -643,25 +658,26 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
             physical, TensorRole::ValueWeight, layer);
         const ArtifactTensorRecord* layer_q_norm = unique_role_tensor(
             physical, TensorRole::AttentionQueryNormWeight, layer);
-        if (!layer_q || !layer_k || !layer_v || !layer_q_norm ||
+        if (!layer_q || !layer_k || !layer_v ||
             layer_q->logical_dimensions.size() != 2 ||
             layer_k->logical_dimensions.size() != 2 ||
             layer_v->logical_dimensions.size() != 2 ||
-            layer_q_norm->logical_dimensions.size() != 1 ||
+            (layer_q_norm && layer_q_norm->logical_dimensions.size() != 1) ||
             layer_q->logical_dimensions[0] != *hidden ||
             layer_k->logical_dimensions[0] != *hidden ||
             layer_v->logical_dimensions[0] != *hidden ||
             layer_v->logical_dimensions[1] != layer_k->logical_dimensions[1] ||
             layer_q->logical_dimensions[1] == 0 ||
             layer_k->logical_dimensions[1] == 0 ||
-            layer_q_norm->logical_dimensions[0] == 0 ||
+            (layer_q_norm && layer_q_norm->logical_dimensions[0] == 0) ||
             layer_q->logical_dimensions[1] % *q_heads_fact != 0) {
             return std::nullopt;
         }
         const uint32_t layer_q_width = static_cast<uint32_t>(layer_q->logical_dimensions[1]);
         const uint32_t layer_kv_width = static_cast<uint32_t>(layer_k->logical_dimensions[1]);
         const uint32_t layer_head_dim = layer_q_width / *q_heads_fact;
-        if (layer_head_dim == 0 || layer_q_norm->logical_dimensions[0] != layer_head_dim) {
+        if (layer_head_dim == 0 ||
+            (layer_q_norm && layer_q_norm->logical_dimensions[0] != layer_head_dim)) {
             return std::nullopt;
         }
         const uint32_t layer_kv_heads = kv_heads_fact.value_or(
@@ -701,6 +717,9 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         r.gate = find_layer_tensor(model, physical, layer, TensorRole::FfnGateWeight);
         r.up = find_layer_tensor(model, physical, layer, TensorRole::FfnUpWeight);
         r.down = find_layer_tensor(model, physical, layer, TensorRole::FfnDownWeight);
+        r.q_bias = find_layer_tensor(model, physical, layer, TensorRole::QueryBias);
+        r.k_bias = find_layer_tensor(model, physical, layer, TensorRole::KeyBias);
+        r.v_bias = find_layer_tensor(model, physical, layer, TensorRole::ValueBias);
         r.route_scale = find_layer_tensor(model, physical, layer, TensorRole::RouterScaleWeight);
         r.router = find_layer_tensor(model, physical, layer, TensorRole::NextnProjectionWeight);
         r.expert_norm = find_layer_tensor(model, physical, layer, TensorRole::ExpertNormWeight);
@@ -711,16 +730,29 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         r.post_moe = find_layer_tensor(model, physical, layer, TensorRole::PostNormWeight, false, 2);
         r.post_output = find_layer_tensor(model, physical, layer, TensorRole::PostNormWeight, false, 3);
         r.output_scale = find_layer_tensor(model, physical, layer, TensorRole::OutputScaleWeight);
-        if (std::any_of(&r.attn_norm, &r.output_scale + 1,
-                        [](uint32_t id) { return id == UINT32_MAX; }))
+        if (r.attn_norm == UINT32_MAX || r.q == UINT32_MAX || r.k == UINT32_MAX ||
+            r.v == UINT32_MAX || r.attn_out == UINT32_MAX || r.ffn_norm == UINT32_MAX ||
+            r.gate == UINT32_MAX || r.up == UINT32_MAX || r.down == UINT32_MAX) {
             return std::nullopt;
+        }
+        if (moe_source && (r.route_scale == UINT32_MAX || r.router == UINT32_MAX ||
+                       r.expert_norm == UINT32_MAX || r.expert_up == UINT32_MAX ||
+                       r.expert_down == UINT32_MAX || r.reduce == UINT32_MAX ||
+                       r.post_dense == UINT32_MAX || r.post_moe == UINT32_MAX ||
+                       r.post_output == UINT32_MAX || r.output_scale == UINT32_MAX)) {
+            return std::nullopt;
+        }
 
         const uint32_t normed = add_value(model, ScalarType::F32, rows(*hidden));
         const uint32_t qv = add_value(model, ScalarType::F32, rows(layer_q_width));
         const uint32_t kv = add_value(model, ScalarType::F32, rows(layer_kv_width));
         const uint32_t vv = add_value(model, ScalarType::F32, rows(layer_kv_width));
-        const uint32_t qn = add_value(model, ScalarType::F32, rows(layer_q_width));
-        const uint32_t kn = add_value(model, ScalarType::F32, rows(layer_kv_width));
+        // Without a source q/k norm, Rope reads the projected values
+        // directly; no unused intermediate values enter the graph.
+        const uint32_t qn = r.q_norm != UINT32_MAX
+            ? add_value(model, ScalarType::F32, rows(layer_q_width)) : qv;
+        const uint32_t kn = r.k_norm != UINT32_MAX
+            ? add_value(model, ScalarType::F32, rows(layer_kv_width)) : kv;
         const uint32_t qr = add_value(model, ScalarType::F32, rows(layer_q_width));
         const uint32_t ar = add_value(model, ScalarType::F32, rows(layer_q_width));
         const uint32_t ao = add_value(model, ScalarType::F32, rows(layer_q_width));
@@ -731,32 +763,56 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         const uint32_t du = add_value(model, ScalarType::F32, rows(intermediate));
         const uint32_t dh = add_value(model, ScalarType::F32, rows(intermediate));
         const uint32_t dd = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t dense_post = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t router_norm = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t route_scaled = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t route_normalized = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t scores = add_value(model, ScalarType::F32, rows(*experts));
-        const uint32_t ids = add_value(model, ScalarType::U32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, *selected}});
-        const uint32_t weights = add_value(model, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, *selected}});
-        const uint32_t expert_norm = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t expert_up = add_value(model, ScalarType::F32, routed(*selected, 2 * *expert_inter));
-        const uint32_t expert_gate = add_value(model, ScalarType::F32, routed(*selected, *expert_inter));
-        const uint32_t expert_value = add_value(model, ScalarType::F32, routed(*selected, *expert_inter));
-        const uint32_t expert_act = add_value(model, ScalarType::F32, routed(*selected, *expert_inter));
-        const uint32_t expert_down = add_value(model, ScalarType::F32, routed(*selected, *hidden));
-        const uint32_t reduced = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t moe_post = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t branch = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t output_post = add_value(model, ScalarType::F32, rows(*hidden));
+        uint32_t dense_post = UINT32_MAX, router_norm = UINT32_MAX, route_scaled = UINT32_MAX;
+        uint32_t route_normalized = UINT32_MAX, scores = UINT32_MAX, ids = UINT32_MAX;
+        uint32_t weights = UINT32_MAX, expert_norm = UINT32_MAX, expert_up = UINT32_MAX;
+        uint32_t expert_gate = UINT32_MAX, expert_value = UINT32_MAX, expert_act = UINT32_MAX;
+        uint32_t expert_down = UINT32_MAX, reduced = UINT32_MAX, moe_post = UINT32_MAX;
+        uint32_t branch = UINT32_MAX, output_post = UINT32_MAX, next_current = UINT32_MAX;
+        if (moe_source) {
+            dense_post = add_value(model, ScalarType::F32, rows(*hidden));
+            router_norm = add_value(model, ScalarType::F32, rows(*hidden));
+            route_scaled = add_value(model, ScalarType::F32, rows(*hidden));
+            route_normalized = add_value(model, ScalarType::F32, rows(*hidden));
+            scores = add_value(model, ScalarType::F32, rows(*experts));
+            ids = add_value(model, ScalarType::U32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, *selected}});
+            weights = add_value(model, ScalarType::F32, {{DimensionKind::Symbol, 1}, {DimensionKind::Constant, *selected}});
+            expert_norm = add_value(model, ScalarType::F32, rows(*hidden));
+            expert_up = add_value(model, ScalarType::F32, routed(*selected, 2 * *expert_inter));
+            expert_gate = add_value(model, ScalarType::F32, routed(*selected, *expert_inter));
+            expert_value = add_value(model, ScalarType::F32, routed(*selected, *expert_inter));
+            expert_act = add_value(model, ScalarType::F32, routed(*selected, *expert_inter));
+            expert_down = add_value(model, ScalarType::F32, routed(*selected, *hidden));
+            reduced = add_value(model, ScalarType::F32, rows(*hidden));
+            moe_post = add_value(model, ScalarType::F32, rows(*hidden));
+            branch = add_value(model, ScalarType::F32, rows(*hidden));
+            output_post = add_value(model, ScalarType::F32, rows(*hidden));
+            next_current = add_value(model, ScalarType::F32, rows(*hidden));
+        }
         const uint32_t layer_out = add_value(model, ScalarType::F32, rows(*hidden));
-        const uint32_t next_current = add_value(model, ScalarType::F32, rows(*hidden));
 
         add_operator(model, OperatorKind::RmsNorm, {current}, {normed}, {r.attn_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
-        add_operator(model, OperatorKind::Linear, {normed}, {qv}, {r.q}, {}, LinearPayload{});
-        add_operator(model, OperatorKind::Linear, {normed}, {kv}, {r.k}, {}, LinearPayload{});
-        add_operator(model, OperatorKind::Linear, {normed}, {vv}, {r.v}, {}, LinearPayload{});
-        add_operator(model, OperatorKind::RmsNorm, {qv}, {qn}, {r.q_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
-        add_operator(model, OperatorKind::RmsNorm, {kv}, {kn}, {r.k_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
+        // Q/K/V projections carry their bias tensor when the source has one;
+        // has_bias keeps the contract explicit in the operator payload.
+        if (r.q_bias != UINT32_MAX)
+            add_operator(model, OperatorKind::Linear, {normed}, {qv}, {r.q, r.q_bias}, {},
+                         LinearPayload{false, true, ScalarType::F32});
+        else
+            add_operator(model, OperatorKind::Linear, {normed}, {qv}, {r.q}, {}, LinearPayload{});
+        if (r.k_bias != UINT32_MAX)
+            add_operator(model, OperatorKind::Linear, {normed}, {kv}, {r.k, r.k_bias}, {},
+                         LinearPayload{false, true, ScalarType::F32});
+        else
+            add_operator(model, OperatorKind::Linear, {normed}, {kv}, {r.k}, {}, LinearPayload{});
+        if (r.v_bias != UINT32_MAX)
+            add_operator(model, OperatorKind::Linear, {normed}, {vv}, {r.v, r.v_bias}, {},
+                         LinearPayload{false, true, ScalarType::F32});
+        else
+            add_operator(model, OperatorKind::Linear, {normed}, {vv}, {r.v}, {}, LinearPayload{});
+        if (r.q_norm != UINT32_MAX)
+            add_operator(model, OperatorKind::RmsNorm, {qv}, {qn}, {r.q_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
+        if (r.k_norm != UINT32_MAX)
+            add_operator(model, OperatorKind::RmsNorm, {kv}, {kn}, {r.k_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
         add_operator(model, OperatorKind::Rope, {qn, kn}, {qr, ar}, {}, {}, RopePayload{RopePairing::HalfSplit, true, layer_head_dim, rope_base_bits, one_bits});
         CausalAttentionPayload attention{q_heads, layer_kv_heads, layer_head_dim, one_bits, AttentionMask::Causal,
                                          CachePolicy::Global, AttentionWindowKind::Global, 0,
@@ -770,6 +826,7 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         add_operator(model, OperatorKind::Linear, {fn}, {du}, {r.up}, {}, LinearPayload{});
         add_operator(model, OperatorKind::SwiGlu, {dg, du}, {dh}, {}, {}, SwiGluPayload{ActivationKind::Silu});
         add_operator(model, OperatorKind::Linear, {dh}, {dd}, {r.down}, {}, LinearPayload{});
+        if (moe_source) {
         add_operator(model, OperatorKind::RmsNorm, {dd}, {dense_post}, {r.post_dense}, {}, RmsNormPayload{norm_bits, -1, 1});
         add_operator(model, OperatorKind::RmsNorm, {attn_res}, {router_norm}, {}, {}, RmsNormPayload{norm_bits, -1, 0});
         add_operator(model, OperatorKind::Scale, {router_norm}, {route_scaled}, {r.route_scale}, {}, ScalePayload{ScaleSource::Tensor, 0});
@@ -792,6 +849,12 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         add_operator(model, OperatorKind::Add, {attn_res, output_post}, {layer_out}, {}, {}, AddPayload{});
         add_operator(model, OperatorKind::Scale, {layer_out}, {next_current}, {r.output_scale}, {}, ScalePayload{ScaleSource::Tensor, 0});
         current = next_current;
+        } else {
+            // Plain dense pre-norm block: the FFN output joins the attention
+            // residual directly, with no post-norm or routed path.
+            add_operator(model, OperatorKind::Add, {attn_res, dd}, {layer_out}, {}, {}, AddPayload{});
+            current = layer_out;
+        }
         model.layers.push_back({layer, first_operator,
                                 static_cast<uint32_t>(model.operators.size()) - first_operator, 0});
     }

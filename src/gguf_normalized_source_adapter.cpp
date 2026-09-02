@@ -141,8 +141,13 @@ ParseResult parse_spelling(std::string_view spelling) {
         }
     }
     size_t matches = 0;
+    bool bias_suffix = false;
     for (size_t index = after_layer; index != parts.size(); ++index) {
         if (parts[index] == "weight") continue;
+        if (parts[index] == "bias") {
+            bias_suffix = true;
+            continue;
+        }
         const auto candidate = role_marker(parts[index]);
         if (!candidate) continue;
         role = candidate;
@@ -150,6 +155,14 @@ ParseResult parse_spelling(std::string_view spelling) {
     }
     if (matches == 0) return {ParseState::Missing, {}};
     if (matches != 1) return {ParseState::Ambiguous, {}};
+    if (bias_suffix) {
+        // A bias projection is a distinct typed fact. Mapping it onto the
+        // weight role would put two candidates on one coordinate.
+        if (*role == TensorRole::QueryWeight) *role = TensorRole::QueryBias;
+        else if (*role == TensorRole::KeyWeight) *role = TensorRole::KeyBias;
+        else if (*role == TensorRole::ValueWeight) *role = TensorRole::ValueBias;
+        else return {ParseState::Ambiguous, {}};
+    }
     ParsedRole parsed;
     parsed.role = *role;
     parsed.coordinate.root = 0;

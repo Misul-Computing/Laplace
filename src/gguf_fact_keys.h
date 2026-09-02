@@ -38,8 +38,9 @@ inline constexpr CanonicalFactKey eos_token_id{0x4755460du};
 inline constexpr CanonicalFactKey expert_count{0x4755460eu};
 inline constexpr CanonicalFactKey expert_used_count{0x4755460fu};
 inline constexpr CanonicalFactKey expert_feed_forward_length{0x47554610u};
+inline constexpr CanonicalFactKey attention_sliding_window{0x47554611u};
 
-inline constexpr std::array<Descriptor, 16> descriptors = {{
+inline constexpr std::array<Descriptor, 17> descriptors = {{
     {block_count, "block_count", ValueKind::Unsigned},
     {context_length, "context_length", ValueKind::Unsigned},
     {embedding_length, "embedding_length", ValueKind::Unsigned},
@@ -56,6 +57,7 @@ inline constexpr std::array<Descriptor, 16> descriptors = {{
     {expert_count, "expert_count", ValueKind::Unsigned},
     {expert_used_count, "expert_used_count", ValueKind::Unsigned},
     {expert_feed_forward_length, "expert_feed_forward_length", ValueKind::Unsigned},
+    {attention_sliding_window, "attention.sliding_window", ValueKind::Unsigned},
 }};
 
 } // namespace Laplace::gguf_fact_keys

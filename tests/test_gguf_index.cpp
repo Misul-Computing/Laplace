@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
