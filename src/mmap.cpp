@@ -307,17 +307,24 @@ MappedFile::~MappedFile() { close(); }
 bool MappedFile::open(const char* path) {
     int fd = ::open(path, O_RDONLY);
     if (fd < 0) {
-        fprintf(stderr, "mmap: open failed for %s\n", path);
+        fprintf(stderr, "mmap: open failed for %s: %s\n", path, std::strerror(errno));
         return false;
     }
     struct stat st;
     if (fstat(fd, &st) < 0) {
+        const int reason = errno;
         ::close(fd);
-        fprintf(stderr, "mmap: fstat failed for %s\n", path);
+        fprintf(stderr, "mmap: fstat failed for %s: %s\n", path, std::strerror(reason));
+        return false;
+    }
+    if (st.st_size == 0) {
+        ::close(fd);
+        fprintf(stderr, "mmap: file is empty: %s\n", path);
         return false;
     }
     if (!map_owned_fd(fd, static_cast<size_t>(st.st_size))) {
-        fprintf(stderr, "mmap: mmap failed for %s\n", path);
+        const int reason = errno;
+        fprintf(stderr, "mmap: mmap failed for %s: %s\n", path, std::strerror(reason));
         return false;
     }
     return true;
