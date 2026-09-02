@@ -36,7 +36,8 @@ constexpr uint16_t kKnownAddedFlags = static_cast<uint16_t>(AddedTokenFlags::Sin
                                        static_cast<uint16_t>(AddedTokenFlags::Normalized) |
                                        static_cast<uint16_t>(AddedTokenFlags::Special);
 constexpr uint8_t kKnownPretokenizerFlags = static_cast<uint8_t>(PretokenizerFlags::AddPrefixSpace) |
-                                            static_cast<uint8_t>(PretokenizerFlags::SplitAsciiWhitespace);
+                                            static_cast<uint8_t>(PretokenizerFlags::SplitAsciiWhitespace) |
+                                            static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns);
 constexpr uint8_t kKnownPostprocessorFlags = static_cast<uint8_t>(PostprocessorFlags::AddBos) |
                                              static_cast<uint8_t>(PostprocessorFlags::AddEos);
 constexpr uint16_t kKnownBpeFlags = static_cast<uint16_t>(BpeFlags::FuseUnknown);
@@ -1377,6 +1378,8 @@ TokenProgramStatus normalize_sentencepiece_v3(std::string_view input, const Toke
     return {};
 }
 
+std::vector<std::string_view> scan_unicode_scalars(std::string_view text, bool group_newline_runs);
+
 TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_view text) {
     const TokenProgramDefinition& definition = program.definition();
     std::unordered_map<std::string, uint32_t> piece_ids;
@@ -1577,6 +1580,16 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
                 if (!status.ok()) return status;
             }
             begin = index + 1;
+        }
+    } else if (definition.pretokenizer.kind == PretokenizerKind::ByteLevel) {
+        // Byte-level BPE groups by the family-neutral scalar scanner
+        // before merging, so merges never cross a word boundary.
+        for (std::string_view segment : scan_unicode_scalars(
+                 canonical,
+                 (definition.pretokenizer.flags &
+                  static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns)) != 0)) {
+            const TokenProgramStatus status = append_merged(segment);
+            if (!status.ok()) return status;
         }
     } else {
         const TokenProgramStatus status = append_merged(canonical);
@@ -2489,7 +2502,9 @@ bool scalar_is_word(uint32_t value) {
 
 bool scalar_is_newline(uint32_t value) { return value == '\n' || value == '\r'; }
 
-std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
+std::vector<std::string_view> scan_unicode_scalars(std::string_view text, bool group_newline_runs);
+
+std::vector<std::string_view> scan_unicode_scalars(std::string_view text, bool group_newline_runs) {
     std::vector<ScalarSpan> scalars;
     if (!collect_scalars(text, scalars)) return {};
     std::vector<std::string_view> result;
@@ -2498,12 +2513,22 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
         const auto at = [&](size_t index) -> uint32_t { return scalars[index].value; };
         const size_t begin = cursor;
 
-        // Keep the contraction alternatives explicit and deterministic.
+        // Keep the contraction alternatives explicit and deterministic:
+        // 's 't 're 've 'm 'll 'd.
         if (at(cursor) == '\'' && cursor + 1 < scalars.size() && at(cursor + 1) < 0x80) {
-            const char suffix = static_cast<char>(at(cursor + 1) | 0x20);
-            if (suffix == 's' || suffix == 't' || suffix == 'r' || suffix == 'v' || suffix == 'm' ||
-                suffix == 'l' || suffix == 'd') {
-                cursor += 2;
+            const char first = static_cast<char>(at(cursor + 1) | 0x20);
+            size_t take = 0;
+            if (first == 's' || first == 't' || first == 'm' || first == 'd') {
+                take = 2;
+            } else if (cursor + 2 < scalars.size() && at(cursor + 2) < 0x80) {
+                const char second = static_cast<char>(at(cursor + 2) | 0x20);
+                if ((first == 'r' && second == 'e') || (first == 'v' && second == 'e') ||
+                    (first == 'l' && second == 'l')) {
+                    take = 3;
+                }
+            }
+            if (take != 0) {
+                cursor += take;
                 result.emplace_back(text.data() + scalars[begin].begin,
                                     scalars[cursor - 1].end - scalars[begin].begin);
                 continue;
@@ -2515,7 +2540,7 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
         } else if (!scalar_is_newline(at(cursor)) && !scalar_is_letter(at(cursor)) &&
                    !scalar_is_number(at(cursor)) && cursor + 1 < scalars.size() &&
                    scalar_is_letter(at(cursor + 1))) {
-            // [^\r\n\p{L}\p{N}]?\p{L}+
+            // [^\\r\\n\\p{L}\\p{N}]?\\p{L}+
             ++cursor;
             while (cursor < scalars.size() && scalar_is_letter(at(cursor))) ++cursor;
         } else if (scalar_is_number(at(cursor))) {
@@ -2529,29 +2554,51 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
         } else if (at(cursor) == ' ' && cursor + 1 < scalars.size() &&
                    !scalar_is_whitespace(at(cursor + 1)) && !scalar_is_letter(at(cursor + 1)) &&
                    !scalar_is_number(at(cursor + 1))) {
-            // ?[^\s\p{L}\p{N}]+[\r\n]* with its optional ASCII space.
+            // ?[^\\s\\p{L}\\p{N}]+ with its optional ASCII space. The
+            // trailing [\\r\\n]* is Qwen's; the GPT-2 ByteLevel regex stops
+            // at the newline and lets the whitespace rule take it.
             ++cursor;
             while (cursor < scalars.size() && !scalar_is_whitespace(at(cursor)) &&
                    !scalar_is_letter(at(cursor)) && !scalar_is_number(at(cursor))) ++cursor;
-            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
-        } else if (scalar_is_whitespace(at(cursor)) && !scalar_is_newline(at(cursor))) {
-            size_t probe = cursor;
-            while (probe < scalars.size() && scalar_is_whitespace(at(probe)) &&
-                   !scalar_is_newline(at(probe))) ++probe;
-            if (probe < scalars.size() && scalar_is_newline(at(probe))) {
-                cursor = probe;
+            if (group_newline_runs) {
                 while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            }
+        } else if (scalar_is_whitespace(at(cursor)) && group_newline_runs &&
+                   scalar_is_newline(at(cursor))) {
+            // Qwen-class \s*[\r\n]+ at a newline: fold the whole run.
+            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+        } else if (scalar_is_whitespace(at(cursor))) {
+            if (group_newline_runs && !scalar_is_newline(at(cursor))) {
+                size_t probe = cursor;
+                while (probe < scalars.size() && !scalar_is_newline(at(probe)) &&
+                       scalar_is_whitespace(at(probe))) ++probe;
+                if (probe < scalars.size() && scalar_is_newline(at(probe))) {
+                    cursor = probe;
+                    while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+                } else {
+                    while (cursor < scalars.size() && !scalar_is_newline(at(cursor)) &&
+                           scalar_is_whitespace(at(cursor))) ++cursor;
+                    if (cursor < scalars.size() && cursor - begin > 1) --cursor;
+                }
             } else {
+                // GPT-2 \s+(?!\S): a whitespace run of any kind keeps its
+                // final scalar for whatever follows; a space joins the
+                // next word, other whitespace becomes its own segment.
                 while (cursor < scalars.size() && scalar_is_whitespace(at(cursor))) ++cursor;
+                if (cursor < scalars.size() && cursor - begin > 1) --cursor;
             }
         } else if (scalar_is_newline(at(cursor))) {
-            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            // A lone leftover newline: the regex's final \s+ alternative.
+            ++cursor;
         } else {
-            // ?[^\s\p{L}\p{N}]+[\r\n]*, including combining marks.
+            // ?[^\\s\\p{L}\\p{N}]+, including combining marks. Trailing
+            // newlines belong to the Qwen contract only.
             if (scalar_is_whitespace(at(cursor))) ++cursor;
             while (cursor < scalars.size() && !scalar_is_whitespace(at(cursor)) &&
                    !scalar_is_letter(at(cursor)) && !scalar_is_number(at(cursor))) ++cursor;
-            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            if (group_newline_runs) {
+                while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            }
         }
         if (cursor == begin) ++cursor;
         result.emplace_back(text.data() + scalars[begin].begin,
@@ -2561,7 +2608,9 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
 }
 
 std::vector<std::string_view> pretokenize_v2(std::string_view text, const PretokenizerSpec& spec) {
-    if (spec.kind == PretokenizerKind::UnicodeScalarScanner) return scan_unicode_scalars(text);
+    if (spec.kind == PretokenizerKind::UnicodeScalarScanner)
+        return scan_unicode_scalars(
+            text, (spec.flags & static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns)) != 0);
     if ((spec.flags & static_cast<uint8_t>(PretokenizerFlags::SplitAsciiWhitespace)) == 0) {
         return {text};
     }

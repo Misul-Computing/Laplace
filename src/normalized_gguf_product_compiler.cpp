@@ -12,6 +12,8 @@
 #include <utility>
 #include <vector>
 
+#include <CommonCrypto/CommonDigest.h>
+
 #include "gguf.h"
 #include "gguf_fact_keys.h"
 #include "gguf_index.h"
@@ -406,6 +408,25 @@ bool has_gguf_physical_tuple(const SemanticTensor& tensor, uint32_t elements,
            tensor.planes[0].length / (constant_elements / elements) == bytes;
 }
 
+// Codec selection is data: one row per blocked codec ABI (block geometry
+// plus zero-point type) with its arithmetic certificate. Extending codec
+// coverage means adding a row here and its certificate constructor, not
+// another branch in the loader.
+using CodecCertificateConstructor = std::vector<uint8_t> (*)();
+struct GgufCodecSelector {
+    uint32_t block_elements;
+    uint32_t block_bytes;
+    ScalarType zero_type;
+    CodecCertificateConstructor certificate;
+};
+
+constexpr GgufCodecSelector kGgufCodecSelectors[] = {
+    {256, 144, ScalarType::F16, make_q4_k_codec_certificate},
+    {32, 22, static_cast<ScalarType>(0), make_q5_0_codec_certificate},
+    {32, 34, static_cast<ScalarType>(0), make_q8_0_codec_certificate},
+    {256, 210, static_cast<ScalarType>(0), make_q6_k_codec_certificate},
+};
+
 std::vector<uint8_t> certificate_for_tensor(const SemanticTensor& tensor) {
     if (tensor.quantization.kind == QuantizationKind::None) {
         if (tensor.logical_type == ScalarType::F16 &&
@@ -442,14 +463,12 @@ std::vector<uint8_t> certificate_for_tensor(const SemanticTensor& tensor) {
             return make_raw_f32_codec_certificate();
         return {};
     }
-    if (has_gguf_physical_tuple(tensor, 256, 144, ScalarType::F16))
-        return make_q4_k_codec_certificate();
-    if (has_gguf_physical_tuple(tensor, 32, 22, static_cast<ScalarType>(0)))
-        return make_q5_0_codec_certificate();
-    if (has_gguf_physical_tuple(tensor, 32, 34, static_cast<ScalarType>(0)))
-        return make_q8_0_codec_certificate();
-    if (has_gguf_physical_tuple(tensor, 256, 210, static_cast<ScalarType>(0)))
-        return make_q6_k_codec_certificate();
+    for (const GgufCodecSelector& selector : kGgufCodecSelectors) {
+        if (has_gguf_physical_tuple(tensor, selector.block_elements,
+                                    selector.block_bytes, selector.zero_type)) {
+            return selector.certificate();
+        }
+    }
     return {};
 }
 
@@ -590,6 +609,7 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     if (model.bos_id == UINT32_MAX || model.eos_id == UINT32_MAX) return std::nullopt;
     model.tokenizer_digest = physical.artifacts().front().digest().bytes;
     model.template_digest = physical.artifacts().front().digest().bytes;
+    model.stop_ids = {model.eos_id};
 
     for (const ArtifactTensorRecord& record : physical.tensors()) {
         const NormalizedTensorEvidence* typed = evidence_for(evidence, record.id);
@@ -869,6 +889,123 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     return model;
 }
 
+// Compiles the package's own tokenizer facts into an executable token
+// program. The "tokenizer.ggml.model" value is a format-level algorithm
+// fact, not a family name: gpt2 selects byte-level BPE, and every
+// tokenizer that stores gpt2 facts compiles through this one path.
+// Algorithm kinds without an executable mapping keep the token-ids-only
+// contract and fail closed at text prompts instead of guessing.
+std::optional<TokenProgram> compile_gguf_tokenizer(const GGUFContext& context,
+                                                   const SemanticModel& model) {
+    const auto& metadata = context.metadata();
+    const std::string* algorithm = meta_str(metadata, "tokenizer.ggml.model");
+    if (!algorithm || *algorithm != "gpt2") return std::nullopt;
+    const auto* tokens = meta_as<MetaArrayStr>(metadata, "tokenizer.ggml.tokens");
+    const auto* merges = meta_as<MetaArrayStr>(metadata, "tokenizer.ggml.merges");
+    if (!tokens || !merges || tokens->empty() ||
+        tokens->size() != model.vocabulary_size) {
+        return std::nullopt;
+    }
+    const auto* token_types = meta_as<MetaArrayU32>(metadata, "tokenizer.ggml.token_type");
+    const auto* scores = meta_as<MetaArrayF32>(metadata, "tokenizer.ggml.scores");
+    if (token_types && token_types->size() != tokens->size()) return std::nullopt;
+    if (scores && scores->size() != tokens->size()) return std::nullopt;
+
+    TokenProgramDefinition definition;
+    definition.model_kind = TokenProgramModelKind::ByteBpe;
+    definition.stop_ids = {model.eos_id};
+    // GPT-2 byte alphabet: printable bytes stay themselves, the rest
+    // continue at 256. This is the tokenizer data's own convention.
+    {
+        uint32_t next = 256;
+        for (int byte = 0; byte != 256; ++byte) {
+            const bool printable = (byte >= 0x21 && byte <= 0x7e) ||
+                                   (byte >= 0xa1 && byte <= 0xac) ||
+                                   (byte >= 0xae && byte <= 0xff);
+            definition.byte_to_unicode[static_cast<size_t>(byte)] =
+                printable ? static_cast<uint32_t>(byte) : next++;
+        }
+    }
+
+    definition.vocabulary.reserve(tokens->size());
+    std::map<std::string, uint32_t> piece_ids;
+    for (size_t id = 0; id != tokens->size(); ++id) {
+        VocabEntry entry;
+        entry.piece = (*tokens)[id];
+        const uint32_t type = token_types
+                                  ? (*token_types)[id]
+                                  : static_cast<uint32_t>(TokenPieceType::Normal);
+        if (type < static_cast<uint32_t>(TokenPieceType::Normal) ||
+            type > static_cast<uint32_t>(TokenPieceType::Byte)) {
+            return std::nullopt;
+        }
+        entry.type = static_cast<uint8_t>(type);
+        entry.flags = type == static_cast<uint32_t>(TokenPieceType::Normal)
+                          ? 0
+                          : static_cast<uint16_t>(VocabFlags::Special);
+        entry.score = scores ? (*scores)[id] : 0.0f;
+        if (!piece_ids.emplace(entry.piece, static_cast<uint32_t>(id)).second)
+            return std::nullopt;
+        if (type == static_cast<uint32_t>(TokenPieceType::Unknown))
+            definition.unknown_token_id = static_cast<uint32_t>(id);
+        definition.vocabulary.push_back(std::move(entry));
+    }
+
+    definition.merges.reserve(merges->size());
+    for (size_t rank = 0; rank != merges->size(); ++rank) {
+        const std::string& text = (*merges)[rank];
+        const size_t split = text.find(' ');
+        if (split == std::string::npos ||
+            text.find(' ', split + 1) != std::string::npos) {
+            return std::nullopt;
+        }
+        const std::string left_text = text.substr(0, split);
+        const std::string right_text = text.substr(split + 1);
+        const auto left = piece_ids.find(left_text);
+        const auto right = piece_ids.find(right_text);
+        const auto result = piece_ids.find(left_text + right_text);
+        if (left == piece_ids.end() || right == piece_ids.end() ||
+            result == piece_ids.end()) {
+            return std::nullopt;
+        }
+        definition.merges.push_back({left->second, right->second, result->second,
+                                     static_cast<uint32_t>(rank)});
+    }
+
+    definition.pretokenizer.kind = PretokenizerKind::ByteLevel;
+    // The pretokenizer grouping contract comes from the package's own
+    // "tokenizer.ggml.pre" fact. Every spelling without a verified
+    // Qwen-style newline grouping keeps the default GPT-2 backtracking
+    // rule; extending coverage is adding a spelling to this data list.
+    if (const std::string* pre = meta_str(metadata, "tokenizer.ggml.pre");
+        pre && *pre == "qwen2") {
+        definition.pretokenizer.flags =
+            static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns);
+    }
+    definition.decoder.kind = DecoderKind::ByteLevel;
+    definition.decoder.flags = static_cast<uint8_t>(DecoderFlags::SkipSpecial);
+    definition.postprocessor.kind = PostprocessorKind::None;
+    const auto* add_bos = meta_as<uint32_t>(metadata, "tokenizer.ggml.add_bos_token");
+    if (add_bos && *add_bos == 1 && model.bos_id != UINT32_MAX) {
+        definition.postprocessor.kind = PostprocessorKind::AddBosEos;
+        definition.postprocessor.flags = static_cast<uint8_t>(PostprocessorFlags::AddBos);
+        definition.postprocessor.bos_token_id = model.bos_id;
+    }
+    // The V3 canonical template requires a generation marker; without the
+    // package's chat template the neutral universal marker is a newline.
+    definition.prompt = {{PromptOpcode::EmitUserText, {}},
+                         {PromptOpcode::EmitGenerationPrompt, "\n"},
+                         {PromptOpcode::End, {}}};
+
+    auto serialized = serialize_token_program_v3(definition);
+    const auto* bytes = std::get_if<std::vector<uint8_t>>(&serialized);
+    if (!bytes) return std::nullopt;
+    auto compiled = TokenProgram::compile(*bytes);
+    const auto* program = std::get_if<TokenProgram>(&compiled);
+    if (!program) return std::nullopt;
+    return std::move(*program);
+}
+
 } // namespace
 
 GgufProductCompilationResult compile_normalized_gguf_product(const PackageView& package) {
@@ -890,13 +1027,51 @@ GgufProductCompilationResult compile_normalized_gguf_product(const PackageView& 
     auto model_result = build_model(physical, evidence);
     if (!model_result) return failure(CompatibilityError::IMPORT_SCHEMA_NOT_FOUND, "typed normalized GGUF facts do not form an executable semantic graph");
     SemanticModel model = std::move(*model_result);
+    auto token_program = compile_gguf_tokenizer(context, model);
     TokenContract contract;
-    contract.tokenizer_algorithm = TokenizerAlgorithm::TokenIdsOnly;
-    contract.tokenizer_version = 0;
+    if (token_program) {
+        // The tokenizer is compiled from the package's own metadata span
+        // (header plus every key/value, which is where the tokenizer
+        // arrays live), so the contract binds to that exact byte range
+        // instead of re-hashing the whole file.
+        const uint64_t span = context.data_section_offset();
+        Sha256Digest span_digest{};
+        {
+            CC_SHA256_CTX digest_context;
+            CC_SHA256_Init(&digest_context);
+            size_t offset = 0;
+            while (offset != span) {
+                const size_t chunk = std::min<size_t>(
+                    span - offset, std::numeric_limits<CC_LONG>::max());
+                CC_SHA256_Update(&digest_context,
+                                 package.bytes().data() + offset,
+                                 static_cast<CC_LONG>(chunk));
+                offset += chunk;
+            }
+            CC_SHA256_Final(span_digest.bytes.data(), &digest_context);
+        }
+        model.tokenizer_digest = span_digest.bytes;
+        model.template_digest = token_program->prompt_digest().bytes;
+        contract.tokenizer_algorithm = TokenizerAlgorithm::ByteBpe;
+        contract.tokenizer_version = token_program->wire_major_version();
+        contract.vocabulary_digest = token_program->vocabulary_digest();
+        contract.tokenizer_data = {physical.artifacts().front().artifact_id(),
+                                   0, span, span_digest};
+        contract.authoritative_tokenizer_digest = span_digest;
+        contract.authoritative_template_digest = token_program->prompt_digest();
+        contract.stop_ids = model.stop_ids;
+        contract.prompt = PromptTemplate{
+            1, {PromptOperation{PromptOperationKind::AppendInputText, {}, kNoTokenId},
+                PromptOperation{PromptOperationKind::AppendLiteral, {'\n'}, kNoTokenId}}};
+    } else {
+        contract.tokenizer_algorithm = TokenizerAlgorithm::TokenIdsOnly;
+        contract.tokenizer_version = 0;
+        contract.vocabulary_digest = package.digest();
+        contract.authoritative_tokenizer_digest.bytes = model.tokenizer_digest;
+        contract.authoritative_template_digest.bytes = model.template_digest;
+        contract.stop_ids = model.stop_ids;
+    }
     contract.vocabulary_size = model.vocabulary_size;
-    contract.vocabulary_digest = package.digest();
-    contract.authoritative_tokenizer_digest.bytes = model.tokenizer_digest;
-    contract.authoritative_template_digest.bytes = model.template_digest;
     contract.bos_id = model.bos_id; contract.eos_id = model.eos_id;
     auto registry_result = build_codec_registry(model);
     if (const auto* report = std::get_if<CompatibilityReport>(&registry_result))
@@ -907,7 +1082,9 @@ GgufProductCompilationResult compile_normalized_gguf_product(const PackageView& 
     if (const auto* report = std::get_if<CompatibilityReport>(&manifest_result))
         return *report;
     return GgufProductCompilation{std::get<SemanticManifest>(std::move(manifest_result)),
-                                  TokenProgram::token_ids_only(model.vocabulary_size)};
+                                  token_program
+                                      ? std::move(*token_program)
+                                      : TokenProgram::token_ids_only(model.vocabulary_size)};
 }
 
 } // namespace Laplace
