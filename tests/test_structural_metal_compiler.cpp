@@ -6,6 +6,7 @@
 #include "structural_metal_compiler.h"
 #include "metal_codec_capability.h"
 #include "normalized_codec_program.h"
+#include "prefill_tile.h"
 
 #include <algorithm>
 #include <array>
@@ -1119,6 +1120,128 @@ void test_dense_program_compiles_to_bundles() {
     });
 }
 
+void test_tile_width_program_compiles_to_bundles() {
+    const Fixture fixture = make_structural_fixture(0x37);
+    CHECK(fixture.package != nullptr);
+    if (!fixture.package) return;
+    const auto bindings_result = preflight_codec_bindings(*fixture.package);
+    CHECK(std::holds_alternative<ResolvedCodecBindings>(bindings_result));
+    if (!std::holds_alternative<ResolvedCodecBindings>(bindings_result)) return;
+    const ResolvedCodecBindings bindings = std::get<ResolvedCodecBindings>(bindings_result);
+    SessionRequest request;
+    request.max_context = 64;
+    request.max_batch = kPrefillTileRows;
+    request.enable_prefill = true;
+    request.enable_decode = true;
+    const auto build = [&](uint32_t rows, bool sampled) {
+        return build_semantic_dispatch_program(
+            fixture.model,
+            {ExecutionPhase::Prefill, rows, NumericalClass::ExactFp32, false, sampled});
+    };
+    const auto decode = [&](bool sampled) {
+        return build_semantic_dispatch_program(
+            fixture.model,
+            {ExecutionPhase::Decode, 1, NumericalClass::ExactFp32, false, sampled});
+    };
+    const auto prefill = build(1, false);
+    const auto prefill_sample = build(1, true);
+    const auto pair = build(2, false);
+    const auto pair_sample = build(2, true);
+    const auto tile = build(kPrefillTileRows, false);
+    const auto tile_sample = build(kPrefillTileRows, true);
+    const auto decode_plain = decode(false);
+    const auto decode_sample = decode(true);
+    CHECK(std::holds_alternative<SemanticDispatchProgram>(tile));
+    CHECK(std::holds_alternative<SemanticDispatchProgram>(tile_sample));
+    if (!std::holds_alternative<SemanticDispatchProgram>(prefill) ||
+        !std::holds_alternative<SemanticDispatchProgram>(prefill_sample) ||
+        !std::holds_alternative<SemanticDispatchProgram>(pair) ||
+        !std::holds_alternative<SemanticDispatchProgram>(pair_sample) ||
+        !std::holds_alternative<SemanticDispatchProgram>(tile) ||
+        !std::holds_alternative<SemanticDispatchProgram>(tile_sample) ||
+        !std::holds_alternative<SemanticDispatchProgram>(decode_plain) ||
+        !std::holds_alternative<SemanticDispatchProgram>(decode_sample)) return;
+    const std::array<SemanticDispatchProgram, 8> programs = {
+        std::get<SemanticDispatchProgram>(prefill),
+        std::get<SemanticDispatchProgram>(prefill_sample),
+        std::get<SemanticDispatchProgram>(pair),
+        std::get<SemanticDispatchProgram>(pair_sample),
+        std::get<SemanticDispatchProgram>(tile),
+        std::get<SemanticDispatchProgram>(tile_sample),
+        std::get<SemanticDispatchProgram>(decode_plain),
+        std::get<SemanticDispatchProgram>(decode_sample)};
+    const auto bound_result = bind_dispatch_requirements(
+        *fixture.package, bindings, request, programs);
+    CHECK(std::holds_alternative<BoundDispatchRequirements>(bound_result));
+    if (!std::holds_alternative<BoundDispatchRequirements>(bound_result)) return;
+    StructuralMetalLibraryIdentitySet libraries;
+    libraries.identities = {
+        library(StructuralMetalLibraryId::Core, 0x41),
+        library(StructuralMetalLibraryId::Prefill, 0x42),
+        library(StructuralMetalLibraryId::Sampler, 0x43),
+    };
+    const MetalCodecCapabilityRegistry codec_capabilities =
+        make_codec_capabilities(fixture.model, programs,
+                                std::get<BoundDispatchRequirements>(bound_result),
+                                fixture.package->physical_codec_registry().codecs);
+    const auto compiled = compile_structural_metal(
+        std::get<BoundDispatchRequirements>(bound_result), programs, fixture.model,
+        fixture.package->physical_codec_registry().codecs, libraries,
+        &codec_capabilities);
+    CHECK_MSG(std::holds_alternative<StructuralMetalCompilation>(compiled),
+              "tile compiler error=%u detail=%s",
+              std::holds_alternative<CompatibilityReport>(compiled)
+                  ? static_cast<unsigned>(std::get<CompatibilityReport>(compiled).code) : 0u,
+              std::holds_alternative<CompatibilityReport>(compiled)
+                  ? std::get<CompatibilityReport>(compiled).detail.c_str() : "");
+    if (!std::holds_alternative<StructuralMetalCompilation>(compiled)) return;
+    const auto& output = std::get<StructuralMetalCompilation>(compiled);
+    CHECK(output.programs().size() == 8);
+    CHECK(output.programs()[4].batch_rows() == kPrefillTileRows);
+    CHECK(output.programs()[5].batch_rows() == kPrefillTileRows);
+    // The tile program's dense layer must run its projections on the tiled
+    // kernel, and the two-row program must keep the legacy rows kernel.
+    size_t tile_projections = 0;
+    size_t rows_projections = 0;
+    const auto& tile_layer = output.programs()[4].groups()[1];
+    for (const auto& invocation : tile_layer.primitives()) {
+        if (invocation.primitive == StructuralMetalPrimitive::PrefillF16Tile)
+            ++tile_projections;
+        if (invocation.primitive == StructuralMetalPrimitive::PrefillF16Rows)
+            ++rows_projections;
+    }
+    CHECK(tile_projections == 7);
+    CHECK(rows_projections == 0);
+    size_t pair_rows_projections = 0;
+    size_t pair_tile_projections = 0;
+    const auto& pair_layer = output.programs()[2].groups()[1];
+    for (const auto& invocation : pair_layer.primitives()) {
+        if (invocation.primitive == StructuralMetalPrimitive::PrefillF16Rows)
+            ++pair_rows_projections;
+        if (invocation.primitive == StructuralMetalPrimitive::PrefillF16Tile)
+            ++pair_tile_projections;
+    }
+    CHECK(pair_rows_projections == 7);
+    CHECK(pair_tile_projections == 0);
+    // Widths outside the admitted set fail closed.
+    const auto unadmitted = build(kPrefillTileRows - 1, false);
+    CHECK(std::holds_alternative<SemanticDispatchProgram>(unadmitted));
+    if (std::holds_alternative<SemanticDispatchProgram>(unadmitted)) {
+        std::array<SemanticDispatchProgram, 2> rejected_programs = {
+            std::get<SemanticDispatchProgram>(prefill),
+            std::get<SemanticDispatchProgram>(unadmitted)};
+        const auto rejected_bound = bind_dispatch_requirements(
+            *fixture.package, bindings, request, rejected_programs);
+        if (std::holds_alternative<BoundDispatchRequirements>(rejected_bound)) {
+            const auto rejected = compile_structural_metal(
+                std::get<BoundDispatchRequirements>(rejected_bound), rejected_programs,
+                fixture.model, fixture.package->physical_codec_registry().codecs,
+                libraries, &codec_capabilities);
+            CHECK(std::holds_alternative<CompatibilityReport>(rejected));
+        }
+    }
+}
+
 void test_recurrent_group_owns_every_fused_step() {
     Fixture fixture = make_raw_shape_fixture(recurrent_shape_model());
     CHECK(fixture.package != nullptr);
@@ -1293,6 +1416,7 @@ int main() {
     test_equivalent_codec_declarations_share_structural_lowering();
     test_unknown_valid_codec_fails_closed();
     test_dense_program_compiles_to_bundles();
+    test_tile_width_program_compiles_to_bundles();
     test_recurrent_group_owns_every_fused_step();
     test_moe_parallel_group_and_rewired_serial_rejection();
     return test_summary("test_structural_metal_compiler");

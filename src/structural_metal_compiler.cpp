@@ -1,4 +1,5 @@
 #include "structural_metal_compiler.h"
+#include "prefill_tile.h"
 
 #include <CommonCrypto/CommonDigest.h>
 
@@ -464,6 +465,12 @@ PrimitiveSpec primitive_spec(StructuralMetalPrimitive primitive) {
         result.library = StructuralMetalLibraryId::Prefill;
         result.function = "prefill_f16_rows"; result.abi = "prefill.f16.rows.v1";
         result.dispatch = dispatch(2, 1024); break;
+    case StructuralMetalPrimitive::PrefillF16Tile:
+        // One simdgroup of exactly 32 threads computes each 32x32 output
+        // tile; threadgroup memory is set by the executor at dispatch time.
+        result.library = StructuralMetalLibraryId::Prefill;
+        result.function = "prefill_f16_tile"; result.abi = "prefill.f16.tile.v1";
+        result.dispatch = dispatch(32, 32); break;
     case StructuralMetalPrimitive::VecAdd:
         result.function = "vec_add"; result.abi = "vec.add.v1";
         result.dispatch = dispatch(1, 1024); break;
@@ -604,9 +611,13 @@ bool has_strategy(const CertificateFact& fact,
     return fact.lowering.strategy == static_cast<uint32_t>(strategy);
 }
 
-bool exact_two_row(const SemanticDispatchProgram& program) noexcept {
+// Exact admitted batched prefill widths: two (the legacy rows kernel) and
+// the declared tile width (the tiled kernel). The plan pattern admits the
+// full interval between them; this is the exact structural gate.
+bool admitted_batch_prefill(const SemanticDispatchProgram& program) noexcept {
     return program.request.phase == ExecutionPhase::Prefill &&
-           program.request.batch_rows == 2;
+           (program.request.batch_rows == 2 ||
+            program.request.batch_rows == kPrefillTileRows);
 }
 
 bool is_final_output_operator(const SemanticModel& model,
@@ -677,16 +688,16 @@ std::optional<CompatibilityReport> validate_program_order(
     return std::nullopt;
 }
 
-std::optional<CompatibilityReport> validate_two_row_program(
+std::optional<CompatibilityReport> validate_batched_program(
     const SemanticModel& model, const SemanticDispatchProgram& program,
     const std::vector<std::vector<CertificateFact>>& facts) {
-    if (!exact_two_row(program)) return std::nullopt;
+    if (!admitted_batch_prefill(program)) return std::nullopt;
     for (size_t index = 0; index < program.steps.size(); ++index) {
         const SemanticDispatchStep& step = program.steps[index];
         if (step.kind != SemanticDispatchStepKind::Operator) continue;
         const SemanticOperator* operation = operator_for(model, step.operator_id);
         if (!operation) return fail(CompatibilityError::IR_REFERENCE_INVALID,
-                                    "two-row program has an unknown operator",
+                                    "batched prefill program has an unknown operator",
                                     step.operator_id);
         switch (operation->kind) {
         case OperatorKind::EmbeddingLookup:
@@ -694,7 +705,7 @@ std::optional<CompatibilityReport> validate_two_row_program(
                 !has_strategy(facts[index][0],
                               MetalCodecLoweringStrategy::StructuralEmbeddingF16))
                 return fail(CompatibilityError::KERNEL_UNAVAILABLE,
-                            "two-row F16 prefill requires an F16 embedding",
+                            "batched F16 prefill requires an F16 embedding",
                             operation->id);
             break;
         case OperatorKind::Linear:
@@ -704,7 +715,7 @@ std::optional<CompatibilityReport> validate_two_row_program(
                 !has_strategy(facts[index][0],
                               MetalCodecLoweringStrategy::StructuralGemvF16)))
                 return fail(CompatibilityError::KERNEL_UNAVAILABLE,
-                            "two-row F16 prefill requires unbiased F16 linears",
+                            "batched F16 prefill requires unbiased F16 linears",
                             operation->id);
             break;
         case OperatorKind::RmsNorm:
@@ -715,7 +726,7 @@ std::optional<CompatibilityReport> validate_two_row_program(
             break;
         default:
             return fail(CompatibilityError::KERNEL_UNAVAILABLE,
-                        "two-row F16 prefill contains an unsupported semantic operation",
+                        "batched F16 prefill contains an unsupported semantic operation",
                         operation->id);
         }
     }
@@ -920,7 +931,7 @@ std::optional<CompatibilityReport> add_primitives(
         break;
     }
     case OperatorKind::Linear: {
-        const bool batched_linear = exact_two_row(program) &&
+        const bool batched_linear = admitted_batch_prefill(program) &&
             !is_final_output_operator(model, program, operation);
         const bool router_projection = operation.outputs.size() == 1 &&
             std::any_of(model.operators.begin(), model.operators.end(),
@@ -942,7 +953,7 @@ std::optional<CompatibilityReport> add_primitives(
             (!selected || *selected != StructuralMetalPrimitive::GemvF32)) {
             return fail(CompatibilityError::KERNEL_UNAVAILABLE,
                         batched_linear
-                            ? "two-row prefill does not support an F32 router projection"
+                            ? "batched prefill does not support an F32 router projection"
                             : "router projection requires an exact F32 structural codec",
                         operation.id);
         } else if (!router_projection && selected &&
@@ -953,13 +964,13 @@ std::optional<CompatibilityReport> add_primitives(
         if (batched_linear) {
             if (!selected || *selected != StructuralMetalPrimitive::GemvF16)
                 return fail(CompatibilityError::KERNEL_UNAVAILABLE,
-                            "two-row prefill only supports an F16 structural codec",
+                            "batched prefill only supports an F16 structural codec",
                             operation.id);
         }
         if (column_grouped) {
             if (batched_linear)
                 return fail(CompatibilityError::KERNEL_UNAVAILABLE,
-                            "two-row prefill does not support column-grouped affine",
+                            "batched prefill does not support column-grouped affine",
                             operation.id);
             if (const auto report = add(StructuralMetalPrimitive::ColumnGroupedSelect))
                 return report;
@@ -968,8 +979,11 @@ std::optional<CompatibilityReport> add_primitives(
             if (const auto report = add(StructuralMetalPrimitive::ColumnGroupedReduce))
                 return report;
         } else if (const auto report = add(
-                       batched_linear ? StructuralMetalPrimitive::PrefillF16Rows
-                               : *selected)) {
+                       batched_linear
+                           ? (program.request.batch_rows == 2
+                                  ? StructuralMetalPrimitive::PrefillF16Rows
+                                  : StructuralMetalPrimitive::PrefillF16Tile)
+                           : *selected)) {
             return report;
         }
         const auto* payload = std::get_if<LinearPayload>(&operation.payload);
@@ -2043,7 +2057,7 @@ std::optional<CompatibilityReport> compile_program(
                         step.operator_id);
         }
     }
-    if (const auto report = validate_two_row_program(model, program, facts)) return report;
+    if (const auto report = validate_batched_program(model, program, facts)) return report;
 
     std::vector<StructuralMetalBundleStep> steps;
     steps.reserve(program.steps.size());

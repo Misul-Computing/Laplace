@@ -30,6 +30,7 @@
 
 #include "gguf.h"
 #include "generation_loop.h"
+#include "prefill_tile.h"
 #include "product_package.h"
 #include "program_package.h"
 #include "runtime_session.h"
@@ -342,7 +343,7 @@ static int run_generate(const std::string& path,
     uint32_t max_seq = 0;
 
     SessionRequest request;
-    request.max_batch = 1;
+    request.max_batch = kPrefillTileRows;
     request.memory_limit = UINT64_MAX;
     request.enable_prefill = true;
     request.enable_decode = true;

@@ -252,6 +252,8 @@ private:
                                                                   ExecutionPhase phase,
                                                                   OutputMode output_mode);
     std::variant<CanonicalMetalOutput, CompatibilityReport> advance_prefill(uint32_t token_id);
+    std::variant<CanonicalMetalOutput, CompatibilityReport> advance_prefill_batch(
+        std::span<const uint32_t> token_ids);
     std::unique_ptr<Impl> impl_;
 
     friend class RuntimeSession;

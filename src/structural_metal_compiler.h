@@ -52,6 +52,7 @@ enum class StructuralMetalPrimitive : uint8_t {
     GemvQ6 = 8,
     GemvAffineU2 = 9,
     PrefillF16Rows = 10,
+    PrefillF16Tile = 36,
     VecAdd = 11,
     SwiGlu = 12,
     RopeHalfSplit = 13,

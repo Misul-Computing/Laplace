@@ -1,6 +1,7 @@
 #include "execution_plan.h"
 
 #include "compat_rule.h"
+#include "prefill_tile.h"
 
 #include <algorithm>
 #include <array>
@@ -1698,7 +1699,8 @@ KernelQuery moe_metal_query(const SemanticModel& model, const SemanticLayer& lay
 }
 
 bool dense_prefill_batch_layer(const SemanticModel& model, const SemanticLayer& layer,
-                               const SemanticOperator*& attention, uint32_t* weight_format = nullptr) {
+                               const SemanticOperator*& attention, uint32_t* weight_format = nullptr,
+                               bool require_tile_reduction_width = false) {
     uint32_t format = 0;
     if (!dense_metal_layer(model, layer, attention, &format) || !attention ||
         format != MetalWeightFormatF16) return false;
@@ -1710,6 +1712,15 @@ bool dense_prefill_batch_layer(const SemanticModel& model, const SemanticLayer& 
                tensor->planes[0].kind == PlaneKind::Values &&
                tensor->planes[0].storage_type == ScalarType::F16 &&
                tensor->planes[0].alignment == 64;
+    };
+    // The tiled batch kernel stages weights and activations as 128-bit
+    // vectors, so its reduction width (the inner dimension) must be a
+    // multiple of the declared tile stride.
+    const auto tile_reduction_width = [](const SemanticTensor* tensor) {
+        return tensor && tensor->dimensions.size() == 2 &&
+               tensor->dimensions[1].kind == DimensionKind::Constant &&
+               tensor->dimensions[1].constant_or_symbol != 0 &&
+               tensor->dimensions[1].constant_or_symbol % kPrefillTileKMultiple == 0;
     };
     const auto unique_role = [&](TensorRole role) {
         const SemanticTensor* found = nullptr;
@@ -1751,7 +1762,10 @@ bool dense_prefill_batch_layer(const SemanticModel& model, const SemanticLayer& 
             case TensorRole::FfnGateWeight:
             case TensorRole::FfnUpWeight:
             case TensorRole::FfnDownWeight:
-                if (!exact_f16_64(&model.tensors[tensor_id])) return false;
+                if (!exact_f16_64(&model.tensors[tensor_id]) ||
+                    (require_tile_reduction_width &&
+                     !tile_reduction_width(&model.tensors[tensor_id])))
+                    return false;
                 break;
             case TensorRole::QueryBias:
             case TensorRole::KeyBias:
@@ -1779,8 +1793,14 @@ KernelQuery dense_prefill_batch_query(const SemanticModel& model, const Semantic
                                       const SemanticOperator& attention, uint32_t batch_rows) {
     KernelQuery query = dense_metal_query(model, layer, attention, ExecutionPhase::Prefill, batch_rows);
     const SemanticOperator* candidate = nullptr;
+    // Widths two and the declared tile width are admitted; the interval
+    // pattern range is necessary but not sufficient, and the structural
+    // compiler fails closed on any width outside this exact set.
     query.metal_dense_prefill_batch_pattern =
-        batch_rows == 2 && dense_prefill_batch_layer(model, layer, candidate) && candidate == &attention;
+        (batch_rows == 2 || batch_rows == kPrefillTileRows) &&
+        dense_prefill_batch_layer(model, layer, candidate, nullptr,
+                                  batch_rows == kPrefillTileRows) &&
+        candidate == &attention;
     return query;
 }
 
@@ -3103,7 +3123,7 @@ std::vector<KernelDescriptor> builtin_canonical_metal_registry() {
     prefill_batch.pattern.rank = {2, 3};
     prefill_batch.pattern.alignment = {64, 64};
     prefill_batch.pattern.head_dimension = {32, 512};
-    prefill_batch.pattern.batch_rows = {2, 2};
+    prefill_batch.pattern.batch_rows = {2, kPrefillTileRows};
     prefill_batch.pattern.head_dimension_multiple = 16;
     prefill_batch.pattern.tile_tokens = {0, 0};
     prefill_batch.pattern.block_elements = {0, 0};

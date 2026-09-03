@@ -21,17 +21,16 @@ kernel void prefill_f16_rows(
     for (int k = 0; k < K; ++k) sum += float(weight_row[k]) * input_row[k];
     output[index] = sum;
 }
-)METAL";
-
+)METAL"
 // Tiled batched prefill projection. One threadgroup (a single simdgroup of
 // 32 lanes) computes a 32-row x 32-column output tile: activations for one
 // k-block are staged cooperatively in threadgroup memory, so every weight
 // element is fetched once per tile instead of once per output row, and each
 // lane keeps its weight slice in registers as 128-bit vectors. Requires
-// K % 8 == 0 (admitted host-side); M and N need no alignment. Edge tiles are
-// zero-padded, and the accumulation order over k matches the scalar kernel,
-// so results are bit-identical for the same M.
-static const char* src_prefill_f16_tile = R"METAL(
+// K % 8 == 0 (self-guarded and admitted host-side); M and N need no
+// alignment. Edge tiles are zero-padded, and the accumulation order over k
+// matches the scalar kernel, so results are bit-identical for the same M.
+R"METAL(
 #include <metal_stdlib>
 using namespace metal;
 

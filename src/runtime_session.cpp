@@ -1,6 +1,7 @@
 #include "runtime_session.h"
 
 #include "product_package.h"
+#include "prefill_tile.h"
 #include "program_package.h"
 
 #include <algorithm>
@@ -384,18 +385,32 @@ RuntimeRunResult RuntimeSession::execute(std::span<const uint32_t> token_ids,
                     poisoned_ = true;
                     return session_error(CompatibilityError::STATE_ABI_MISMATCH);
                 }
+                const size_t remaining = token_ids.size() - index;
+                // Tile-width chunks amortize each weight read across a
+                // whole prompt block; the two-row pair stays for short
+                // prompts and everything else runs per token.
+                const size_t tile_chunk =
+                    !metal_->has_recurrent_layers() &&
+                            request_.max_batch >= kPrefillTileRows &&
+                            remaining >= kPrefillTileRows
+                        ? static_cast<size_t>(kPrefillTileRows)
+                        : 0;
                 const bool batch_two =
-                    !metal_->has_recurrent_layers() && request_.max_batch >= 2 &&
+                    tile_chunk == 0 &&
+                    !metal_->has_recurrent_layers() &&
+                    request_.max_batch >= 2 &&
                     metal_->position() == 0 && index == 0 &&
-                    token_ids.size() >= 2;
-                const size_t rows = batch_two ? 2 : 1;
+                    remaining >= 2;
+                const size_t rows = tile_chunk != 0 ? tile_chunk : (batch_two ? 2 : 1);
                 const bool final_chunk = index + rows == token_ids.size();
                 CanonicalMetalRunResult chained = [&]() {
-                    if (rows == 2) {
-                        const auto pair = token_ids.subspan(index, 2);
-                        return final_chunk && sampled
-                            ? metal_->prefill_sampled(pair)
-                            : metal_->prefill(pair);
+                    if (rows > 1) {
+                        const auto batch = token_ids.subspan(index, rows);
+                        return final_chunk
+                            ? (sampled
+                                ? metal_->prefill_sampled(batch)
+                                : metal_->prefill(batch))
+                            : metal_->advance_prefill_batch(batch);
                     }
                     const uint32_t token = token_ids[index];
                     return final_chunk
