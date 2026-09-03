@@ -852,6 +852,10 @@ add_executable(test_sampler tests/test_sampler.cpp src/sampler.cpp)
 target_include_directories(test_sampler PRIVATE src)
 add_test(NAME test_sampler COMMAND test_sampler)
 
+add_executable(test_prefill_tile_emulation tests/test_prefill_tile_emulation.cpp)
+target_include_directories(test_prefill_tile_emulation PRIVATE src)
+add_test(NAME test_prefill_tile_emulation COMMAND test_prefill_tile_emulation)
+
 add_executable(test_tokenizer tests/test_tokenizer.cpp src/tokenizer.cpp src/gguf.cpp src/mmap.cpp)
 target_include_directories(test_tokenizer PRIVATE src)
 add_test(NAME test_tokenizer COMMAND test_tokenizer)
