@@ -84,6 +84,10 @@ enum class PretokenizerFlags : uint8_t {
     None = 0,
     AddPrefixSpace = 1u << 0,
     SplitAsciiWhitespace = 1u << 1,
+    // Qwen-class sources group consecutive newlines (and horizontal space
+    // before them) into one segment; the default follows GPT-2's
+    // backtracking whitespace rule instead. Selected from package facts.
+    GroupNewlineRuns = 1u << 2,
 };
 
 enum class BpeFlags : uint16_t {

@@ -36,7 +36,8 @@ constexpr uint16_t kKnownAddedFlags = static_cast<uint16_t>(AddedTokenFlags::Sin
                                        static_cast<uint16_t>(AddedTokenFlags::Normalized) |
                                        static_cast<uint16_t>(AddedTokenFlags::Special);
 constexpr uint8_t kKnownPretokenizerFlags = static_cast<uint8_t>(PretokenizerFlags::AddPrefixSpace) |
-                                            static_cast<uint8_t>(PretokenizerFlags::SplitAsciiWhitespace);
+                                            static_cast<uint8_t>(PretokenizerFlags::SplitAsciiWhitespace) |
+                                            static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns);
 constexpr uint8_t kKnownPostprocessorFlags = static_cast<uint8_t>(PostprocessorFlags::AddBos) |
                                              static_cast<uint8_t>(PostprocessorFlags::AddEos);
 constexpr uint16_t kKnownBpeFlags = static_cast<uint16_t>(BpeFlags::FuseUnknown);
@@ -1364,7 +1365,9 @@ TokenProgramStatus normalize_sentencepiece_v3(std::string_view input, const Toke
     std::vector<ScalarSpan> normalized_scalars;
     if (!collect_scalars(source, normalized_scalars)) return failure(TokenProgramError::InvalidUtf8, "V3 normalized UTF-8 is invalid");
     for (const ScalarSpan scalar : normalized_scalars) {
-        if (scalar_is_whitespace(scalar.value) && escape) {
+        // SentencePiece escapes the ASCII space only; newlines and tabs
+        // stay literal and match their own pieces.
+        if (escape && scalar.value == ' ') {
             output.append("\xe2\x96\x81");
         } else {
             output.append(source.substr(scalar.begin, scalar.end - scalar.begin));
@@ -1376,6 +1379,8 @@ TokenProgramStatus normalize_sentencepiece_v3(std::string_view input, const Toke
     }
     return {};
 }
+
+std::vector<std::string_view> scan_unicode_scalars(std::string_view text, bool group_newline_runs);
 
 TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_view text) {
     const TokenProgramDefinition& definition = program.definition();
@@ -1417,77 +1422,141 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
     };
     append_bos();
     if (definition.model_kind == TokenProgramModelKind::SentencePiece) {
-        struct State {
-            bool reachable = false;
-            float score = -INFINITY;
-            size_t previous = SIZE_MAX;
-            uint32_t token = kTokenProgramNoTokenId;
-        };
-        std::vector<State> states(normalized.size() + 1);
-        states[0].reachable = true;
-        states[0].score = 0.0f;
-        uint64_t work = 0;
         std::unordered_map<std::string, uint32_t> byte_ids;
         for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
             if (static_cast<TokenPieceType>(definition.vocabulary[index].type) == TokenPieceType::Byte) {
                 byte_ids.emplace(definition.vocabulary[index].piece, static_cast<uint32_t>(index));
             }
         }
-        for (size_t offset = 0; offset < normalized.size(); ++offset) {
-            if (!states[offset].reachable) continue;
+        uint64_t work = 0;
+        // User-defined symbols (the raw multi-space and newline pieces)
+        // match the raw text before normalization; everything else is
+        // normalized per segment and segmented greedily.
+        struct RawItem {
+            bool is_token = false;
+            uint32_t token = kTokenProgramNoTokenId;
+            std::string text;
+        };
+        std::vector<RawItem> items;
+        {
+            std::vector<std::pair<size_t, uint32_t>> user_defined;
             for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
-                const VocabEntry& entry = definition.vocabulary[index];
-                if (!v3_is_regular(entry) || entry.piece.size() > normalized.size() - offset) continue;
-                if (++work > kV3MaxExecutionWork) return failure(TokenProgramError::InputTooLarge, "V3 tokenizer work bound exceeded");
-                if (normalized.compare(offset, entry.piece.size(), entry.piece) != 0) continue;
-                const size_t end = offset + entry.piece.size();
-                State& candidate = states[end];
-                const float score = states[offset].score + entry.score;
-                if (!candidate.reachable || score > candidate.score ||
-                    (score == candidate.score && index < candidate.token)) {
-                    candidate = {true, score, offset, static_cast<uint32_t>(index)};
+                if (static_cast<TokenPieceType>(definition.vocabulary[index].type) !=
+                    TokenPieceType::UserDefined) {
+                    continue;
+                }
+                user_defined.emplace_back(definition.vocabulary[index].piece.size(),
+                                          static_cast<uint32_t>(index));
+            }
+            std::sort(user_defined.begin(), user_defined.end(),
+                      [](const auto& left, const auto& right) {
+                          return left.first > right.first;
+                      });
+            std::string pending;
+            size_t offset = 0;
+            while (offset < text.size()) {
+                bool matched = false;
+                for (const auto& [size, id] : user_defined) {
+                    if (size > text.size() - offset) continue;
+                    if (text.compare(offset, size,
+                                     definition.vocabulary[id].piece) != 0) {
+                        continue;
+                    }
+                    if (!pending.empty()) {
+                        items.push_back({false, kTokenProgramNoTokenId, std::move(pending)});
+                        pending.clear();
+                    }
+                    items.push_back({true, id, {}});
+                    offset += size;
+                    matched = true;
+                    break;
+                }
+                if (!matched) {
+                    pending.push_back(text[offset]);
+                    ++offset;
                 }
             }
-            if (definition.byte_fallback) {
-                const uint8_t byte = static_cast<uint8_t>(normalized[offset]);
-                const auto found = byte_ids.find(v3_byte_piece(byte));
-                if (found != byte_ids.end()) {
-                    State& candidate = states[offset + 1];
-                    if (!candidate.reachable || states[offset].score > candidate.score) {
-                        candidate = {true, states[offset].score, offset, found->second};
+            if (!pending.empty()) {
+                items.push_back({false, kTokenProgramNoTokenId, std::move(pending)});
+            }
+        }
+        bool first_segment = true;
+        for (const RawItem& item : items) {
+            if (item.is_token) {
+                output.push_back(item.token);
+                first_segment = false;
+                continue;
+            }
+            std::string normalized;
+            const TokenProgramStatus status =
+                normalize_sentencepiece_v3(item.text, definition, normalized);
+            if (!status.ok()) return status;
+            if (first_segment) {
+                first_segment = false;
+            } else if ((definition.normalizer.flags &
+                        static_cast<uint8_t>(SentencePieceNormalizerFlags::AddDummyPrefix)) != 0 &&
+                       normalized.size() >= 3 &&
+                       static_cast<uint8_t>(normalized[0]) == 0xe2 &&
+                       static_cast<uint8_t>(normalized[1]) == 0x96 &&
+                       static_cast<uint8_t>(normalized[2]) == 0x81) {
+                // The dummy prefix belongs to the whole input, not to each
+                // segment split by a user-defined symbol.
+                normalized.erase(0, 3);
+            }
+            size_t offset = 0;
+            while (offset < normalized.size()) {
+                uint32_t best_id = kTokenProgramNoTokenId;
+                size_t best_size = 0;
+                for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
+                    const VocabEntry& entry = definition.vocabulary[index];
+                    if (!v3_is_regular(entry) || entry.piece.size() <= best_size ||
+                        entry.piece.size() > normalized.size() - offset) {
+                        continue;
+                    }
+                    if (++work > kV3MaxExecutionWork) {
+                        return failure(TokenProgramError::InputTooLarge,
+                                       "V3 tokenizer work bound exceeded");
+                    }
+                    if (normalized.compare(offset, entry.piece.size(), entry.piece) != 0) {
+                        continue;
+                    }
+                    best_id = static_cast<uint32_t>(index);
+                    best_size = entry.piece.size();
+                }
+                if (best_id != kTokenProgramNoTokenId) {
+                    output.push_back(best_id);
+                    offset += best_size;
+                    continue;
+                }
+                if (definition.byte_fallback) {
+                    const uint8_t byte = static_cast<uint8_t>(normalized[offset]);
+                    const auto found = byte_ids.find(v3_byte_piece(byte));
+                    if (found != byte_ids.end()) {
+                        output.push_back(found->second);
+                        ++offset;
+                        continue;
                     }
                 }
-            }
-            if (definition.unknown_token_id != kTokenProgramNoTokenId) {
-                uint32_t scalar = 0;
-                size_t scalar_length = 0;
-                if (!decode_scalar_at(normalized, offset, scalar, scalar_length)) {
-                    // Byte fallback may deliberately make progress one byte
-                    // at a time through a UTF-8 scalar.  Such continuation
-                    // bytes are not an invalid input scalar; they simply
-                    // cannot start an unknown-piece transition.
-                    if ((static_cast<uint8_t>(normalized[offset]) & 0xc0) == 0x80) continue;
-                    return failure(TokenProgramError::InvalidUtf8, "V3 normalized SentencePiece text is invalid");
+                if (definition.unknown_token_id != kTokenProgramNoTokenId) {
+                    uint32_t scalar = 0;
+                    size_t scalar_length = 0;
+                    if (!decode_scalar_at(normalized, offset, scalar, scalar_length)) {
+                        if ((static_cast<uint8_t>(normalized[offset]) & 0xc0) == 0x80) {
+                            ++offset;
+                            continue;
+                        }
+                        return failure(TokenProgramError::InvalidUtf8,
+                                       "V3 normalized SentencePiece text is invalid");
+                    }
+                    output.push_back(definition.unknown_token_id);
+                    offset += scalar_length;
+                    continue;
                 }
-                State& candidate = states[offset + scalar_length];
-                const float score = states[offset].score + definition.vocabulary[definition.unknown_token_id].score;
-                if (!candidate.reachable || score > candidate.score ||
-                    (score == candidate.score && definition.unknown_token_id < candidate.token)) {
-                    candidate = {true, score, offset, definition.unknown_token_id};
-                }
+                return failure(TokenProgramError::UnknownPiece,
+                               "V3 SentencePiece position has no piece, byte, or unknown coverage",
+                               SIZE_MAX, static_cast<uint32_t>(offset));
             }
         }
-        if (!states.back().reachable) return failure(TokenProgramError::UnknownPiece, "V3 SentencePiece has no valid segmentation");
-        std::vector<uint32_t> reversed;
-        for (size_t cursor = normalized.size(); cursor != 0;) {
-            const State& state = states[cursor];
-            if (!state.reachable || state.previous == SIZE_MAX || state.token == kTokenProgramNoTokenId) {
-                return failure(TokenProgramError::UnknownPiece, "V3 SentencePiece backtrace is incomplete");
-            }
-            reversed.push_back(state.token);
-            cursor = state.previous;
-        }
-        output.insert(output.end(), reversed.rbegin(), reversed.rend());
         append_eos();
         return output;
     }
@@ -1577,6 +1646,16 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
                 if (!status.ok()) return status;
             }
             begin = index + 1;
+        }
+    } else if (definition.pretokenizer.kind == PretokenizerKind::ByteLevel) {
+        // Byte-level BPE groups by the family-neutral scalar scanner
+        // before merging, so merges never cross a word boundary.
+        for (std::string_view segment : scan_unicode_scalars(
+                 canonical,
+                 (definition.pretokenizer.flags &
+                  static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns)) != 0)) {
+            const TokenProgramStatus status = append_merged(segment);
+            if (!status.ok()) return status;
         }
     } else {
         const TokenProgramStatus status = append_merged(canonical);
@@ -2489,7 +2568,9 @@ bool scalar_is_word(uint32_t value) {
 
 bool scalar_is_newline(uint32_t value) { return value == '\n' || value == '\r'; }
 
-std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
+std::vector<std::string_view> scan_unicode_scalars(std::string_view text, bool group_newline_runs);
+
+std::vector<std::string_view> scan_unicode_scalars(std::string_view text, bool group_newline_runs) {
     std::vector<ScalarSpan> scalars;
     if (!collect_scalars(text, scalars)) return {};
     std::vector<std::string_view> result;
@@ -2498,12 +2579,22 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
         const auto at = [&](size_t index) -> uint32_t { return scalars[index].value; };
         const size_t begin = cursor;
 
-        // Keep the contraction alternatives explicit and deterministic.
+        // Keep the contraction alternatives explicit and deterministic:
+        // 's 't 're 've 'm 'll 'd.
         if (at(cursor) == '\'' && cursor + 1 < scalars.size() && at(cursor + 1) < 0x80) {
-            const char suffix = static_cast<char>(at(cursor + 1) | 0x20);
-            if (suffix == 's' || suffix == 't' || suffix == 'r' || suffix == 'v' || suffix == 'm' ||
-                suffix == 'l' || suffix == 'd') {
-                cursor += 2;
+            const char first = static_cast<char>(at(cursor + 1) | 0x20);
+            size_t take = 0;
+            if (first == 's' || first == 't' || first == 'm' || first == 'd') {
+                take = 2;
+            } else if (cursor + 2 < scalars.size() && at(cursor + 2) < 0x80) {
+                const char second = static_cast<char>(at(cursor + 2) | 0x20);
+                if ((first == 'r' && second == 'e') || (first == 'v' && second == 'e') ||
+                    (first == 'l' && second == 'l')) {
+                    take = 3;
+                }
+            }
+            if (take != 0) {
+                cursor += take;
                 result.emplace_back(text.data() + scalars[begin].begin,
                                     scalars[cursor - 1].end - scalars[begin].begin);
                 continue;
@@ -2515,7 +2606,7 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
         } else if (!scalar_is_newline(at(cursor)) && !scalar_is_letter(at(cursor)) &&
                    !scalar_is_number(at(cursor)) && cursor + 1 < scalars.size() &&
                    scalar_is_letter(at(cursor + 1))) {
-            // [^\r\n\p{L}\p{N}]?\p{L}+
+            // [^\\r\\n\\p{L}\\p{N}]?\\p{L}+
             ++cursor;
             while (cursor < scalars.size() && scalar_is_letter(at(cursor))) ++cursor;
         } else if (scalar_is_number(at(cursor))) {
@@ -2529,29 +2620,51 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
         } else if (at(cursor) == ' ' && cursor + 1 < scalars.size() &&
                    !scalar_is_whitespace(at(cursor + 1)) && !scalar_is_letter(at(cursor + 1)) &&
                    !scalar_is_number(at(cursor + 1))) {
-            // ?[^\s\p{L}\p{N}]+[\r\n]* with its optional ASCII space.
+            // ?[^\\s\\p{L}\\p{N}]+ with its optional ASCII space. The
+            // trailing [\\r\\n]* is Qwen's; the GPT-2 ByteLevel regex stops
+            // at the newline and lets the whitespace rule take it.
             ++cursor;
             while (cursor < scalars.size() && !scalar_is_whitespace(at(cursor)) &&
                    !scalar_is_letter(at(cursor)) && !scalar_is_number(at(cursor))) ++cursor;
-            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
-        } else if (scalar_is_whitespace(at(cursor)) && !scalar_is_newline(at(cursor))) {
-            size_t probe = cursor;
-            while (probe < scalars.size() && scalar_is_whitespace(at(probe)) &&
-                   !scalar_is_newline(at(probe))) ++probe;
-            if (probe < scalars.size() && scalar_is_newline(at(probe))) {
-                cursor = probe;
+            if (group_newline_runs) {
                 while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            }
+        } else if (scalar_is_whitespace(at(cursor)) && group_newline_runs &&
+                   scalar_is_newline(at(cursor))) {
+            // Qwen-class \s*[\r\n]+ at a newline: fold the whole run.
+            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+        } else if (scalar_is_whitespace(at(cursor))) {
+            if (group_newline_runs && !scalar_is_newline(at(cursor))) {
+                size_t probe = cursor;
+                while (probe < scalars.size() && !scalar_is_newline(at(probe)) &&
+                       scalar_is_whitespace(at(probe))) ++probe;
+                if (probe < scalars.size() && scalar_is_newline(at(probe))) {
+                    cursor = probe;
+                    while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+                } else {
+                    while (cursor < scalars.size() && !scalar_is_newline(at(cursor)) &&
+                           scalar_is_whitespace(at(cursor))) ++cursor;
+                    if (cursor < scalars.size() && cursor - begin > 1) --cursor;
+                }
             } else {
+                // GPT-2 \s+(?!\S): a whitespace run of any kind keeps its
+                // final scalar for whatever follows; a space joins the
+                // next word, other whitespace becomes its own segment.
                 while (cursor < scalars.size() && scalar_is_whitespace(at(cursor))) ++cursor;
+                if (cursor < scalars.size() && cursor - begin > 1) --cursor;
             }
         } else if (scalar_is_newline(at(cursor))) {
-            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            // A lone leftover newline: the regex's final \s+ alternative.
+            ++cursor;
         } else {
-            // ?[^\s\p{L}\p{N}]+[\r\n]*, including combining marks.
+            // ?[^\\s\\p{L}\\p{N}]+, including combining marks. Trailing
+            // newlines belong to the Qwen contract only.
             if (scalar_is_whitespace(at(cursor))) ++cursor;
             while (cursor < scalars.size() && !scalar_is_whitespace(at(cursor)) &&
                    !scalar_is_letter(at(cursor)) && !scalar_is_number(at(cursor))) ++cursor;
-            while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            if (group_newline_runs) {
+                while (cursor < scalars.size() && scalar_is_newline(at(cursor))) ++cursor;
+            }
         }
         if (cursor == begin) ++cursor;
         result.emplace_back(text.data() + scalars[begin].begin,
@@ -2561,7 +2674,9 @@ std::vector<std::string_view> scan_unicode_scalars(std::string_view text) {
 }
 
 std::vector<std::string_view> pretokenize_v2(std::string_view text, const PretokenizerSpec& spec) {
-    if (spec.kind == PretokenizerKind::UnicodeScalarScanner) return scan_unicode_scalars(text);
+    if (spec.kind == PretokenizerKind::UnicodeScalarScanner)
+        return scan_unicode_scalars(
+            text, (spec.flags & static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns)) != 0);
     if ((spec.flags & static_cast<uint8_t>(PretokenizerFlags::SplitAsciiWhitespace)) == 0) {
         return {text};
     }

@@ -1,5 +1,7 @@
 #include <array>
 #include <cstdint>
+#include <utility>
+#include <vector>
 #include <unistd.h>
 
 #include "artifact_set.h"
@@ -53,9 +55,92 @@ void test_untyped_tensor_stays_fail_closed() {
     }
 }
 
+std::string write_dense_source() {
+    // Plain dense llama-spelled source: no q/k norms, no routed experts,
+    // and no output projection (tied embeddings). This shape must compile
+    // through the universal product route.
+    char path[] = "/private/tmp/laplace-product-compiler-dense-XXXXXX";
+    const int fd = mkstemp(path);
+    CHECK(fd >= 0);
+    if (fd >= 0) close(fd);
+
+    constexpr uint32_t kHidden = 8;
+    constexpr uint32_t kVocab = 4;
+    constexpr uint32_t kFfn = 16;
+    gguf_writer::Writer writer;
+    writer.kv_u32("general.quantization_version", 2);
+    writer.kv_u32("llama.block_count", 1);
+    writer.kv_u32("llama.context_length", 64);
+    writer.kv_u32("llama.embedding_length", kHidden);
+    writer.kv_u32("llama.feed_forward_length", kFfn);
+    writer.kv_u32("llama.attention.head_count", 1);
+    writer.kv_u32("llama.attention.head_count_kv", 1);
+    writer.kv_u32("llama.attention.key_length", kHidden);
+    writer.kv_u32("llama.attention.value_length", kHidden);
+    writer.kv_u32("llama.rope.dimension_count", kHidden);
+    writer.kv_f32("llama.rope.freq_base", 10000.0f);
+    writer.kv_f32("llama.attention.layer_norm_rms_epsilon", 1.0e-5f);
+    writer.kv_u32("tokenizer.ggml.bos_token_id", 2);
+    writer.kv_u32("tokenizer.ggml.eos_token_id", 1);
+    writer.kv_arr_str("tokenizer.ggml.tokens", {"a", "<eos>", "<bos>", "<pad>"});
+
+    auto f32 = [](const char* name, std::vector<uint64_t> dims) {
+        gguf_writer::TensorDecl tensor;
+        tensor.name = name;
+        tensor.dims = std::move(dims);
+        tensor.type = 0;
+        size_t count = 1;
+        for (uint64_t dim : tensor.dims) count *= static_cast<size_t>(dim);
+        tensor.data.resize(count * sizeof(float), 0);
+        return tensor;
+    };
+    writer.add_tensor(f32("token_embd.weight", {kHidden, kVocab}));
+    writer.add_tensor(f32("output_norm.weight", {kHidden}));
+    writer.add_tensor(f32("blk.0.attn_norm.weight", {kHidden}));
+    writer.add_tensor(f32("blk.0.attn_q.weight", {kHidden, kHidden}));
+    writer.add_tensor(f32("blk.0.attn_k.weight", {kHidden, kHidden}));
+    writer.add_tensor(f32("blk.0.attn_v.weight", {kHidden, kHidden}));
+    writer.add_tensor(f32("blk.0.attn_output.weight", {kHidden, kHidden}));
+    writer.add_tensor(f32("blk.0.ffn_norm.weight", {kHidden}));
+    writer.add_tensor(f32("blk.0.ffn_gate.weight", {kHidden, kFfn}));
+    writer.add_tensor(f32("blk.0.ffn_up.weight", {kHidden, kFfn}));
+    writer.add_tensor(f32("blk.0.ffn_down.weight", {kFfn, kHidden}));
+    CHECK(writer.write_file(path));
+    return path;
+}
+
+void test_dense_tied_model_compiles() {
+    const std::string path = write_dense_source();
+    auto loaded = ArtifactSet::load_single_file(path);
+    unlink(path.c_str());
+    CHECK(std::holds_alternative<ArtifactSet>(loaded));
+    if (!std::holds_alternative<ArtifactSet>(loaded)) return;
+
+    ArtifactSet artifacts = std::get<ArtifactSet>(std::move(loaded));
+    auto view = artifacts.view(ArtifactId{0});
+    CHECK(std::holds_alternative<PackageView>(view));
+    if (!std::holds_alternative<PackageView>(view)) return;
+
+    const auto result = compile_gguf_product_source(
+        std::get<PackageView>(std::move(view)));
+    CHECK(std::holds_alternative<GgufProductCompilation>(result));
+    if (const auto* report = std::get_if<CompatibilityReport>(&result)) {
+        CHECK_MSG(false, "dense tied model failed to compile: %s (code=%u)",
+                  report->detail.c_str(), static_cast<unsigned>(report->code));
+        return;
+    }
+    const GgufProductCompilation& compiled = std::get<GgufProductCompilation>(result);
+    const SemanticModel& model = compiled.manifest.semantic_model();
+    CHECK(model.layers.size() == 1);
+    CHECK(model.operators.size() >= 12);
+    CHECK(model.vocabulary_size == 4);
+    CHECK(model.maximum_context == 64);
+}
+
 } // namespace
 
 int main() {
     test_untyped_tensor_stays_fail_closed();
+    test_dense_tied_model_compiles();
     return test_summary("test_gguf_product_compiler");
 }
