@@ -59,6 +59,23 @@ std::optional<float> fact_f32(const ArtifactIndex& physical, CanonicalFactKey ke
     return std::nullopt;
 }
 
+std::optional<std::vector<uint32_t>> fact_u32_vector(const ArtifactIndex& physical,
+                                                     CanonicalFactKey key) {
+    for (const ArtifactFact& fact : physical.metadata_facts()) {
+        if (fact.key != key || fact.state != ArtifactFactState::Present) continue;
+        const auto* vector = std::get_if<std::vector<uint64_t>>(&fact.value);
+        if (!vector || vector->size() > 4096) return std::nullopt;
+        std::vector<uint32_t> values;
+        values.reserve(vector->size());
+        for (uint64_t value : *vector) {
+            if (value > UINT32_MAX) return std::nullopt;
+            values.push_back(static_cast<uint32_t>(value));
+        }
+        return values;
+    }
+    return std::nullopt;
+}
+
 const ArtifactTensorRecord* physical_tensor(const ArtifactIndex& index, uint32_t id) {
     for (const ArtifactTensorRecord& tensor : index.tensors()) if (tensor.id == id) return &tensor;
     return nullptr;
@@ -328,7 +345,9 @@ std::optional<SemanticTensor> semantic_tensor(const ArtifactTensorRecord& physic
     }
     if (typed.role == TensorRole::NextnEmbeddingNormWeight ||
         (typed.role == TensorRole::PostNormWeight && typed.coordinate.slot == 0)) {
-        result.flags = kSemanticTensorFlagInactiveProgram;
+        // Historical programs left these unconsumed; activity is now decided
+        // by the built graph, which marks every unreferenced tensor
+        // inactive-program instead of pre-guessing by role.
     }
     return result;
 }
@@ -336,6 +355,7 @@ std::optional<SemanticTensor> semantic_tensor(const ArtifactTensorRecord& physic
 struct LayerRefs {
     uint32_t attn_norm, q, k, v, q_norm, k_norm, attn_out, ffn_norm, gate, up, down;
     uint32_t q_bias, k_bias, v_bias;
+    uint32_t post_attn, post_ffw;
     uint32_t route_scale, router, expert_norm, expert_up, expert_down, reduce;
     uint32_t post_dense, post_moe, post_output, output_scale;
 };
@@ -549,7 +569,6 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     const auto rope_base = fact_f32(physical, rope_freq_base);
     const auto bos = fact_u32(physical, bos_token_id);
     const auto eos = fact_u32(physical, eos_token_id);
-    const auto sliding_window = fact_u32(physical, attention_sliding_window);
     if (!layers || !hidden || !epsilon ||
         !maximum_context || !q_heads_fact || !rope_base || !bos || !eos ||
         *layers == 0 || *layers > 4096 || *hidden == 0 ||
@@ -564,9 +583,41 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
                    *selected > *experts || *selected > 16 || *expert_inter == 0)) {
         return std::nullopt;
     }
-    // Windowed attention needs a windowed cache graph; fail closed instead
-    // of silently building a global-attention plan for a windowed source.
-    if (sliding_window && *sliding_window != 0) return std::nullopt;
+    // Windowed attention: the scalar window fact applies to the layers the
+    // pattern marks. Without a declared pattern every layer takes the
+    // window, which is exact within the window and upgradeable by declaring
+    // the pattern fact; a pattern that disagrees with the layer count is a
+    // contradiction and fails closed.
+    const auto sliding_window = fact_u32(physical, attention_sliding_window);
+    const auto window_pattern = fact_u32_vector(physical, attention_sliding_window_pattern);
+    std::vector<bool> layer_windowed;
+    if (sliding_window && *sliding_window != 0) {
+        if (!window_pattern) {
+            layer_windowed.assign(*layers, true);
+        } else if (window_pattern->size() == *layers) {
+            layer_windowed.reserve(*layers);
+            for (uint32_t marked : *window_pattern) layer_windowed.push_back(marked != 0);
+        } else {
+            return std::nullopt;
+        }
+    } else {
+        layer_windowed.assign(*layers, false);
+    }
+    // Rope and embedding geometry that GGUF cannot express are declared
+    // facts with safe defaults: sources that need another value declare it
+    // (sidecar or a converter that writes the key) instead of the loader
+    // guessing from architecture names.
+    const float embed_scale = fact_f32(physical, embedding_scale).value_or(1.0f);
+    const uint32_t activation_fact = fact_u32(physical, feed_forward_activation)
+                                         .value_or(static_cast<uint32_t>(ActivationKind::Silu));
+    if (activation_fact != static_cast<uint32_t>(ActivationKind::Silu) &&
+        activation_fact != static_cast<uint32_t>(ActivationKind::GeluTanh)) {
+        return std::nullopt;
+    }
+    const ActivationKind activation = static_cast<ActivationKind>(activation_fact);
+    const float sliding_rope_base = fact_f32(physical, rope_freq_base_swa).value_or(10000.0f);
+    const auto sliding_rope_dim = fact_u32(physical, rope_dimension_count_swa);
+    const float global_rope_scale = fact_f32(physical, rope_scaling_freq_scale).value_or(1.0f);
 
     // Vocabulary and projection geometry come from typed tensor coordinates
     // and declared dimensions.  This is also the cross-check that prevents a
@@ -657,7 +708,7 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     const uint32_t embedding_tensor = find_tensor(model, 0, TensorRole::TokenEmbedding);
     if (embedding_tensor == UINT32_MAX) return std::nullopt;
     add_operator(model, OperatorKind::EmbeddingLookup, {token}, {current}, {embedding_tensor}, {},
-                 EmbeddingLookupPayload{std::bit_cast<uint32_t>(std::sqrt(static_cast<float>(*hidden))),
+                 EmbeddingLookupPayload{std::bit_cast<uint32_t>(embed_scale),
                                         model.vocabulary_size, *hidden, 0});
     model.input_values_first = token; model.input_values_count = 1;
 
@@ -668,7 +719,6 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     refs.reserve(*layers);
     const uint32_t norm_bits = std::bit_cast<uint32_t>(*epsilon);
     constexpr uint32_t one_bits = 0x3f800000u;
-    const uint32_t rope_base_bits = std::bit_cast<uint32_t>(*rope_base);
     for (uint32_t layer = 0; layer != *layers; ++layer) {
         const ArtifactTensorRecord* layer_q = unique_role_tensor(
             physical, TensorRole::QueryWeight, layer);
@@ -740,6 +790,8 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         r.q_bias = find_layer_tensor(model, physical, layer, TensorRole::QueryBias);
         r.k_bias = find_layer_tensor(model, physical, layer, TensorRole::KeyBias);
         r.v_bias = find_layer_tensor(model, physical, layer, TensorRole::ValueBias);
+        r.post_attn = find_layer_tensor(model, physical, layer, TensorRole::PostNormWeight, false, 0);
+        r.post_ffw = find_layer_tensor(model, physical, layer, TensorRole::PostNormWeight, false, 3);
         r.route_scale = find_layer_tensor(model, physical, layer, TensorRole::RouterScaleWeight);
         r.router = find_layer_tensor(model, physical, layer, TensorRole::NextnProjectionWeight);
         r.expert_norm = find_layer_tensor(model, physical, layer, TensorRole::ExpertNormWeight);
@@ -783,6 +835,13 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         const uint32_t du = add_value(model, ScalarType::F32, rows(intermediate));
         const uint32_t dh = add_value(model, ScalarType::F32, rows(intermediate));
         const uint32_t dd = add_value(model, ScalarType::F32, rows(*hidden));
+        // Sandwich-norm sources (the gemma shape) norm both after the
+        // attention residual and after the FFN; without those tensors the
+        // graph is unchanged.
+        const uint32_t normed2 = r.post_attn != UINT32_MAX
+            ? add_value(model, ScalarType::F32, rows(*hidden)) : attn_res;
+        const uint32_t dd_out = r.post_ffw != UINT32_MAX
+            ? add_value(model, ScalarType::F32, rows(*hidden)) : dd;
         uint32_t dense_post = UINT32_MAX, router_norm = UINT32_MAX, route_scaled = UINT32_MAX;
         uint32_t route_normalized = UINT32_MAX, scores = UINT32_MAX, ids = UINT32_MAX;
         uint32_t weights = UINT32_MAX, expert_norm = UINT32_MAX, expert_up = UINT32_MAX;
@@ -833,19 +892,38 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
             add_operator(model, OperatorKind::RmsNorm, {qv}, {qn}, {r.q_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
         if (r.k_norm != UINT32_MAX)
             add_operator(model, OperatorKind::RmsNorm, {kv}, {kn}, {r.k_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
-        add_operator(model, OperatorKind::Rope, {qn, kn}, {qr, ar}, {}, {}, RopePayload{RopePairing::HalfSplit, true, layer_head_dim, rope_base_bits, one_bits});
+        const bool windowed = layer < layer_windowed.size() && layer_windowed[layer];
+        const float layer_rope_base = windowed ? sliding_rope_base : *rope_base;
+        const float layer_rope_scale = windowed ? 1.0f : global_rope_scale;
+        const uint32_t layer_rope_dim =
+            (windowed && sliding_rope_dim && *sliding_rope_dim % 2 == 0 &&
+             *sliding_rope_dim <= layer_head_dim)
+                ? *sliding_rope_dim : layer_head_dim;
+        add_operator(model, OperatorKind::Rope, {qn, kn}, {qr, ar}, {}, {},
+                     RopePayload{RopePairing::HalfSplit, true, layer_rope_dim,
+                                 std::bit_cast<uint32_t>(layer_rope_base),
+                                 std::bit_cast<uint32_t>(layer_rope_scale)});
         CausalAttentionPayload attention{q_heads, layer_kv_heads, layer_head_dim, one_bits, AttentionMask::Causal,
-                                         CachePolicy::Global, AttentionWindowKind::Global, 0,
+                                         CachePolicy::Global,
+                                         windowed ? AttentionWindowKind::Sliding : AttentionWindowKind::Global,
+                                         windowed && sliding_window ? *sliding_window : 0,
                                          ValueSource::SeparateProjection, vv};
         add_operator(model, OperatorKind::CausalAttention, {qr, ar, vv}, {ao}, {},
                      {key_state_id, key_state_id + 1}, attention);
         add_operator(model, OperatorKind::Linear, {ao}, {attn_proj}, {r.attn_out}, {}, LinearPayload{});
         add_operator(model, OperatorKind::Add, {current, attn_proj}, {attn_res}, {}, {}, AddPayload{});
-        add_operator(model, OperatorKind::RmsNorm, {attn_res}, {fn}, {r.ffn_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
+        if (r.post_attn != UINT32_MAX)
+            add_operator(model, OperatorKind::RmsNorm, {attn_res}, {normed2}, {r.post_attn}, {},
+                         RmsNormPayload{norm_bits, -1, 1});
+        add_operator(model, OperatorKind::RmsNorm, {normed2}, {fn}, {r.ffn_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
         add_operator(model, OperatorKind::Linear, {fn}, {dg}, {r.gate}, {}, LinearPayload{});
         add_operator(model, OperatorKind::Linear, {fn}, {du}, {r.up}, {}, LinearPayload{});
-        add_operator(model, OperatorKind::SwiGlu, {dg, du}, {dh}, {}, {}, SwiGluPayload{ActivationKind::Silu});
+        add_operator(model, OperatorKind::SwiGlu, {dg, du}, {dh}, {}, {},
+                     SwiGluPayload{activation});
         add_operator(model, OperatorKind::Linear, {dh}, {dd}, {r.down}, {}, LinearPayload{});
+        if (r.post_ffw != UINT32_MAX)
+            add_operator(model, OperatorKind::RmsNorm, {dd}, {dd_out}, {r.post_ffw}, {},
+                         RmsNormPayload{norm_bits, -1, 1});
         if (moe_source) {
         add_operator(model, OperatorKind::RmsNorm, {dd}, {dense_post}, {r.post_dense}, {}, RmsNormPayload{norm_bits, -1, 1});
         add_operator(model, OperatorKind::RmsNorm, {attn_res}, {router_norm}, {}, {}, RmsNormPayload{norm_bits, -1, 0});
@@ -872,7 +950,7 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         } else {
             // Plain dense pre-norm block: the FFN output joins the attention
             // residual directly, with no post-norm or routed path.
-            add_operator(model, OperatorKind::Add, {attn_res, dd}, {layer_out}, {}, {}, AddPayload{});
+            add_operator(model, OperatorKind::Add, {attn_res, dd_out}, {layer_out}, {}, {}, AddPayload{});
             current = layer_out;
         }
         model.layers.push_back({layer, first_operator,
@@ -886,6 +964,25 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     add_operator(model, OperatorKind::RmsNorm, {current}, {final}, {final_norm}, {}, RmsNormPayload{norm_bits, -1, 1});
     add_operator(model, OperatorKind::Linear, {final}, {logits}, {output_weight}, {}, LinearPayload{});
     model.output_values_first = logits; model.output_values_count = 1;
+
+    // The program defines tensor activity: a tensor no operator references
+    // is inactive-program, and a referenced tensor is active. This replaces
+    // role-based pre-guessing, so optional tensors (q/k norms, sandwich
+    // norms, the rope table) are consumed or parked by the graph itself.
+    {
+        std::vector<bool> used(model.tensors.size(), false);
+        for (const SemanticOperator& operation : model.operators) {
+            for (uint32_t tensor_id : operation.tensors) {
+                if (tensor_id < used.size()) used[tensor_id] = true;
+            }
+        }
+        for (size_t tensor_id = 0; tensor_id != model.tensors.size(); ++tensor_id) {
+            if (!used[tensor_id] &&
+                (model.tensors[tensor_id].flags & kSemanticTensorFlagInactiveProgram) == 0) {
+                model.tensors[tensor_id].flags |= kSemanticTensorFlagInactiveProgram;
+            }
+        }
+    }
     return model;
 }
 
@@ -899,24 +996,43 @@ std::optional<TokenProgram> compile_gguf_tokenizer(const GGUFContext& context,
                                                    const SemanticModel& model) {
     const auto& metadata = context.metadata();
     const std::string* algorithm = meta_str(metadata, "tokenizer.ggml.model");
-    if (!algorithm || *algorithm != "gpt2") return std::nullopt;
+    if (!algorithm) return std::nullopt;
+    const bool byte_bpe = *algorithm == "gpt2";
+    const bool sentence_piece = *algorithm == "llama";
+    // The "tokenizer.ggml.model" value is a format-level algorithm fact,
+    // not a family name: gpt2 selects byte-level BPE and llama selects
+    // SentencePiece, and every tokenizer storing those facts compiles
+    // through one of these two paths. Other kinds fail closed.
+    if (!byte_bpe && !sentence_piece) return std::nullopt;
     const auto* tokens = meta_as<MetaArrayStr>(metadata, "tokenizer.ggml.tokens");
-    const auto* merges = meta_as<MetaArrayStr>(metadata, "tokenizer.ggml.merges");
-    if (!tokens || !merges || tokens->empty() ||
-        tokens->size() != model.vocabulary_size) {
+    if (!tokens || tokens->empty() || tokens->size() != model.vocabulary_size) {
         return std::nullopt;
     }
-    const auto* token_types = meta_as<MetaArrayU32>(metadata, "tokenizer.ggml.token_type");
+    const auto* merges = meta_as<MetaArrayStr>(metadata, "tokenizer.ggml.merges");
+    if (byte_bpe && !merges) return std::nullopt;
+    const auto* token_types_u32 = meta_as<MetaArrayU32>(metadata, "tokenizer.ggml.token_type");
+    const auto* token_types_i32 = meta_as<MetaArrayI32>(metadata, "tokenizer.ggml.token_type");
+    if ((token_types_u32 && token_types_u32->size() != tokens->size()) ||
+        (token_types_i32 && token_types_i32->size() != tokens->size())) {
+        return std::nullopt;
+    }
+    const auto type_at = [token_types_u32, token_types_i32](size_t id) -> uint32_t {
+        if (token_types_u32 && id < token_types_u32->size()) return (*token_types_u32)[id];
+        if (token_types_i32 && id < token_types_i32->size() &&
+            (*token_types_i32)[id] >= 0) return static_cast<uint32_t>((*token_types_i32)[id]);
+        return static_cast<uint32_t>(TokenPieceType::Normal);
+    };
     const auto* scores = meta_as<MetaArrayF32>(metadata, "tokenizer.ggml.scores");
-    if (token_types && token_types->size() != tokens->size()) return std::nullopt;
     if (scores && scores->size() != tokens->size()) return std::nullopt;
 
     TokenProgramDefinition definition;
-    definition.model_kind = TokenProgramModelKind::ByteBpe;
     definition.stop_ids = {model.eos_id};
-    // GPT-2 byte alphabet: printable bytes stay themselves, the rest
-    // continue at 256. This is the tokenizer data's own convention.
-    {
+    if (byte_bpe) definition.model_kind = TokenProgramModelKind::ByteBpe;
+    if (sentence_piece) definition.model_kind = TokenProgramModelKind::SentencePiece;
+
+    if (byte_bpe) {
+        // GPT-2 byte alphabet: printable bytes stay themselves, the rest
+        // continue at 256. This is the tokenizer data's own convention.
         uint32_t next = 256;
         for (int byte = 0; byte != 256; ++byte) {
             const bool printable = (byte >= 0x21 && byte <= 0x7e) ||
@@ -932,9 +1048,7 @@ std::optional<TokenProgram> compile_gguf_tokenizer(const GGUFContext& context,
     for (size_t id = 0; id != tokens->size(); ++id) {
         VocabEntry entry;
         entry.piece = (*tokens)[id];
-        const uint32_t type = token_types
-                                  ? (*token_types)[id]
-                                  : static_cast<uint32_t>(TokenPieceType::Normal);
+        const uint32_t type = type_at(id);
         if (type < static_cast<uint32_t>(TokenPieceType::Normal) ||
             type > static_cast<uint32_t>(TokenPieceType::Byte)) {
             return std::nullopt;
@@ -943,53 +1057,90 @@ std::optional<TokenProgram> compile_gguf_tokenizer(const GGUFContext& context,
         entry.flags = type == static_cast<uint32_t>(TokenPieceType::Normal)
                           ? 0
                           : static_cast<uint16_t>(VocabFlags::Special);
+        // SentencePiece segmentation is scored; byte-level BPE ignores it.
         entry.score = scores ? (*scores)[id] : 0.0f;
-        if (!piece_ids.emplace(entry.piece, static_cast<uint32_t>(id)).second)
+        if (!piece_ids.emplace(entry.piece, static_cast<uint32_t>(id)).second) {
             return std::nullopt;
+        }
         if (type == static_cast<uint32_t>(TokenPieceType::Unknown))
             definition.unknown_token_id = static_cast<uint32_t>(id);
+        if (type == static_cast<uint32_t>(TokenPieceType::Byte))
+            definition.byte_fallback = true;
         definition.vocabulary.push_back(std::move(entry));
     }
 
-    definition.merges.reserve(merges->size());
-    for (size_t rank = 0; rank != merges->size(); ++rank) {
-        const std::string& text = (*merges)[rank];
-        const size_t split = text.find(' ');
-        if (split == std::string::npos ||
-            text.find(' ', split + 1) != std::string::npos) {
-            return std::nullopt;
+    if (byte_bpe) {
+        definition.merges.reserve(merges->size());
+        for (size_t rank = 0; rank != merges->size(); ++rank) {
+            const std::string& text = (*merges)[rank];
+            const size_t split = text.find(' ');
+            if (split == std::string::npos ||
+                text.find(' ', split + 1) != std::string::npos) {
+                return std::nullopt;
+            }
+            const std::string left_text = text.substr(0, split);
+            const std::string right_text = text.substr(split + 1);
+            const auto left = piece_ids.find(left_text);
+            const auto right = piece_ids.find(right_text);
+            const auto result = piece_ids.find(left_text + right_text);
+            if (left == piece_ids.end() || right == piece_ids.end() ||
+                result == piece_ids.end()) {
+                return std::nullopt;
+            }
+            definition.merges.push_back({left->second, right->second, result->second,
+                                         static_cast<uint32_t>(rank)});
         }
-        const std::string left_text = text.substr(0, split);
-        const std::string right_text = text.substr(split + 1);
-        const auto left = piece_ids.find(left_text);
-        const auto right = piece_ids.find(right_text);
-        const auto result = piece_ids.find(left_text + right_text);
-        if (left == piece_ids.end() || right == piece_ids.end() ||
-            result == piece_ids.end()) {
-            return std::nullopt;
-        }
-        definition.merges.push_back({left->second, right->second, result->second,
-                                     static_cast<uint32_t>(rank)});
     }
 
-    definition.pretokenizer.kind = PretokenizerKind::ByteLevel;
-    // The pretokenizer grouping contract comes from the package's own
-    // "tokenizer.ggml.pre" fact. Every spelling without a verified
-    // Qwen-style newline grouping keeps the default GPT-2 backtracking
-    // rule; extending coverage is adding a spelling to this data list.
-    if (const std::string* pre = meta_str(metadata, "tokenizer.ggml.pre");
-        pre && *pre == "qwen2") {
-        definition.pretokenizer.flags =
-            static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns);
+    if (byte_bpe) {
+        definition.pretokenizer.kind = PretokenizerKind::ByteLevel;
+        // The grouping contract comes from the package's own
+        // "tokenizer.ggml.pre" fact. Every spelling without a verified
+        // Qwen-style newline grouping keeps the default GPT-2 backtracking
+        // rule; extending coverage is adding a spelling to this data list.
+        if (const std::string* pre = meta_str(metadata, "tokenizer.ggml.pre");
+            pre && *pre == "qwen2") {
+            definition.pretokenizer.flags =
+                static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns);
+        }
+        definition.decoder.kind = DecoderKind::ByteLevel;
+        definition.decoder.flags = static_cast<uint8_t>(DecoderFlags::SkipSpecial);
+    } else {
+        definition.normalizer.kind = NormalizerKind::SentencePiece;
+        // The dummy-prefix contract is the package's own
+        // "tokenizer.ggml.add_space_prefix" fact (BOOL or UINT32 per
+        // converter); whitespace escaping is the SP default.
+        bool dummy_prefix = false;
+        if (const auto* flag = meta_as<bool>(metadata, "tokenizer.ggml.add_space_prefix")) {
+            dummy_prefix = *flag;
+        } else if (const auto* flag_u32 = meta_as<uint32_t>(metadata, "tokenizer.ggml.add_space_prefix")) {
+            dummy_prefix = *flag_u32 == 1;
+        }
+        definition.normalizer.flags =
+            static_cast<uint8_t>(SentencePieceNormalizerFlags::EscapeWhitespaces) |
+            (dummy_prefix ? static_cast<uint8_t>(SentencePieceNormalizerFlags::AddDummyPrefix) : 0);
+        definition.pretokenizer.kind = PretokenizerKind::SentencePiece;
+        definition.decoder.kind = DecoderKind::Identity;
     }
-    definition.decoder.kind = DecoderKind::ByteLevel;
-    definition.decoder.flags = static_cast<uint8_t>(DecoderFlags::SkipSpecial);
     definition.postprocessor.kind = PostprocessorKind::None;
-    const auto* add_bos = meta_as<uint32_t>(metadata, "tokenizer.ggml.add_bos_token");
-    if (add_bos && *add_bos == 1 && model.bos_id != UINT32_MAX) {
+    // GGUF stores this flag as BOOL in some converters and UINT32 in others.
+    bool bos_prefix = false;
+    if (const auto* flag = meta_as<bool>(metadata, "tokenizer.ggml.add_bos_token")) {
+        bos_prefix = *flag;
+    } else if (const auto* flag_u32 = meta_as<uint32_t>(metadata, "tokenizer.ggml.add_bos_token")) {
+        bos_prefix = *flag_u32 == 1;
+    }
+    if (bos_prefix && model.bos_id != UINT32_MAX) {
         definition.postprocessor.kind = PostprocessorKind::AddBosEos;
         definition.postprocessor.flags = static_cast<uint8_t>(PostprocessorFlags::AddBos);
         definition.postprocessor.bos_token_id = model.bos_id;
+    }
+    if (definition.unknown_token_id == kTokenProgramNoTokenId) {
+        if (const auto* declared_unknown = meta_as<uint32_t>(metadata, "tokenizer.ggml.unknown_token_id");
+            declared_unknown && *declared_unknown < tokens->size() &&
+            type_at(*declared_unknown) == static_cast<uint32_t>(TokenPieceType::Unknown)) {
+            definition.unknown_token_id = *declared_unknown;
+        }
     }
     // The V3 canonical template requires a generation marker; without the
     // package's chat template the neutral universal marker is a newline.
@@ -998,9 +1149,10 @@ std::optional<TokenProgram> compile_gguf_tokenizer(const GGUFContext& context,
                          {PromptOpcode::End, {}}};
 
     auto serialized = serialize_token_program_v3(definition);
+    if (std::get_if<TokenProgramStatus>(&serialized)) return std::nullopt;
     const auto* bytes = std::get_if<std::vector<uint8_t>>(&serialized);
-    if (!bytes) return std::nullopt;
     auto compiled = TokenProgram::compile(*bytes);
+    if (std::get_if<TokenProgramStatus>(&compiled)) return std::nullopt;
     const auto* program = std::get_if<TokenProgram>(&compiled);
     if (!program) return std::nullopt;
     return std::move(*program);
@@ -1052,7 +1204,10 @@ GgufProductCompilationResult compile_normalized_gguf_product(const PackageView& 
         }
         model.tokenizer_digest = span_digest.bytes;
         model.template_digest = token_program->prompt_digest().bytes;
-        contract.tokenizer_algorithm = TokenizerAlgorithm::ByteBpe;
+        contract.tokenizer_algorithm =
+            token_program->definition().model_kind == TokenProgramModelKind::SentencePiece
+                ? TokenizerAlgorithm::SentencePiece
+                : TokenizerAlgorithm::ByteBpe;
         contract.tokenizer_version = token_program->wire_major_version();
         contract.vocabulary_digest = token_program->vocabulary_digest();
         contract.tokenizer_data = {physical.artifacts().front().artifact_id(),

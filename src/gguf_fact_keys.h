@@ -39,8 +39,14 @@ inline constexpr CanonicalFactKey expert_count{0x4755460eu};
 inline constexpr CanonicalFactKey expert_used_count{0x4755460fu};
 inline constexpr CanonicalFactKey expert_feed_forward_length{0x47554610u};
 inline constexpr CanonicalFactKey attention_sliding_window{0x47554611u};
+inline constexpr CanonicalFactKey attention_sliding_window_pattern{0x47554612u};
+inline constexpr CanonicalFactKey rope_freq_base_swa{0x47554613u};
+inline constexpr CanonicalFactKey rope_dimension_count_swa{0x47554614u};
+inline constexpr CanonicalFactKey rope_scaling_freq_scale{0x47554615u};
+inline constexpr CanonicalFactKey embedding_scale{0x47554616u};
+inline constexpr CanonicalFactKey feed_forward_activation{0x47554617u};
 
-inline constexpr std::array<Descriptor, 17> descriptors = {{
+inline constexpr std::array<Descriptor, 23> descriptors = {{
     {block_count, "block_count", ValueKind::Unsigned},
     {context_length, "context_length", ValueKind::Unsigned},
     {embedding_length, "embedding_length", ValueKind::Unsigned},
@@ -58,6 +64,12 @@ inline constexpr std::array<Descriptor, 17> descriptors = {{
     {expert_used_count, "expert_used_count", ValueKind::Unsigned},
     {expert_feed_forward_length, "expert_feed_forward_length", ValueKind::Unsigned},
     {attention_sliding_window, "attention.sliding_window", ValueKind::Unsigned},
+    {attention_sliding_window_pattern, "attention.sliding_window_pattern", ValueKind::UnsignedOrVector},
+    {rope_freq_base_swa, "rope.freq_base_swa", ValueKind::Float32},
+    {rope_dimension_count_swa, "rope.dimension_count_swa", ValueKind::UnsignedOrVector},
+    {rope_scaling_freq_scale, "rope.scaling.freq_scale", ValueKind::Float32},
+    {embedding_scale, "embedding_scale", ValueKind::Float32},
+    {feed_forward_activation, "feed_forward_activation", ValueKind::Unsigned},
 }};
 
 } // namespace Laplace::gguf_fact_keys

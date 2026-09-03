@@ -1365,7 +1365,9 @@ TokenProgramStatus normalize_sentencepiece_v3(std::string_view input, const Toke
     std::vector<ScalarSpan> normalized_scalars;
     if (!collect_scalars(source, normalized_scalars)) return failure(TokenProgramError::InvalidUtf8, "V3 normalized UTF-8 is invalid");
     for (const ScalarSpan scalar : normalized_scalars) {
-        if (scalar_is_whitespace(scalar.value) && escape) {
+        // SentencePiece escapes the ASCII space only; newlines and tabs
+        // stay literal and match their own pieces.
+        if (escape && scalar.value == ' ') {
             output.append("\xe2\x96\x81");
         } else {
             output.append(source.substr(scalar.begin, scalar.end - scalar.begin));
@@ -1420,77 +1422,141 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
     };
     append_bos();
     if (definition.model_kind == TokenProgramModelKind::SentencePiece) {
-        struct State {
-            bool reachable = false;
-            float score = -INFINITY;
-            size_t previous = SIZE_MAX;
-            uint32_t token = kTokenProgramNoTokenId;
-        };
-        std::vector<State> states(normalized.size() + 1);
-        states[0].reachable = true;
-        states[0].score = 0.0f;
-        uint64_t work = 0;
         std::unordered_map<std::string, uint32_t> byte_ids;
         for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
             if (static_cast<TokenPieceType>(definition.vocabulary[index].type) == TokenPieceType::Byte) {
                 byte_ids.emplace(definition.vocabulary[index].piece, static_cast<uint32_t>(index));
             }
         }
-        for (size_t offset = 0; offset < normalized.size(); ++offset) {
-            if (!states[offset].reachable) continue;
+        uint64_t work = 0;
+        // User-defined symbols (the raw multi-space and newline pieces)
+        // match the raw text before normalization; everything else is
+        // normalized per segment and segmented greedily.
+        struct RawItem {
+            bool is_token = false;
+            uint32_t token = kTokenProgramNoTokenId;
+            std::string text;
+        };
+        std::vector<RawItem> items;
+        {
+            std::vector<std::pair<size_t, uint32_t>> user_defined;
             for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
-                const VocabEntry& entry = definition.vocabulary[index];
-                if (!v3_is_regular(entry) || entry.piece.size() > normalized.size() - offset) continue;
-                if (++work > kV3MaxExecutionWork) return failure(TokenProgramError::InputTooLarge, "V3 tokenizer work bound exceeded");
-                if (normalized.compare(offset, entry.piece.size(), entry.piece) != 0) continue;
-                const size_t end = offset + entry.piece.size();
-                State& candidate = states[end];
-                const float score = states[offset].score + entry.score;
-                if (!candidate.reachable || score > candidate.score ||
-                    (score == candidate.score && index < candidate.token)) {
-                    candidate = {true, score, offset, static_cast<uint32_t>(index)};
+                if (static_cast<TokenPieceType>(definition.vocabulary[index].type) !=
+                    TokenPieceType::UserDefined) {
+                    continue;
+                }
+                user_defined.emplace_back(definition.vocabulary[index].piece.size(),
+                                          static_cast<uint32_t>(index));
+            }
+            std::sort(user_defined.begin(), user_defined.end(),
+                      [](const auto& left, const auto& right) {
+                          return left.first > right.first;
+                      });
+            std::string pending;
+            size_t offset = 0;
+            while (offset < text.size()) {
+                bool matched = false;
+                for (const auto& [size, id] : user_defined) {
+                    if (size > text.size() - offset) continue;
+                    if (text.compare(offset, size,
+                                     definition.vocabulary[id].piece) != 0) {
+                        continue;
+                    }
+                    if (!pending.empty()) {
+                        items.push_back({false, kTokenProgramNoTokenId, std::move(pending)});
+                        pending.clear();
+                    }
+                    items.push_back({true, id, {}});
+                    offset += size;
+                    matched = true;
+                    break;
+                }
+                if (!matched) {
+                    pending.push_back(text[offset]);
+                    ++offset;
                 }
             }
-            if (definition.byte_fallback) {
-                const uint8_t byte = static_cast<uint8_t>(normalized[offset]);
-                const auto found = byte_ids.find(v3_byte_piece(byte));
-                if (found != byte_ids.end()) {
-                    State& candidate = states[offset + 1];
-                    if (!candidate.reachable || states[offset].score > candidate.score) {
-                        candidate = {true, states[offset].score, offset, found->second};
+            if (!pending.empty()) {
+                items.push_back({false, kTokenProgramNoTokenId, std::move(pending)});
+            }
+        }
+        bool first_segment = true;
+        for (const RawItem& item : items) {
+            if (item.is_token) {
+                output.push_back(item.token);
+                first_segment = false;
+                continue;
+            }
+            std::string normalized;
+            const TokenProgramStatus status =
+                normalize_sentencepiece_v3(item.text, definition, normalized);
+            if (!status.ok()) return status;
+            if (first_segment) {
+                first_segment = false;
+            } else if ((definition.normalizer.flags &
+                        static_cast<uint8_t>(SentencePieceNormalizerFlags::AddDummyPrefix)) != 0 &&
+                       normalized.size() >= 3 &&
+                       static_cast<uint8_t>(normalized[0]) == 0xe2 &&
+                       static_cast<uint8_t>(normalized[1]) == 0x96 &&
+                       static_cast<uint8_t>(normalized[2]) == 0x81) {
+                // The dummy prefix belongs to the whole input, not to each
+                // segment split by a user-defined symbol.
+                normalized.erase(0, 3);
+            }
+            size_t offset = 0;
+            while (offset < normalized.size()) {
+                uint32_t best_id = kTokenProgramNoTokenId;
+                size_t best_size = 0;
+                for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
+                    const VocabEntry& entry = definition.vocabulary[index];
+                    if (!v3_is_regular(entry) || entry.piece.size() <= best_size ||
+                        entry.piece.size() > normalized.size() - offset) {
+                        continue;
+                    }
+                    if (++work > kV3MaxExecutionWork) {
+                        return failure(TokenProgramError::InputTooLarge,
+                                       "V3 tokenizer work bound exceeded");
+                    }
+                    if (normalized.compare(offset, entry.piece.size(), entry.piece) != 0) {
+                        continue;
+                    }
+                    best_id = static_cast<uint32_t>(index);
+                    best_size = entry.piece.size();
+                }
+                if (best_id != kTokenProgramNoTokenId) {
+                    output.push_back(best_id);
+                    offset += best_size;
+                    continue;
+                }
+                if (definition.byte_fallback) {
+                    const uint8_t byte = static_cast<uint8_t>(normalized[offset]);
+                    const auto found = byte_ids.find(v3_byte_piece(byte));
+                    if (found != byte_ids.end()) {
+                        output.push_back(found->second);
+                        ++offset;
+                        continue;
                     }
                 }
-            }
-            if (definition.unknown_token_id != kTokenProgramNoTokenId) {
-                uint32_t scalar = 0;
-                size_t scalar_length = 0;
-                if (!decode_scalar_at(normalized, offset, scalar, scalar_length)) {
-                    // Byte fallback may deliberately make progress one byte
-                    // at a time through a UTF-8 scalar.  Such continuation
-                    // bytes are not an invalid input scalar; they simply
-                    // cannot start an unknown-piece transition.
-                    if ((static_cast<uint8_t>(normalized[offset]) & 0xc0) == 0x80) continue;
-                    return failure(TokenProgramError::InvalidUtf8, "V3 normalized SentencePiece text is invalid");
+                if (definition.unknown_token_id != kTokenProgramNoTokenId) {
+                    uint32_t scalar = 0;
+                    size_t scalar_length = 0;
+                    if (!decode_scalar_at(normalized, offset, scalar, scalar_length)) {
+                        if ((static_cast<uint8_t>(normalized[offset]) & 0xc0) == 0x80) {
+                            ++offset;
+                            continue;
+                        }
+                        return failure(TokenProgramError::InvalidUtf8,
+                                       "V3 normalized SentencePiece text is invalid");
+                    }
+                    output.push_back(definition.unknown_token_id);
+                    offset += scalar_length;
+                    continue;
                 }
-                State& candidate = states[offset + scalar_length];
-                const float score = states[offset].score + definition.vocabulary[definition.unknown_token_id].score;
-                if (!candidate.reachable || score > candidate.score ||
-                    (score == candidate.score && definition.unknown_token_id < candidate.token)) {
-                    candidate = {true, score, offset, definition.unknown_token_id};
-                }
+                return failure(TokenProgramError::UnknownPiece,
+                               "V3 SentencePiece position has no piece, byte, or unknown coverage",
+                               SIZE_MAX, static_cast<uint32_t>(offset));
             }
         }
-        if (!states.back().reachable) return failure(TokenProgramError::UnknownPiece, "V3 SentencePiece has no valid segmentation");
-        std::vector<uint32_t> reversed;
-        for (size_t cursor = normalized.size(); cursor != 0;) {
-            const State& state = states[cursor];
-            if (!state.reachable || state.previous == SIZE_MAX || state.token == kTokenProgramNoTokenId) {
-                return failure(TokenProgramError::UnknownPiece, "V3 SentencePiece backtrace is incomplete");
-            }
-            reversed.push_back(state.token);
-            cursor = state.previous;
-        }
-        output.insert(output.end(), reversed.rbegin(), reversed.rend());
         append_eos();
         return output;
     }

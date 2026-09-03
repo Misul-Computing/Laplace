@@ -92,6 +92,38 @@ The `--bench` option reports prefill and decode separately.
 
 Run `./build/laplace --help` for the full option list with defaults.
 
+## Models
+
+Any conforming GGUF is worth trying: loading is universal and data-driven,
+never keyed on architecture names. Dense llama-class and Qwen-class models
+load with their byte-level BPE tokenizers (text prompts work directly),
+including tied embeddings, QKV biases, QK-norms, sandwich norms, and mixed
+Q4_K/Q5_0/Q6_K/Q8_0 quantization. Gemma-class models load with windowed
+attention and their SentencePiece tokenizer.
+
+Fetch a small test model and run it:
+
+```bash
+python3 scripts/download_model.py
+./build/laplace models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
+  -p "Hello, Laplace" -n 32 --greedy --seed 7 --bench
+```
+
+Inspect any GGUF without the engine:
+
+```bash
+python3 scripts/gguf_header.py /absolute/path/to/model.gguf
+```
+
+Packages fail closed with the reason when a contract is not expressible:
+windowed sources without a declared layer pattern default to all-window
+attention (exact within the window), and a source needing a non-unit
+embedding scale or a non-SiLU activation declares it through the
+`embedding_scale` and `feed_forward_activation` metadata keys. Sources whose
+tokenizers were trained with BPE merge ranks (serialized in GGUF as pieces
+and scores only) use longest-piece segmentation; merge ranks are not part of
+the GGUF contract.
+
 See [Architecture](docs/architecture.md), [Support](docs/support.md), and
 [Benchmarks](docs/benchmarks.md) for the execution model, support levels, and
 measurement contract.

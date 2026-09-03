@@ -189,10 +189,11 @@ ProductPackageLoadResult ProductPackage::finish_closed_v1(
     }
     const TokenContract& contract = compilation.manifest.token_contract();
     if (contract.tokenizer_algorithm != TokenizerAlgorithm::TokenIdsOnly &&
-        (contract.tokenizer_algorithm != TokenizerAlgorithm::ByteBpe ||
+        ((contract.tokenizer_algorithm != TokenizerAlgorithm::ByteBpe &&
+          contract.tokenizer_algorithm != TokenizerAlgorithm::SentencePiece) ||
          contract.prompt_mode() != TokenPromptMode::SerializedTemplate)) {
         return tokenizer_error(
-            "closed source compilation requires a ByteBpe tokenizer and input-text prompt contract");
+            "closed source compilation requires an executable tokenizer and input-text prompt contract");
     }
     if (contract.tokenizer_algorithm != TokenizerAlgorithm::TokenIdsOnly) {
         if (auto token_authority =
