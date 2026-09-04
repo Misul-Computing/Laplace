@@ -856,6 +856,10 @@ add_executable(test_prefill_tile_emulation tests/test_prefill_tile_emulation.cpp
 target_include_directories(test_prefill_tile_emulation PRIVATE src)
 add_test(NAME test_prefill_tile_emulation COMMAND test_prefill_tile_emulation)
 
+add_executable(test_chat_framing tests/test_chat_framing.cpp src/chat_framing.cpp)
+target_include_directories(test_chat_framing PRIVATE src)
+add_test(NAME test_chat_framing COMMAND test_chat_framing)
+
 add_executable(test_tokenizer tests/test_tokenizer.cpp src/tokenizer.cpp src/gguf.cpp src/mmap.cpp)
 target_include_directories(test_tokenizer PRIVATE src)
 add_test(NAME test_tokenizer COMMAND test_tokenizer)
