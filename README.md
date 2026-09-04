@@ -75,20 +75,26 @@ ctest --test-dir build --output-on-failure
 
 ## Run
 
-Inspect a local package and create its native plan:
+Talk to a model:
 
 ```bash
 ./build/laplace /absolute/path/to/model.gguf
 ```
 
-Run a fixed native sample with phase-separated measurement:
+That opens an interactive chat. Each message is framed with the model's own
+chat template, the conversation history carries across turns, and Ctrl-D
+exits. If the package's template is not one of the recognized shapes, the
+session says so and continues with plain text framing.
+
+Run one fixed response with phase-separated measurement:
 
 ```bash
 ./build/laplace /absolute/path/to/model.gguf \
   -p "Hello, Laplace" -n 32 --greedy --seed 7 --max-seq 2048 --bench
 ```
 
-The `--bench` option reports prefill and decode separately.
+The `--bench` option reports prefill and decode separately. `--info` prints
+package metadata, and `--raw-prompt` bypasses the chat template.
 
 Run `./build/laplace --help` for the full option list with defaults.
 
@@ -101,12 +107,11 @@ including tied embeddings, QKV biases, QK-norms, sandwich norms, and mixed
 Q4_K/Q5_0/Q6_K/Q8_0 quantization. Gemma-class models load with windowed
 attention and their SentencePiece tokenizer.
 
-Fetch a small test model and run it:
+Fetch a small test model and talk to it:
 
 ```bash
 python3 scripts/download_model.py
-./build/laplace models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  -p "Hello, Laplace" -n 32 --greedy --seed 7 --bench
+./build/laplace models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
 Inspect any GGUF without the engine:
