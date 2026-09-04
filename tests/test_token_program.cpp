@@ -173,6 +173,56 @@ TokenProgramDefinition definition_for_serializer() {
     return definition;
 }
 
+TokenProgramDefinition v3_byte_bpe_definition();
+
+void check_turn_program_round_trip() {
+    const TokenProgramDefinition base = v3_byte_bpe_definition();
+    TokenProgramDefinition definition = base;
+    definition.turn = {
+        {PromptOpcode::EmitLiteralUtf8, "<turn>"},
+        {PromptOpcode::EmitUserText, {}},
+        {PromptOpcode::EmitLiteralUtf8, "<end>"},
+        {PromptOpcode::EmitGenerationPrompt, "<assistant>"},
+        {PromptOpcode::End, {}},
+    };
+    const auto serialized = serialize_token_program_v3(definition);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(serialized));
+    if (!std::holds_alternative<std::vector<uint8_t>>(serialized)) return;
+    const auto compiled = TokenProgram::compile(std::get<std::vector<uint8_t>>(serialized));
+    CHECK(std::holds_alternative<TokenProgram>(compiled));
+    if (!std::holds_alternative<TokenProgram>(compiled)) return;
+    const TokenProgram& program = std::get<TokenProgram>(compiled);
+
+    const auto turn = program.render_turn("ab");
+    CHECK(std::holds_alternative<std::string>(turn));
+    if (const auto* text = std::get_if<std::string>(&turn))
+        CHECK(*text == "<turn>ab<end><assistant>");
+
+    // The first turn keeps the automatic start token; continuations must not
+    // repeat it.
+    const auto first = program.encode("<turn>ab<end><assistant>");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(first));
+    if (const auto* ids = std::get_if<std::vector<uint32_t>>(&first))
+        CHECK(!ids->empty() && ids->front() == 5);
+    const auto continuation = program.encode_continuation("<turn>ab<end><assistant>");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(continuation));
+    if (const auto* ids = std::get_if<std::vector<uint32_t>>(&continuation)) {
+        CHECK(!ids->empty() && ids->front() != 5);
+        if (const auto* first_ids = std::get_if<std::vector<uint32_t>>(&first))
+            CHECK(*ids == std::vector<uint32_t>(first_ids->begin() + 1, first_ids->end()));
+    }
+
+    // A program compiled without a turn list fails closed on turn rendering.
+    const auto plain = serialize_token_program_v3(base);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(plain));
+    if (!std::holds_alternative<std::vector<uint8_t>>(plain)) return;
+    const auto plain_compiled = TokenProgram::compile(std::get<std::vector<uint8_t>>(plain));
+    CHECK(std::holds_alternative<TokenProgram>(plain_compiled));
+    if (!std::holds_alternative<TokenProgram>(plain_compiled)) return;
+    const auto rejected = std::get<TokenProgram>(plain_compiled).render_turn("ab");
+    CHECK(std::holds_alternative<TokenProgramStatus>(rejected));
+}
+
 void check_independent_golden() {
     const RawPayload raw = canonical_payload();
     const auto result = TokenProgram::compile(raw.bytes);
@@ -996,6 +1046,7 @@ void check_v3_sentencepiece_execution_and_fail_closed() {
 } // namespace
 
 int main() {
+    check_turn_program_round_trip();
     check_independent_golden();
     check_canonical_serializer_matches_hand_built();
     check_component_parameters_and_postprocessor();

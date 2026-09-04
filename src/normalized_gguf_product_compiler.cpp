@@ -1,4 +1,5 @@
 #include "normalized_gguf_product_compiler.h"
+#include "chat_framing.h"
 
 #include <algorithm>
 #include <array>
@@ -1142,11 +1143,44 @@ std::optional<TokenProgram> compile_gguf_tokenizer(const GGUFContext& context,
             definition.unknown_token_id = *declared_unknown;
         }
     }
-    // The V3 canonical template requires a generation marker; without the
-    // package's chat template the neutral universal marker is a newline.
-    definition.prompt = {{PromptOpcode::EmitUserText, {}},
-                         {PromptOpcode::EmitGenerationPrompt, "\n"},
-                         {PromptOpcode::End, {}}};
+    // The package's own chat template compiles into the first-turn and
+    // continuation-turn programs. When the template is missing or outside
+    // the recognized conversational shapes, the neutral universal marker
+    // stays a newline and no turn program is emitted.
+    const std::string* chat_template = meta_str(metadata, "tokenizer.chat_template");
+    const ChatFraming framing =
+        chat_template ? compile_chat_framing(*chat_template) : ChatFraming{};
+    if (framing.matched) {
+        std::string system_prefix = framing.system_prefix;
+        // The template itself opens with the BOS token: when the package
+        // does not declare an automatic BOS prefix, the framing owns it and
+        // places the token's own text; otherwise the postprocessor already
+        // adds it and the framing stays out of the way.
+        if (framing.template_emits_bos && !bos_prefix &&
+            model.bos_id != UINT32_MAX && model.bos_id < tokens->size()) {
+            system_prefix = (*tokens)[model.bos_id] + system_prefix;
+        }
+        definition.prompt = {};
+        if (!system_prefix.empty())
+            definition.prompt.push_back({PromptOpcode::EmitLiteralUtf8, system_prefix});
+        definition.prompt.push_back({PromptOpcode::EmitLiteralUtf8, framing.user_open});
+        definition.prompt.push_back({PromptOpcode::EmitUserText, {}});
+        definition.prompt.push_back({PromptOpcode::EmitLiteralUtf8, framing.turn_close});
+        definition.prompt.push_back(
+            {PromptOpcode::EmitGenerationPrompt, framing.generation_open});
+        definition.prompt.push_back({PromptOpcode::End, {}});
+        definition.turn = {
+            {PromptOpcode::EmitLiteralUtf8, framing.user_open},
+            {PromptOpcode::EmitUserText, {}},
+            {PromptOpcode::EmitLiteralUtf8, framing.turn_close},
+            {PromptOpcode::EmitGenerationPrompt, framing.generation_open},
+            {PromptOpcode::End, {}},
+        };
+    } else {
+        definition.prompt = {{PromptOpcode::EmitUserText, {}},
+                             {PromptOpcode::EmitGenerationPrompt, "\n"},
+                             {PromptOpcode::End, {}}};
+    }
 
     auto serialized = serialize_token_program_v3(definition);
     if (std::get_if<TokenProgramStatus>(&serialized)) return std::nullopt;
