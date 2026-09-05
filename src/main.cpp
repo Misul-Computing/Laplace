@@ -75,13 +75,6 @@ static bool parse_float_value(const char* text, double minimum, double maximum, 
            value >= minimum && value <= maximum;
 }
 
-static void print_usage(const char* program) {
-    fprintf(stderr,
-        "usage: %s <model-path> [options]\n"
-        "try '%s --help' for all options\n",
-        program, program);
-}
-
 static void print_help(const char* program) {
     printf(
         "laplace - Apple Silicon native Metal inference engine\n"
@@ -89,7 +82,7 @@ static void print_help(const char* program) {
         "usage: %s <model-path> [options]\n"
         "       %s -- <model-path> [options]   when the model path starts with '-'\n"
         "\n"
-        "With no prompt options, starts chat. Ctrl-D exits.\n"
+        "With no prompt options, starts chat. /help shows commands; /exit or Ctrl-D exits.\n"
         "\n"
         "prompt:\n"
         "  -p <text>              generate from the given prompt text\n"
@@ -117,10 +110,12 @@ static void print_help(const char* program) {
         "  --seed <value>         sampler seed; 0 picks a fresh seed each run\n"
         "                         (default: 0)\n"
         "\n"
-        "example:\n"
+        "examples:\n"
+        "  %s /path/to/model.gguf              start a conversation\n"
+        "  %s /path/to/model.gguf --info       inspect a model\n"
         "  %s /path/to/model.gguf -p \"Hello, Laplace\" -n 32 \\\n"
         "      --greedy --seed 7 --max-seq 2048 --bench\n",
-        program, program, program);
+        program, program, program, program, program);
 }
 
 static constexpr size_t kMaxPromptFileBytes = 16 * 1024 * 1024;
@@ -169,8 +164,8 @@ static bool read_prompt_file(const std::string& path, std::string& prompt) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        print_usage(argv[0]);
-        return 1;
+        print_help(argv[0]);
+        return 0;
     }
     if (std::string(argv[1]) == "--help" || std::string(argv[1]) == "-h") {
         print_help(argv[0]);
@@ -440,7 +435,7 @@ static int run_generate(const std::string& path,
     size_t previous_reply_tokens = 0;
     const bool plain_framing = !use_template || tokenizer->definition().turn.empty();
     if (interactive) {
-        fprintf(stderr, "Ready. Type a message; Ctrl-D exits.\n");
+        fprintf(stderr, "Ready. Type a message; /help for commands, /exit or Ctrl-D to leave.\n");
         if (use_template && plain_framing)
             fprintf(stderr, "chat: no supported chat template; using plain text\n");
     }
@@ -458,6 +453,15 @@ static int run_generate(const std::string& path,
             if (!std::getline(std::cin, input)) break;
             if (!input.empty() && input.back() == '\r') input.pop_back();
             if (input.empty()) continue;
+            if (input == "/exit") break;
+            if (input == "/help") {
+                fprintf(stderr, "Enter one message per line. Conversation history stays in this session.\n"
+                                "/help  show this help\n"
+                                "/exit  leave chat (or press Ctrl-D)\n"
+                                "Context: %zu of %u tokens used.\n",
+                        session.token_history().size(), max_seq);
+                continue;
+            }
         }
         std::string rendered_prompt = interactive && plain_framing && !first_turn
             ? "\n" + input : input;

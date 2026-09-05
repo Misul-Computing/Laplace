@@ -28,7 +28,7 @@ Model:
 SHA-256 74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db
 ```
 
-Authoritative trace regenerated from that GGUF and `longprompt.txt`:
+Authoritative trace regenerated from that GGUF and [`longprompt.txt`](corpora/longprompt.txt):
 
 ```text
 /tmp/laplace-qwen-official-256-all.kvt

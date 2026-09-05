@@ -109,6 +109,7 @@ set(LAPLACE_SOURCES
 )
 
 add_executable(laplace ${LAPLACE_SOURCES})
+install(TARGETS laplace RUNTIME DESTINATION bin)
 target_include_directories(laplace PRIVATE src)
 if(LAPLACE_OMP_TARGET)
     target_link_libraries(laplace PRIVATE ${LAPLACE_OMP_TARGET})

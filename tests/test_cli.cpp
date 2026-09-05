@@ -332,6 +332,10 @@ void test_help_lists_only_the_v1_product_route() {
 
 void test_help_alias_and_option_position() {
     int status = 0;
+    const std::string bare = run_cli("", &status);
+    CHECK(status == 0);
+    CHECK(bare.find("examples:") != std::string::npos);
+    CHECK(bare.find("/exit") != std::string::npos);
     const std::string alias = run_cli("-h", &status);
     CHECK(status == 0);
     CHECK(alias.find("usage:") != std::string::npos);

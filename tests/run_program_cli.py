@@ -37,6 +37,14 @@ def main():
             sys.stderr.write(completed.stderr)
             raise SystemExit("program CLI did not report the verified Metal route")
 
+        chat = subprocess.run([
+            laplace, str(container), "--program-manifest", str(manifest),
+            "--greedy", "--max-seq", "4", "--raw-prompt",
+        ], input="/help\n/exit\na\n", text=True, capture_output=True)
+        if (chat.returncode != 0 or chat.stdout or
+                "Context: 0 of 4 tokens used." not in chat.stderr):
+            raise SystemExit(f"chat commands changed model state or failed: {chat}")
+
     print("program CLI: OK")
 
 

@@ -643,7 +643,9 @@ TurboQuant simulator used commit
 differential fixture yet, so neither is described as exact. Their FP32
 lifecycle outputs invalidate timing and measured storage.
 
-Reproduction uses a capture-enabled build and the fail-closed runner. Replace
+This historical reproduction requires the earlier CLI and the archived
+[validator](legacy/validate_laplace_kv.py); it does not run against the current
+application. Use a capture-enabled build of that revision. Replace
 the model path, choose `k4v2`, `mlxq2`, `turboquant2.5`, or `kivi2`, and use a
 new output path for each run:
 
@@ -651,7 +653,7 @@ new output path for each run:
 cmake -B build-capture -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DLAPLACE_NATIVE=ON -DLAPLACE_KV_CAPTURE=ON
 cmake --build build-capture
-python3 tools/validate_laplace_kv.py \
+python3 research/laplace_kv/legacy/validate_laplace_kv.py \
   --laplace build-capture/laplace \
   --model qwen=/path/to/qwen2.5-0.5b-instruct-q4_k_m.gguf \
   --corpus prose=research/laplace_kv/corpora/technical_prose_v1.txt \
