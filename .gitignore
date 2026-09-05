@@ -23,3 +23,30 @@ temp/
 
 # Local measurement output
 .performance/
+
+# Private workspace instructions and automation state
+AGENTS.md
+AGENTS.md.*
+CLAUDE.md
+GEMINI.md
+SKILL.md
+MEMORY.md
+WORKSPACE.md
+PLAN.md
+GATES.md
+.cursorrules
+.windsurfrules
+.clinerules
+.agents/
+.agent/
+.claude/
+.codex/
+.cursor/
+.jspace/
+.speed-work/
+.superpowers/
+.superpowers-*/
+docs/superpowers/
+.github/instructions/
+.github/prompts/
+copilot-instructions.md

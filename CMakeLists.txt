@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 # Project: Laplace - the Apple Silicon inference engine.
-# See README.md, AGENTS.md, research/REPORT.md.
+# See README.md and docs/architecture.md.
 project(laplace CXX OBJCXX)
 
 set(CMAKE_CXX_STANDARD 20)
