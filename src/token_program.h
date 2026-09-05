@@ -175,6 +175,10 @@ enum class TokenProgramV3Section : uint16_t {
     Decoder = 8,
     Prompt = 9,
     ByteToUnicode = 10,
+    // Continuation-turn framing for multi-turn conversations. Absent from
+    // packages without chat framing, which remain byte-identical; framed
+    // packages require a reader that understands this section and digest.
+    TurnPrompt = 11,
 };
 
 enum class TokenProgramV3SectionFlags : uint16_t {
@@ -270,6 +274,11 @@ struct TokenProgramDefinition {
     PostprocessorSpec postprocessor;
     DecoderSpec decoder;
     std::vector<PromptInstruction> prompt;
+    // Continuation-turn framing: the same shape as `prompt` without the
+    // conversation-opening system block, so a multi-turn session frames each
+    // later turn exactly as the package's chat template would. Empty when
+    // the package has no recognized chat framing.
+    std::vector<PromptInstruction> turn;
     uint32_t prompt_max_bytes = 64u * 1024u;
     uint32_t unknown_token_id = kTokenProgramNoTokenId;
     uint16_t bpe_flags = 0;
@@ -299,6 +308,7 @@ public:
         std::string pending_utf8;
         size_t decoded_bytes = 0;
         bool finished = false;
+        bool sentencepiece_prefix_stripped = false;
     };
 
     static CompileResult compile(std::span<const uint8_t> payload);
@@ -314,6 +324,12 @@ public:
     SerializeResult serialize() const;
     EncodeResult encode(std::string_view text) const;
     PromptResult render_prompt(std::string_view user_text) const;
+    // Frames one continuation turn of a multi-turn conversation. Fails when
+    // the package has no recognized chat framing.
+    PromptResult render_turn(std::string_view user_text) const;
+    // Encodes text without repeating a declared automatic start-of-sequence
+    // token: a conversation's first turn already placed it.
+    EncodeResult encode_continuation(std::string_view text) const;
     DecodeResult decode(std::span<const uint32_t> token_ids) const;
     DecodeResult decode_chunk(std::span<const uint32_t> token_ids, StreamState& state,
                               bool final_chunk = false) const;

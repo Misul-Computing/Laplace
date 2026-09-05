@@ -1,133 +1,158 @@
 # Laplace
 
-Laplace is the Apple Inference Engine for Apple Silicon Macs.
+**Apple Inference Engine**
 
-It is built to maximize M-series inference throughput and efficiency through
-an Apple-native Metal runtime, unified memory, a universal semantic model
-compiler and loader, and automatic capability planning. The same architecture
-is designed for dense, recurrent, and MoE models.
-
-The current alpha turns compatible GGUF packages into typed physical facts, a
-semantic graph, and a capability-checked execution plan. A session owns its
-Metal resources and mutable state, then executes each validated token step as
-a transaction. The V1 design applies the same package pipeline to GGUF and
-MLX contracts.
+Laplace is built for fast, efficient local inference on Apple Silicon. Its
+core idea is a universal model compiler: describe what a model computes and
+how its tensors are stored, then compile that description into native Metal
+execution on your Mac.
 
 ## Why Laplace
 
-Apple Silicon puts CPU and GPU work in one unified-memory system. Laplace keeps
-the execution model close to that hardware: Metal handles tensor work through
-compatible plans, runtime capability queries select those plans, and
-session-owned state keeps token execution explicit. See Apple's [unified-memory guidance](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus)
-and [Metal compute documentation](https://developer.apple.com/documentation/metal).
+**One compiler, shared improvements.** Model operations and tensor storage are
+represented separately. The runtime compiles those facts into shared execution
+programs, so an improvement to execution can serve different compatible model
+layouts and weight precisions. Universality means improving the common path
+instead of accumulating a separate engine for every model.
 
-Universal means one semantic compiler and execution runtime that selects from
-the graph, tensor physical contract, execution phase, and queried device
-capability. Model names, paths, and hashes remain metadata.
+**Apple-native execution and memory.** Metal performs tensor computation while
+session-owned resources keep model data and working state close to the GPU.
+Artifact mappings and intermediate storage are reused, reducing repeated setup
+and allocation during generation.
 
-## What exists today
+**A conversation is a persistent session.** Model resources and conversation
+state stay alive across turns. Token steps use transactional state updates,
+with commit and rollback contracts that keep execution and history aligned.
+The package's chat template frames messages, and replies stream to the terminal.
 
-The current tree contains the core of that architecture:
-
-- Physical artifact validation records checked files, tensor planes, layouts,
-  aliases, and digests before semantic loading.
-- The semantic model represents tensors, values, operators, layers, state,
-  constraints, capability requirements, and tokenizer/template digests in a
-  versioned form.
-- The capability planner matches complete execution plans against operators,
-  physical formats, state contracts, and device capabilities.
-- The canonical Metal session provides dense prefill and decode transactions
-  with session-owned resources, checkpoint, commit, and rollback state.
-
-Semantic routed operators and expert-axis tensor contracts are present
-alongside dense and recurrent graph primitives.
-
-Laplace is under active development and its interfaces may change before V1.
-
-## Architecture
+**Performance you can inspect.** Prefill and decode timing are reported
+separately. The aim is maximum useful throughput and efficiency on M-series
+hardware, with correctness and memory costs measured alongside speed.
 
 ```text
-local package
-  -> physical artifact index
-  -> versioned semantic graph and state contracts
-  -> capability-aware execution plan
-  -> session-owned Metal resources and state
-  -> transactional prefill or decode
+Model package
+  -> declared operations + tensor storage
+  -> validated shared execution program
+  -> native Metal session
+  -> streamed responses with persistent state
 ```
 
-Every plan entry binds an operator to its tensor and state contract. The
-session commits a token position only after the command transaction completes.
-This gives the runtime one place to validate physical layout, capability
-requirements, resource ownership, and mutable state before work is admitted.
+Compatible dense models run today, including mixed stored precisions and tied
+weights. Dense, recurrent, and routed expert models are part of the wider
+architecture; recurrent and expert execution in the shared compiler is still
+being built. Laplace is an active alpha, and complete universality remains a
+development goal. See [current support](docs/support.md) and the
+[architecture guide](docs/architecture.md).
 
-Dense, recurrent, routed, and expert operators share the same semantic graph,
-physical contracts, capability planner, and session state model.
+Chat, generate from a prompt or file, and inspect models from one command.
+Once your model is downloaded, your prompts and conversation stay on your Mac.
 
-## Build
+## Get started
 
-Build on a native Apple Silicon Mac with CMake and the macOS Metal toolchain.
+You need an Apple Silicon Mac, Apple's command-line developer tools, CMake
+3.16 or newer, and Python 3. Metal execution uses the macOS system frameworks.
 
 ```bash
+git clone https://github.com/Misul-Computing/Laplace.git
+cd Laplace
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DLAPLACE_NATIVE=ON
-cmake --build build
-ctest --test-dir build --output-on-failure
+cmake --build build --target laplace --parallel 4
 ```
 
-## Run
-
-Inspect a local package and create its native plan:
+Use a GGUF you already have:
 
 ```bash
-./build/laplace /absolute/path/to/model.gguf
+./build/laplace /path/to/model.gguf
 ```
 
-Run a fixed native sample with phase-separated measurement:
-
-```bash
-./build/laplace /absolute/path/to/model.gguf \
-  -p "Hello, Laplace" -n 32 --greedy --seed 7 --max-seq 2048 --bench
-```
-
-The `--bench` option reports prefill and decode separately.
-
-Run `./build/laplace --help` for the full option list with defaults.
-
-## Models
-
-Any conforming GGUF is worth trying: loading is universal and data-driven,
-never keyed on architecture names. Dense llama-class and Qwen-class models
-load with their byte-level BPE tokenizers (text prompts work directly),
-including tied embeddings, QKV biases, QK-norms, sandwich norms, and mixed
-Q4_K/Q5_0/Q6_K/Q8_0 quantization. Gemma-class models load with windowed
-attention and their SentencePiece tokenizer.
-
-Fetch a small test model and run it:
+Or download a small starter model, then launch it:
 
 ```bash
 python3 scripts/download_model.py
-./build/laplace models/qwen2.5-0.5b-instruct-q4_k_m.gguf \
-  -p "Hello, Laplace" -n 32 --greedy --seed 7 --bench
+./build/laplace models/qwen2.5-0.5b-instruct-q4_k_m.gguf
 ```
 
-Inspect any GGUF without the engine:
+The download needs an internet connection and several hundred MB of disk
+space. Once the model is on disk, inference runs offline.
+
+After `Ready` appears, type a message and press Enter. Responses stream as
+they are generated, and the session remembers earlier turns. Type `/help`
+for commands and context usage, or `/exit` to leave. Ctrl-D also exits.
+
+## Everyday use
+
+Generate one response:
 
 ```bash
-python3 scripts/gguf_header.py /absolute/path/to/model.gguf
+./build/laplace /path/to/model.gguf -p "Explain unified memory in three sentences."
 ```
 
-Packages fail closed with the reason when a contract is not expressible:
-windowed sources without a declared layer pattern default to all-window
-attention (exact within the window), and a source needing a non-unit
-embedding scale or a non-SiLU activation declares it through the
-`embedding_scale` and `feed_forward_activation` metadata keys. Sources whose
-tokenizers were trained with BPE merge ranks (serialized in GGUF as pieces
-and scores only) use longest-piece segmentation; merge ranks are not part of
-the GGUF contract.
+Work from a text file and save the response:
 
-See [Architecture](docs/architecture.md), [Support](docs/support.md), and
-[Benchmarks](docs/benchmarks.md) for the execution model, support levels, and
-measurement contract.
+```bash
+./build/laplace /path/to/model.gguf --prompt-file prompt.txt > answer.txt
+```
+
+Inspect a model without starting generation:
+
+```bash
+./build/laplace /path/to/model.gguf --info
+```
+
+Set the response budget and conversation capacity:
+
+```bash
+./build/laplace /path/to/model.gguf -n 512 --max-seq 4096
+```
+
+`-n` limits each response, including any reasoning tokens the model emits.
+`--max-seq` covers the whole conversation: prompts, replies, and template
+tokens. The default is the package's context limit capped at 2048. Larger
+contexts use more memory and must fit the package's declared limit. Start a
+new session when the context fills.
+
+For repeatable greedy generation with timing:
+
+```bash
+./build/laplace /path/to/model.gguf \
+  -p "Explain why the sky is blue." -n 64 --greedy --bench
+```
+
+`--bench` reports prefill and decode separately. For sampling, use `-t`
+(temperature), `--top-p`, `--top-k`, and `--seed`. Use `--raw-prompt` for text
+completion without chat framing. Run `./build/laplace --help` for all options.
+
+Responses go to standard output; status and timing go to standard error.
+
+## Install the command
+
+After building, install into your home directory without administrator access:
+
+```bash
+cmake --install build --prefix "$HOME/.local"
+export PATH="$HOME/.local/bin:$PATH"
+laplace /path/to/model.gguf
+```
+
+Add the `export` line to `~/.zshrc` to keep the command available in new terminals.
+
+## Development
+
+The quickstart builds the application only. To build and run the test suite:
+
+```bash
+cmake --build build --parallel 4
+ctest --test-dir build --output-on-failure
+```
+
+The source universality policy check currently fails while transitional code
+remains linked. See [known gaps](docs/support.md#known-gaps) before interpreting
+test results. [Benchmark guidance](docs/benchmarks.md) describes how to record
+performance and correctness together.
+
+Source is in `src/`, checks in `tests/`, utilities in `scripts/`, and historical
+experiments in [`research/`](research/README.md).
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+[Apache-2.0](LICENSE).

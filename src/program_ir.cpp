@@ -23,11 +23,11 @@ constexpr uint64_t kMaximumDimension = uint64_t{1} << 48;
 constexpr uint64_t kMaximumLoopIterations = uint64_t{1} << 32;
 constexpr size_t kMaximumFunctions = 1024;
 constexpr size_t kMaximumRegions = 65536;
-// Canonicalization follows typed dependencies recursively. Keep the complete
-// V1 program below the verified host-stack boundary; repetition belongs in the
-// bounded-control form rather than in an unrolled authority object.
-constexpr size_t kMaximumInstructions = 4096;
+// Program size and recursive dependency depth are independent budgets.
+constexpr size_t kMaximumInstructions = 1u << 20;
+constexpr size_t kMaximumDependencyDepth = 4096;
 constexpr size_t kMaximumEffectEdges = 1u << 16;
+constexpr size_t kMaximumStateAccesses = 4096;
 constexpr size_t kMaximumValues = 1u << 22;
 constexpr size_t kMaximumStateReferences = 1u << 20;
 constexpr size_t kMaximumExports = 1u << 20;
@@ -35,6 +35,19 @@ constexpr size_t kMaximumShapeDepth = 32;
 constexpr size_t kMaximumDimensions = 32;
 constexpr size_t kMaximumStructuredOperands = 64;
 constexpr size_t kMaximumIndexExpressionNodes = 4096;
+
+class DependencyScope {
+public:
+    explicit DependencyScope(size_t& depth, size_t limit = kMaximumDependencyDepth) : depth_(depth) {
+        if (depth_ >= limit)
+            throw compatibility_report(CompatibilityError::IR_CONSTRAINT_FAILED,
+                                       "program dependency depth exceeds the bound");
+        ++depth_;
+    }
+    ~DependencyScope() { --depth_; }
+private:
+    size_t& depth_;
+};
 
 struct Bounds {
     uint64_t lower = 0;
@@ -212,8 +225,10 @@ private:
     std::unordered_map<uint32_t, uint32_t> dimension_ordinals_;
     std::unordered_map<uint32_t, uint32_t> state_ordinals_;
     std::vector<FunctionInfo> infos_;
+    size_t dependency_depth_ = 0;
     size_t instruction_count_ = 0;
     size_t effect_edge_count_ = 0;
+    size_t state_access_count_ = 0;
     size_t region_count_ = 0;
     size_t value_count_ = 0;
 
@@ -515,6 +530,7 @@ private:
                           "region ownership contains a cycle");
         }
         if (color == 2) return true;
+        DependencyScope scope(dependency_depth_, kMaximumDependencyDepth + 1);
         colors[region_id] = 1;
         const Region& region = *info.regions.at(region_id);
         for (const Instruction& item : region.instructions) {
@@ -607,6 +623,17 @@ private:
             if (!expression.operands.empty() || expression.value < 0) {
                 return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
                               "tensor source scalar index is invalid");
+            }
+            result->dynamic = true;
+            return true;
+        case TensorIndexExpression::SourceElement:
+            if (expression.value < 0)
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor source element index is invalid");
+            for (const TensorIndexExpr& operand : expression.operands) {
+                IndexBounds coordinate;
+                if (!index_bounds(operand, iterator_bounds, depth + 1, nodes,
+                                  &coordinate)) return false;
             }
             result->dynamic = true;
             return true;
@@ -715,6 +742,18 @@ private:
             }
             return true;
         }
+        if (expression.expression == TensorIndexExpression::SourceElement) {
+            if (expression.value < 0 ||
+                static_cast<uint64_t>(expression.value) >= attributes.source_count)
+                return reject(CompatibilityError::IR_REFERENCE_INVALID,
+                              "tensor source element reference is invalid");
+            const ValueType* type = input_type(
+                item, static_cast<uint32_t>(expression.value), info);
+            if (!type || type->element_type != ElementType::U32 ||
+                type->dimensions.size() != expression.operands.size())
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "tensor source element requires U32 and matching coordinate rank");
+        }
         for (const TensorIndexExpr& operand : expression.operands) {
             if (!validate_source_scalar_indices(operand, item, attributes,
                                                 info, depth + 1))
@@ -776,7 +815,13 @@ private:
                  code != Primitive::Divide && code != Primitive::Maximum &&
                  code != Primitive::Negate && code != Primitive::Exp &&
                  code != Primitive::Log && code != Primitive::Rsqrt &&
-                 code != Primitive::Sin && code != Primitive::Cos) ||
+                 code != Primitive::Sin && code != Primitive::Cos &&
+                 code != Primitive::Less && code != Primitive::Equal &&
+                 code != Primitive::Select && code != Primitive::Convert &&
+                 code != Primitive::Sqrt && code != Primitive::Tanh &&
+                 code != Primitive::RequireFinite &&
+                 code != Primitive::TensorCoordinate && code != Primitive::Require &&
+                 code != Primitive::Pow) ||
                 !body_item.regions.empty() || !body_item.effect_predecessors.empty()) {
                 return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
                               "structured tensor body is not scalar and pure");
@@ -901,6 +946,16 @@ private:
         case Primitive::Rsqrt:
         case Primitive::Sin:
         case Primitive::Cos:
+        case Primitive::Less:
+        case Primitive::Equal:
+        case Primitive::Select:
+        case Primitive::Convert:
+        case Primitive::Sqrt:
+        case Primitive::Tanh:
+        case Primitive::RequireFinite:
+        case Primitive::TensorCoordinate:
+        case Primitive::Require:
+        case Primitive::Pow:
             return true;
         }
         return false;
@@ -916,6 +971,24 @@ private:
             item.primitive.minor != 0) {
             return reject(CompatibilityError::IR_VERSION_UNSUPPORTED,
                           "primitive version is unsupported");
+        }
+        if (std::holds_alternative<ArithmeticAttributes>(item.attributes)) {
+            switch (item.primitive.code) {
+            case Primitive::Add: case Primitive::Multiply:
+            case Primitive::Subtract: case Primitive::Divide:
+            case Primitive::Maximum: case Primitive::Negate: case Primitive::Pow:
+            case Primitive::Exp: case Primitive::Log: case Primitive::Rsqrt:
+            case Primitive::Sin: case Primitive::Cos:
+            case Primitive::Sqrt: case Primitive::Tanh:
+                break;
+            default:
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "arithmetic policy requires a floating arithmetic primitive");
+            }
+            if (item.outputs.size() != 1 ||
+                item.outputs.front().type.element_type != ElementType::F32)
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "arithmetic policy requires F32 output");
         }
         switch (item.primitive.code) {
         case Primitive::Constant:
@@ -937,7 +1010,8 @@ private:
             return true;
         case Primitive::Add:
         case Primitive::Multiply: {
-            if (!std::holds_alternative<NoAttributes>(item.attributes) ||
+            if ((!std::holds_alternative<NoAttributes>(item.attributes) &&
+                 !std::holds_alternative<ArithmeticAttributes>(item.attributes)) ||
                 item.inputs.size() != 2 || item.outputs.size() != 1 ||
                 !item.regions.empty() || !item.effect_predecessors.empty()) {
                 return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
@@ -954,8 +1028,10 @@ private:
         }
         case Primitive::Subtract:
         case Primitive::Divide:
-        case Primitive::Maximum: {
-            if (!std::holds_alternative<NoAttributes>(item.attributes) ||
+        case Primitive::Maximum:
+        case Primitive::Pow: {
+            if ((!std::holds_alternative<NoAttributes>(item.attributes) &&
+                 !std::holds_alternative<ArithmeticAttributes>(item.attributes)) ||
                 item.inputs.size() != 2 || item.outputs.size() != 1 ||
                 !item.regions.empty() || !item.effect_predecessors.empty()) {
                 return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
@@ -976,19 +1052,113 @@ private:
         case Primitive::Log:
         case Primitive::Rsqrt:
         case Primitive::Sin:
-        case Primitive::Cos: {
-            if (!std::holds_alternative<NoAttributes>(item.attributes) ||
+        case Primitive::Cos:
+        case Primitive::Sqrt:
+        case Primitive::Tanh:
+        case Primitive::RequireFinite: {
+            if ((!std::holds_alternative<NoAttributes>(item.attributes) &&
+                 !std::holds_alternative<ArithmeticAttributes>(item.attributes)) ||
                 item.inputs.size() != 1 || item.outputs.size() != 1 ||
                 !item.regions.empty() || !item.effect_predecessors.empty()) {
                 return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
                               "F32 unary primitive contract is invalid");
             }
+            if (item.primitive.code == Primitive::RequireFinite &&
+                !item.outputs.front().type.dimensions.empty())
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "finite guard requires scalar F32");
             const ValueType* input = input_type(item, 0, info);
             if (input == nullptr || *input != item.outputs.front().type ||
                 input->element_type != ElementType::F32) {
                 return reject(CompatibilityError::IR_SHAPE_MISMATCH,
                               "F32 unary value types do not match");
             }
+            return true;
+        }
+        case Primitive::Less:
+        case Primitive::Equal:
+        case Primitive::Select:
+        case Primitive::Convert: {
+            const Primitive code = item.primitive.code;
+            const size_t arity = code == Primitive::Select ? 3 :
+                                 code == Primitive::Convert ? 1 : 2;
+            if (!std::holds_alternative<NoAttributes>(item.attributes) ||
+                item.inputs.size() != arity || item.outputs.size() != 1 ||
+                !item.regions.empty() || !item.effect_predecessors.empty())
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "typed scalar primitive contract is invalid");
+            const ValueType* first = input_type(item, 0, info);
+            const ValueType& output = item.outputs.front().type;
+            if (!first || !first->dimensions.empty() || !output.dimensions.empty())
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "typed scalar primitive requires scalar values");
+            bool valid = false;
+            if (code == Primitive::Convert) {
+                valid = first->element_type == ElementType::U32 &&
+                        output.element_type == ElementType::F32;
+            } else {
+                const ValueType* second = input_type(item, 1, info);
+                if (code == Primitive::Select) {
+                    const ValueType* third = input_type(item, 2, info);
+                    valid = first->element_type == ElementType::I1 &&
+                            second && third && *second == output && *third == output;
+                } else {
+                    valid = second && *first == *second &&
+                            output.element_type == ElementType::I1 &&
+                            (first->element_type == ElementType::U32 ||
+                             first->element_type == ElementType::I32 ||
+                             first->element_type == ElementType::U64 ||
+                             first->element_type == ElementType::F32);
+                }
+            }
+            if (!valid)
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "typed scalar primitive value types do not match");
+            return true;
+        }
+        case Primitive::TensorCoordinate: {
+            const auto* coordinate = std::get_if<CoordinateAttributes>(&item.attributes);
+            if (!coordinate || !item.inputs.empty() || item.outputs.size() != 1 ||
+                !item.regions.empty() || !item.effect_predecessors.empty())
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor coordinate contract is invalid");
+            const ValueType& output = item.outputs.front().type;
+            if (!output.dimensions.empty() ||
+                (output.element_type != ElementType::U32 && output.element_type != ElementType::U64))
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "tensor coordinate requires scalar U32 or U64");
+            const auto location = info.instructions.find(item.id);
+            const auto parent = location == info.instructions.end() ? info.parents.end() :
+                info.parents.find(location->second.region_id);
+            if (parent == info.parents.end())
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor coordinate requires a structured tensor body");
+            const Instruction& owner = *info.instructions.at(parent->second.instruction_id).instruction;
+            const auto* tensor = std::get_if<StructuredTensorAttributes>(&owner.attributes);
+            if (owner.primitive.code != Primitive::StructuredTensor || !tensor ||
+                coordinate->axis >= tensor->iteration_dimensions.size())
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "tensor coordinate iteration axis is unavailable");
+            Bounds extent;
+            if (!dimension_bounds(tensor->iteration_dimensions[coordinate->axis], 0, &extent))
+                return false;
+            if (output.element_type == ElementType::U32 && extent.upper != 0 &&
+                extent.upper - 1 > UINT32_MAX)
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "tensor coordinate exceeds its output type");
+            return true;
+        }
+        case Primitive::Require: {
+            if (!std::holds_alternative<NoAttributes>(item.attributes) ||
+                item.inputs.size() != 1 || item.outputs.size() != 1 ||
+                !item.regions.empty() || !item.effect_predecessors.empty())
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "predicate requirement contract is invalid");
+            const ValueType predicate{ElementType::I1, {}};
+            const ValueType* input = input_type(item, 0, info);
+            if (!input || *input != predicate || item.outputs.front().type != predicate)
+                return reject(CompatibilityError::IR_SHAPE_MISMATCH,
+                              "predicate requirement needs scalar I1");
             return true;
         }
         case Primitive::BoundedLoop: {
@@ -1089,6 +1259,7 @@ private:
                           "instruction dependencies contain a cycle");
         }
         if (color == 2) return true;
+        DependencyScope scope(dependency_depth_);
         colors[id] = 1;
         const InstructionLocation& location = info.instructions.at(id);
         for (uint32_t input : location.instruction->inputs) {
@@ -1119,6 +1290,10 @@ private:
         std::unordered_map<uint32_t, size_t> node_indices;
         for (const auto& [id, location] : info.instructions) {
             if (!is_state_access(*location.instruction)) continue;
+            if (state_access_count_ == kMaximumStateAccesses)
+                return reject(CompatibilityError::IR_CONSTRAINT_FAILED,
+                              "state access count exceeds the alias analysis bound");
+            ++state_access_count_;
             node_indices.emplace(id, nodes.size());
             nodes.push_back(id);
         }
@@ -1381,6 +1556,7 @@ private:
     std::unordered_map<uint32_t, uint32_t> alias_slots_;
     std::unordered_map<uint32_t, std::unordered_map<uint32_t, ProgramDigest>>
         preview_memos_;
+    mutable size_t dependency_depth_ = 0;
     uint32_t next_alias_slot_ = 0;
     Encoder output_;
 
@@ -1485,7 +1661,12 @@ private:
 
     void encode_attributes(const Instruction& item, Encoder& encoder) {
         encoder.u8(static_cast<uint8_t>(item.attributes.index()));
-        if (const auto* value = std::get_if<ConstantAttributes>(&item.attributes)) {
+        if (const auto* value = std::get_if<CoordinateAttributes>(&item.attributes)) {
+            encoder.u32(value->axis);
+        } else if (const auto* value = std::get_if<ArithmeticAttributes>(&item.attributes)) {
+            encoder.u8(value->allow_nonfinite_operands ? 1 : 0);
+            encoder.u8(value->allow_nonfinite_result ? 1 : 0);
+        } else if (const auto* value = std::get_if<ConstantAttributes>(&item.attributes)) {
             encoder.u64(value->bits);
         } else if (const auto* value = std::get_if<LoopAttributes>(&item.attributes)) {
             encoder.u64(value->lower);
@@ -1567,7 +1748,12 @@ private:
     void preview_encode_attributes(const Instruction& item,
                                    Encoder& encoder) const {
         encoder.u8(static_cast<uint8_t>(item.attributes.index()));
-        if (const auto* value = std::get_if<ConstantAttributes>(&item.attributes)) {
+        if (const auto* value = std::get_if<CoordinateAttributes>(&item.attributes)) {
+            encoder.u32(value->axis);
+        } else if (const auto* value = std::get_if<ArithmeticAttributes>(&item.attributes)) {
+            encoder.u8(value->allow_nonfinite_operands ? 1 : 0);
+            encoder.u8(value->allow_nonfinite_result ? 1 : 0);
+        } else if (const auto* value = std::get_if<ConstantAttributes>(&item.attributes)) {
             encoder.u64(value->bits);
         } else if (const auto* value = std::get_if<LoopAttributes>(&item.attributes)) {
             encoder.u64(value->lower);
@@ -1644,6 +1830,7 @@ private:
             state.instruction_slots.end()) {
             return;
         }
+        DependencyScope scope(dependency_depth_);
         const InstructionLocation& location = info.instructions.at(instruction_id);
         ensure_region_owner(info, state, location.region_id);
         const uint32_t slot = state.next_instruction_slot++;
@@ -1717,6 +1904,7 @@ private:
         std::unordered_map<uint32_t, ProgramDigest>& memo) const {
         const auto cached = memo.find(instruction_id);
         if (cached != memo.end()) return cached->second;
+        DependencyScope scope(dependency_depth_);
         const Instruction& item = *info.instructions.at(instruction_id).instruction;
         Encoder encoder;
         encoder.u16(static_cast<uint16_t>(item.primitive.code));
@@ -1811,7 +1999,7 @@ VerifiedProgram::VerifiedProgram(
       canonical_state_reference_ids_(std::move(canonical_state_reference_ids)),
       canonical_function_ids_(std::move(canonical_function_ids)) {}
 
-ProgramVerificationResult verify_and_canonicalize_program(Program program) {
+ProgramVerificationResult verify_and_canonicalize_program(Program program) try {
     Verifier verifier(program);
     if (!verifier.run()) return verifier.report();
     Canonicalizer canonicalizer(program, verifier.infos(), verifier.dimension_ordinals(),
@@ -1825,6 +2013,11 @@ ProgramVerificationResult verify_and_canonicalize_program(Program program) {
         canonicalizer.canonical_dimension_parameter_ids(),
         canonicalizer.canonical_state_reference_ids(),
         canonicalizer.canonical_function_ids());
+} catch (const CompatibilityReport& report) {
+    return report;
+} catch (const std::bad_alloc&) {
+    return compatibility_report(CompatibilityError::IR_CONSTRAINT_FAILED,
+                                "program verification exceeded available memory");
 }
 
 ProgramDigest program_digest(const VerifiedProgram& program) {
@@ -1985,7 +2178,12 @@ void write_instruction(ProgramWireWriter& writer, const Instruction& instruction
     writer.u16(instruction.primitive.major);
     writer.u16(instruction.primitive.minor);
     writer.u8(static_cast<uint8_t>(instruction.attributes.index()));
-    if (const auto* value = std::get_if<ConstantAttributes>(&instruction.attributes)) {
+    if (const auto* value = std::get_if<CoordinateAttributes>(&instruction.attributes)) {
+        writer.u32(value->axis);
+    } else if (const auto* value = std::get_if<ArithmeticAttributes>(&instruction.attributes)) {
+        writer.u8(value->allow_nonfinite_operands ? 1 : 0);
+        writer.u8(value->allow_nonfinite_result ? 1 : 0);
+    } else if (const auto* value = std::get_if<ConstantAttributes>(&instruction.attributes)) {
         writer.u64(value->bits);
     } else if (const auto* value = std::get_if<LoopAttributes>(&instruction.attributes)) {
         writer.u64(value->lower);
@@ -2152,6 +2350,19 @@ bool read_instruction(ProgramWireReader& reader, Instruction* instruction) {
         StructuredTensorAttributes value;
         if (!read_structured_tensor(reader, &value)) return false;
         instruction->attributes = std::move(value);
+        break;
+    }
+    case 5: {
+        uint8_t operands = 0, result = 0;
+        if (!reader.u8(&operands) || !reader.u8(&result) || operands > 1 || result > 1)
+            return false;
+        instruction->attributes = ArithmeticAttributes{operands != 0, result != 0};
+        break;
+    }
+    case 6: {
+        CoordinateAttributes value;
+        if (!reader.u32(&value.axis)) return false;
+        instruction->attributes = value;
         break;
     }
     default:

@@ -571,7 +571,7 @@ ValueType program_vector(uint64_t extent) {
     return {ElementType::F32, {program_dimension(extent)}};
 }
 
-Program program_session_graph() {
+Program program_session_graph(bool shaped = false) {
     const ValueType token{ElementType::U32, {}};
     const ValueType scores = program_vector(10);
     const ValueType scalar{ElementType::F32, {}};
@@ -601,12 +601,37 @@ Program program_session_graph() {
         Instruction{203, {Primitive::StructuredTensor, 1, 0},
                     {200, 100, 202}, {{204, scores}}, {20}, {},
                     std::move(attributes)}};
+    if (shaped) {
+        const ValueType shaped_token{ElementType::U32,
+            {program_dimension(1), program_dimension(1)}};
+        const ValueType shaped_scores{ElementType::F32,
+            {program_dimension(1), program_dimension(10)}};
+        root.arguments[0].type = shaped_token;
+        root.instructions[0].outputs[0].type = shaped_scores;
+        root.instructions[1].outputs[0].type = shaped_scores;
+        auto& attributes = std::get<StructuredTensorAttributes>(
+            root.instructions[1].attributes);
+        attributes.iteration_dimensions.insert(
+            attributes.iteration_dimensions.begin(), program_dimension(1));
+        attributes.iterator_kinds.insert(attributes.iterator_kinds.begin(),
+            TensorIteratorKind::Parallel);
+        auto& maps = attributes.indexing_maps;
+        maps[0].results[0].value = 1;
+        maps[2].results[0].value = 1;
+        maps[1].results = {
+            {TensorIndexExpression::Constant, 0, {}},
+            {TensorIndexExpression::Constant, 0, {}}};
+        maps[2].results.insert(maps[2].results.begin(),
+            {TensorIndexExpression::Iterator, 0, {}});
+    }
     root.yields = {204};
     Program program;
     program.minor = 1;
     program.functions = {{10, 1, {std::move(body), std::move(root)},
                           {scores}}};
-    program.exports = {{10, 0, scores}};
+    if (shaped) program.functions[0].result_types[0] =
+        {ElementType::F32, {program_dimension(1), program_dimension(10)}};
+    program.exports = {{10, 0, program.functions[0].result_types[0]}};
     return program;
 }
 
@@ -781,7 +806,7 @@ PhysicalProgram program_session_decoder() {
 }
 
 std::optional<VerifiedProgramPackage> make_program_session_package(
-    bool stateful = false, bool guarded = false) {
+    bool stateful = false, bool guarded = false, bool shaped = false) {
     auto token_wire = serialize_token_program(program_session_tokens());
     CHECK(std::holds_alternative<std::vector<uint8_t>>(token_wire));
     if (!std::holds_alternative<std::vector<uint8_t>>(token_wire))
@@ -826,8 +851,9 @@ std::optional<VerifiedProgramPackage> make_program_session_package(
     auto semantic = verify_and_canonicalize_program(
         guarded ? guarded_stateful_program_session_graph()
                 : (stateful ? stateful_program_session_graph()
-                            : program_session_graph()));
-    CHECK(std::holds_alternative<VerifiedProgram>(semantic));
+                            : program_session_graph(shaped)));
+    const auto* semantic_error = std::get_if<CompatibilityReport>(&semantic);
+    CHECK_MSG(!semantic_error, "program graph: %s", semantic_error ? semantic_error->detail.c_str() : "none");
     if (!std::holds_alternative<VerifiedProgram>(semantic))
         return std::nullopt;
     VerifiedProgram verified =
@@ -1053,8 +1079,8 @@ bool emit_program_ingress_fixture(const std::string& container_path,
                        std::get<std::vector<uint8_t>>(ingress_wire));
 }
 
-void test_verified_program_package_creates_runtime_session() {
-    auto package = make_program_session_package();
+void test_verified_program_package_creates_runtime_session(bool shaped = false) {
+    auto package = make_program_session_package(false, false, shaped);
     CHECK(package.has_value());
     if (!package) return;
     SessionRequest program_request;
@@ -2055,6 +2081,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--program-session") == 0) {
         test_program_ingress_creates_runtime_session();
         test_verified_program_package_creates_runtime_session();
+        test_verified_program_package_creates_runtime_session(true);
         test_stateful_program_package_publishes_gpu_state();
         test_program_sequence_failure_does_not_publish_state();
         return test_summary("test_runtime_session_product");

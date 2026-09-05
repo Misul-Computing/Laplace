@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Download a small LLaMA-arch GGUF for testing laplace.
+"""Download a starter GGUF model for Laplace.
 
-Default target: Qwen2.5-0.5B-Instruct Q4_K_M (~400 MB), a pure LLaMA arch
-with GQA + RoPE, stored on the Hugging Face CDN. Use --url and --out to
+Default target: Qwen2.5-0.5B-Instruct Q4_K_M (several hundred MB),
+stored on the Hugging Face CDN. Use --url and --out to
 fetch a different package.
 """
 import argparse
@@ -65,7 +65,7 @@ def download(url: str, out: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download a small LLaMA-arch GGUF for testing laplace.")
+        description="Download a starter GGUF model for Laplace.")
     parser.add_argument("--url", default=DEFAULT_URL,
                         help="package URL (default: Qwen2.5-0.5B-Instruct Q4_K_M)")
     parser.add_argument("--out", type=Path, default=None,

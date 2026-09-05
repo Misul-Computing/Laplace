@@ -411,7 +411,8 @@ bool apply_float_policy(uint32_t bits, const PhysicalNumericPolicy& policy,
     const uint32_t fraction = bits & 0x007fffffu;
     if (exponent == 0x7f800000u && fraction != 0) {
         if (policy.nan == PhysicalNanPolicy::Reject) return false;
-        bits = 0x7fc00000u;
+        if (policy.nan == PhysicalNanPolicy::CanonicalQuiet)
+            bits = 0x7fc00000u;
     } else if (exponent == 0x7f800000u) {
         if (policy.infinity == PhysicalInfinityPolicy::Reject) return false;
         if (policy.infinity == PhysicalInfinityPolicy::SaturateFinite)

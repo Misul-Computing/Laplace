@@ -1,4 +1,5 @@
 #include "program_metal.h"
+#include "codec_certificate.h"
 #include "program_reference.h"
 #include "test_util.h"
 
@@ -302,6 +303,7 @@ void test_transactional_state_publication() {
               std::vector<MetalProgramValue>{f32_value({1}, {1})});
         CHECK(result->audit.command_buffers == 1);
         CHECK(result->audit.state_generation == 1);
+        CHECK(result->audit.intermediate_buffer_bytes == sizeof(float));
     }
     inputs[0].value.bits.front() = 1;
     CHECK(std::holds_alternative<CompatibilityReport>(
@@ -314,6 +316,7 @@ void test_transactional_state_publication() {
               std::vector<MetalProgramValue>{f32_value({1}, {2})});
         CHECK(result->audit.command_buffers == 1);
         CHECK(result->audit.state_generation == 2);
+        CHECK(result->audit.intermediate_buffer_bytes == sizeof(float));
     }
 }
 
@@ -619,7 +622,7 @@ PhysicalInstruction physical_instruction(
     uint8_t bit_width = 0);
 
 std::optional<VerifiedPhysicalProgramPackage>
-bound_dependent_stages_package() {
+bound_dependent_stages_package(bool arithmetic_decoder = false) {
     PhysicalProgram decoder;
     decoder.logical_rank = 1;
     decoder.planes = {{PhysicalPlaneStorage::External, 1, 0, 0}};
@@ -638,7 +641,24 @@ bound_dependent_stages_package() {
                              PhysicalValueType::F32, {3}, 0,
                              kNoPhysicalPlane, 0)};
     decoder.result = 4;
+    if (arithmetic_decoder) {
+        PhysicalNumericPolicy fused;
+        fused.contraction = PhysicalContractionPolicy::Fused;
+        decoder.policies.push_back(fused);
+        decoder.instructions.push_back(physical_instruction(
+            PhysicalOpcode::ConstF32Bits, PhysicalValueType::F32, {},
+            std::bit_cast<uint32_t>(0.5f)));
+        decoder.instructions.push_back(physical_instruction(
+            PhysicalOpcode::ConstF32Bits, PhysicalValueType::F32, {},
+            std::bit_cast<uint32_t>(-1.25f)));
+        decoder.instructions.push_back(physical_instruction(
+            PhysicalOpcode::F32Fma, PhysicalValueType::F32, {4, 5, 6}, 0,
+            kNoPhysicalPlane, 1));
+        decoder.result = 7;
+    }
     auto canonical = canonicalize_physical_program(std::move(decoder));
+    if (const auto* error = std::get_if<CompatibilityReport>(&canonical))
+        CHECK_MSG(false, "decoder verifier code=%u detail=%s", static_cast<unsigned>(error->code), error->detail.c_str());
     CHECK(std::holds_alternative<PhysicalProgram>(canonical));
     if (!std::holds_alternative<PhysicalProgram>(canonical))
         return std::nullopt;
@@ -726,6 +746,7 @@ void test_bound_dependent_stages_one_command_buffer() {
         CHECK(result->audit.implicit_weight_copies == 0);
         CHECK(result->audit.explicit_upload_bytes == 0);
         CHECK(result->audit.zero_copy_plane_bytes == 16);
+        CHECK(result->audit.mapped_artifact_buffer_count == 1);
         CHECK(result->audit.persistent_plane_bytes == 16);
     }
 }
@@ -966,6 +987,7 @@ void test_bound_physical_contraction() {
         CHECK(result->audit.implicit_weight_copies == 0);
         CHECK(result->audit.explicit_upload_bytes == 24);
         CHECK(result->audit.zero_copy_plane_bytes == 24);
+        CHECK(result->audit.mapped_artifact_buffer_count == 1);
         CHECK(result->audit.persistent_plane_bytes == 24);
         CHECK(result->audit.explicit_download_bytes == 16);
     }
@@ -1145,6 +1167,55 @@ std::optional<VerifiedPhysicalProgram> verified_physical(
     return std::get<VerifiedPhysicalProgram>(std::move(verified));
 }
 
+void test_generated_physical_bit_window_exhaustive() {
+    const auto owner = std::make_shared<const std::vector<uint8_t>>(
+        std::initializer_list<uint8_t>{0x13, 0xa7, 0x5c, 0xe1,
+                                       0x4b, 0x90, 0x2d, 0xf6});
+    for (uint8_t width = 1; width <= 32; ++width) {
+        for (const PhysicalBitOrder order : {PhysicalBitOrder::Lsb0Little,
+                                             PhysicalBitOrder::Msb0Big}) {
+            PhysicalProgram source;
+            source.logical_rank = 1;
+            source.planes = {{PhysicalPlaneStorage::External, 1, 0, 0}};
+            source.instructions = {
+                physical_instruction(PhysicalOpcode::Coordinate,
+                                     PhysicalValueType::Index, {}, 0),
+                physical_instruction(PhysicalOpcode::ConstIndex,
+                                     PhysicalValueType::Index, {}, 8),
+                physical_instruction(PhysicalOpcode::IndexAdd,
+                                     PhysicalValueType::Index, {0, 1}),
+                physical_instruction(PhysicalOpcode::LoadBits,
+                                     PhysicalValueType::U32, {2}, 0, 0,
+                                     kNoPhysicalPolicy, width)};
+            source.instructions.back().bit_order = order;
+            source.result = 3;
+            const PhysicalPlaneBinding binding{0, owner, 0, owner->size()};
+            const auto verified = verified_physical(
+                source, {&binding, 1}, {ElementType::U32, {8}});
+            CHECK(verified.has_value());
+            if (!verified) continue;
+            auto compiled = compile_metal_physical_program(*verified);
+            CHECK(std::holds_alternative<MetalPhysicalProgramExecutable>(compiled));
+            if (!std::holds_alternative<MetalPhysicalProgramExecutable>(compiled))
+                continue;
+            const auto actual =
+                std::get<MetalPhysicalProgramExecutable>(std::move(compiled)).execute();
+            CHECK(std::holds_alternative<MetalPhysicalProgramResult>(actual));
+            if (!std::holds_alternative<MetalPhysicalProgramResult>(actual))
+                continue;
+            const auto& values = std::get<MetalPhysicalProgramResult>(actual).value.bits;
+            CHECK(values.size() == 8);
+            for (uint64_t offset = 0; offset < 8; ++offset) {
+                const auto expected = interpret_physical_value(
+                    *verified, std::span<const uint64_t>(&offset, 1));
+                CHECK(std::holds_alternative<ScalarValue>(expected));
+                if (const auto* scalar = std::get_if<ScalarValue>(&expected))
+                    CHECK(values[offset] == scalar->bits);
+            }
+        }
+    }
+}
+
 void check_physical_metal(const VerifiedPhysicalProgram& physical) {
     auto compiled = compile_metal_physical_program(physical);
     const auto* compile_error = std::get_if<CompatibilityReport>(&compiled);
@@ -1185,6 +1256,106 @@ void check_physical_metal(const VerifiedPhysicalProgram& physical) {
     CHECK(result->audit.physical_program_digest == physical.digest());
     CHECK(result->audit.command_buffers == 1);
     CHECK(result->audit.implicit_weight_copies == 0);
+}
+
+void test_preserved_ieee_direct_loads() {
+    static_assert(static_cast<uint8_t>(PhysicalNanPolicy::CanonicalQuiet) == 1);
+    static_assert(static_cast<uint8_t>(PhysicalNanPolicy::Reject) == 2);
+    static_assert(static_cast<uint8_t>(PhysicalNanPolicy::PreserveIeee) == 3);
+    for (uint8_t width : {uint8_t{16}, uint8_t{32}}) {
+        // All binary16 encodings; all binary32 NaN payloads with both signs,
+        // followed by finite extremes, signed zeros, infinities and subnormals.
+        const std::array<uint32_t, 10> finite = {
+            0, 0x80000000u, 1, 0x80000001u, 0x007fffffu, 0x807fffffu,
+            0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u};
+        const uint32_t nan_count = 2u * 0x007fffffu;
+        // Keep each certificate invocation within its existing unit limit.
+        for (uint32_t batch = 0; batch < (width == 16 ? 1u : 2u); ++batch) {
+            const uint32_t count = width == 16 ? 65536u :
+                batch == 0 ? nan_count : static_cast<uint32_t>(finite.size());
+            std::vector<uint8_t> bytes;
+            bytes.reserve(static_cast<size_t>(count) * (width / 8));
+            for (uint32_t index = 0; index < count; ++index) {
+                const uint32_t bits = width == 16 ? index : batch == 1 ? finite[index] :
+                    ((index & 1u) << 31u) | 0x7f800000u | ((index >> 1u) + 1u);
+                for (uint32_t shift = 0; shift < width; shift += 8)
+                    bytes.push_back(static_cast<uint8_t>(bits >> shift));
+            }
+            const auto owner = std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
+            PhysicalProgram program;
+            program.logical_rank = 1;
+            program.planes = {{PhysicalPlaneStorage::External, 1, 0, 0}};
+            PhysicalNumericPolicy policy;
+            policy.nan = PhysicalNanPolicy::PreserveIeee;
+            program.policies = {policy};
+            program.instructions = {
+                physical_instruction(PhysicalOpcode::Coordinate, PhysicalValueType::Index, {}, 0),
+                physical_instruction(PhysicalOpcode::ConstIndex, PhysicalValueType::Index, {}, width),
+                physical_instruction(PhysicalOpcode::IndexMultiply, PhysicalValueType::Index, {0, 1}),
+                physical_instruction(PhysicalOpcode::LoadBits, PhysicalValueType::U32, {2}, 0, 0,
+                                     kNoPhysicalPolicy, width),
+                physical_instruction(width == 16 ? PhysicalOpcode::F16ToF32 : PhysicalOpcode::BitsToF32,
+                                     PhysicalValueType::F32, {3}, 0, kNoPhysicalPlane, 0),
+            };
+            program.result = 4;
+            const PhysicalPlaneBinding binding{0, owner, 0, owner->size()};
+            const auto verified = verified_physical(program, {&binding, 1}, {ElementType::F32, {count}});
+            if (!verified) continue;
+            const auto certificate = parse_codec_certificate(width == 16
+                ? make_raw_f16_codec_certificate() : make_raw_f32_codec_certificate());
+            CHECK(std::holds_alternative<CodecCertificate>(certificate));
+            if (!std::holds_alternative<CodecCertificate>(certificate)) continue;
+            const auto expected = std::get<CodecCertificate>(certificate).decode(
+                {count, {{*owner, 0, owner->size(), static_cast<uint64_t>(width / 8)}}}, count);
+            CHECK(std::holds_alternative<std::vector<float>>(expected));
+            if (!std::holds_alternative<std::vector<float>>(expected)) continue;
+            const auto& values = std::get<std::vector<float>>(expected);
+            auto compiled = compile_metal_physical_program(*verified);
+            CHECK(std::holds_alternative<MetalPhysicalProgramExecutable>(compiled));
+            if (!std::holds_alternative<MetalPhysicalProgramExecutable>(compiled)) continue;
+            const auto actual = std::get<MetalPhysicalProgramExecutable>(compiled).execute();
+            CHECK(std::holds_alternative<MetalPhysicalProgramResult>(actual));
+            if (!std::holds_alternative<MetalPhysicalProgramResult>(actual)) continue;
+            const auto& bits = std::get<MetalPhysicalProgramResult>(actual).value.bits;
+            CHECK(bits.size() == count);
+            if (bits.size() != count) continue;
+            size_t mismatch = count;
+            for (size_t index = 0; index < count; ++index) {
+                if (bits[index] != std::bit_cast<uint32_t>(values[index])) {
+                    mismatch = index;
+                    break;
+                }
+            }
+            CHECK_MSG(mismatch == count, "IEEE load mismatch width=%u batch=%u index=%zu",
+                      width, batch, mismatch);
+            if (width == 16) {
+                // Existing canonicalization still applies to every half NaN.
+                program.policies[0].nan = PhysicalNanPolicy::CanonicalQuiet;
+                if (const auto canonical = verified_physical(program, {&binding, 1},
+                                                              {ElementType::F32, {count}}))
+                    check_physical_metal(*canonical);
+                program.policies[0].nan = PhysicalNanPolicy::PreserveIeee;
+                program.instructions.back().opcode = PhysicalOpcode::Bf16ToF32;
+                if (const auto bf16 = verified_physical(program, {&binding, 1},
+                                                       {ElementType::F32, {count}}))
+                    check_physical_metal(*bf16);
+            } else if (batch == 1) {
+                program.policies[0].subnormal = PhysicalSubnormalPolicy::FlushToSignedZero;
+                program.policies[0].signed_zero = PhysicalSignedZeroPolicy::Positive;
+                program.policies[0].infinity = PhysicalInfinityPolicy::SaturateFinite;
+                if (const auto adjusted = verified_physical(program, {&binding, 1},
+                                                            {ElementType::F32, {count}}))
+                    check_physical_metal(*adjusted);
+            }
+            // Exhaustive CPU binary16 checks and bounded binary32 samples.
+            for (uint64_t index = 0; index < count; index += width == 16 ? 1 : 257) {
+                const auto scalar = interpret_physical_value(*verified, {&index, 1});
+                CHECK(std::holds_alternative<ScalarValue>(scalar));
+                if (const auto* value = std::get_if<ScalarValue>(&scalar))
+                    CHECK(value->bits == std::bit_cast<uint32_t>(values[index]));
+            }
+        }
+    }
 }
 
 void test_generated_physical_bit_orders_and_inline_plane() {
@@ -1739,18 +1910,519 @@ void test_generated_physical_procedural_codebook() {
         check_physical_metal(*verified);
 }
 
+Program branching_state_stages_program() {
+    Program program = transactional_state_stages_program();
+    const ValueType vector = tensor({1});
+    const ValueType scalar{ElementType::F32, {}};
+    const ValueType index{ElementType::U32, {}};
+    Region sum_body;
+    sum_body.id = 50;
+    sum_body.arguments = {{51, scalar}, {52, scalar}, {53, scalar}};
+    sum_body.instructions = {
+        Instruction{54, {Primitive::Add, 1, 0}, {51, 52}, {{55, scalar}},
+                    {}, {}, NoAttributes{}},
+        Instruction{56, {Primitive::Add, 1, 0}, {55, 53}, {{57, scalar}},
+                    {}, {}, NoAttributes{}}};
+    sum_body.yields = {57};
+    StructuredTensorAttributes sum;
+    sum.source_count = 2;
+    sum.iteration_dimensions = {dimension(1)};
+    sum.iterator_kinds = {TensorIteratorKind::Parallel};
+    sum.indexing_maps = {map({0}), map({0}), map({0})};
+    auto& root = program.functions.front().regions.back();
+    const std::vector<Instruction> accumulator = {
+        Instruction{41, {Primitive::StateRead, 1, 0}, {}, {{42, vector}},
+                    {}, {17}, StateAttributes{71}},
+        Instruction{43, {Primitive::Constant, 1, 0}, {}, {{44, vector}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{45, {Primitive::StructuredTensor, 1, 0}, {16, 42, 44},
+                    {{46, vector}}, {50}, {}, std::move(sum)},
+        Instruction{47, {Primitive::StateWrite, 1, 0}, {46}, {}, {}, {41},
+                    StateAttributes{71}}};
+    root.instructions.insert(root.instructions.begin() + 4,
+                             accumulator.begin(), accumulator.end());
+    auto& output = root.instructions.back();
+    output.inputs = {16, 46, 10, 9, 19};
+    auto& attributes = std::get<StructuredTensorAttributes>(output.attributes);
+    attributes.source_count = 4;
+    TensorIndexMap table_map;
+    table_map.results = {
+        TensorIndexExpr{TensorIndexExpression::SourceScalar, 3, {}}, iterator(0)};
+    attributes.indexing_maps = {
+        map({0}), map({0}), std::move(table_map), TensorIndexMap{}, map({0})};
+    auto& output_body = program.functions.front().regions[1];
+    output_body.arguments = {{31, scalar}, {32, scalar}, {33, scalar},
+                             {34, index}, {35, scalar}};
+    output_body.instructions = {
+        Instruction{36, {Primitive::Add, 1, 0}, {31, 32}, {{37, scalar}},
+                    {}, {}, NoAttributes{}},
+        Instruction{38, {Primitive::Add, 1, 0}, {37, 33}, {{39, scalar}},
+                    {}, {}, NoAttributes{}},
+        Instruction{48, {Primitive::Add, 1, 0}, {39, 35}, {{49, scalar}},
+                    {}, {}, NoAttributes{}}};
+    output_body.yields = {49};
+    program.functions.front().regions.push_back(std::move(sum_body));
+    program.state_references.push_back({71, vector, UINT32_MAX, true});
+    return program;
+}
+
+void test_sequence_reuses_workspace_with_branching_state() {
+    auto verified = verify_and_canonicalize_program(branching_state_stages_program());
+    if (const auto* error = std::get_if<CompatibilityReport>(&verified))
+        CHECK_MSG(false, "branch verifier code=%u detail=%s", static_cast<unsigned>(error->code), error->detail.c_str());
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    const auto& program = std::get<VerifiedProgram>(verified);
+    auto compiled = compile_metal_program(program);
+    auto repeated_compiled = compile_metal_program(program);
+    CHECK(std::holds_alternative<MetalProgramExecutable>(compiled));
+    CHECK(std::holds_alternative<MetalProgramExecutable>(repeated_compiled));
+    if (!std::holds_alternative<MetalProgramExecutable>(compiled) ||
+        !std::holds_alternative<MetalProgramExecutable>(repeated_compiled)) return;
+    auto executable = std::get<MetalProgramExecutable>(std::move(compiled));
+    auto repeated = std::get<MetalProgramExecutable>(std::move(repeated_compiled));
+    ReferenceState reference_state;
+    uint64_t accepted_steps = 0;
+    const auto make_steps = [](size_t count) {
+        std::vector<MetalProgramInputStep> steps;
+        for (size_t i = 0; i < count; ++i)
+            steps.push_back({{
+                MetalProgramInput{9, {ElementType::U32, {}, {0}}},
+                MetalProgramInput{10, f32_value({1, 1},
+                    {static_cast<float>(i) * 0.25f - 2.0f})}}});
+        return steps;
+    };
+    const auto check_sequence = [&](const std::vector<MetalProgramInputStep>& steps) {
+        const auto actual = executable.execute_sequence(steps);
+        CHECK(std::holds_alternative<MetalProgramResult>(actual));
+        if (!std::holds_alternative<MetalProgramResult>(actual)) return;
+        const auto& output = std::get<MetalProgramResult>(actual);
+        for (size_t i = 0; i < steps.size(); ++i) {
+            const auto control = repeated.execute(steps[i].inputs);
+            CHECK(std::holds_alternative<MetalProgramResult>(control));
+            const std::array<ReferenceInput, 2> inputs = {
+                ReferenceInput{9, reference_value(steps[i].inputs[0].value)},
+                ReferenceInput{10, reference_value(steps[i].inputs[1].value)}};
+            const auto reference = execute_reference_program(program, reference_state, inputs);
+            CHECK(std::holds_alternative<ReferenceResult>(reference));
+            if (i + 1 != steps.size()) continue;
+            if (const auto* expected = std::get_if<MetalProgramResult>(&control)) {
+                CHECK(output.exports == expected->exports);
+                CHECK(expected->audit.intermediate_buffer_allocations == 0);
+                CHECK(expected->audit.intermediate_buffer_bytes == sizeof(uint32_t));
+            }
+            if (const auto* expected = std::get_if<ReferenceResult>(&reference))
+                CHECK(reference_value(output.exports.front()) == expected->exports.front());
+        }
+        accepted_steps += steps.size();
+        const float count = static_cast<float>(accepted_steps);
+        const float table = std::bit_cast<float>(
+            static_cast<uint32_t>(steps.back().inputs[1].value.bits.front()));
+        CHECK(output.exports == std::vector<MetalProgramValue>{
+            f32_value({1}, {count + count * (count + 1.0f) / 2.0f + table})});
+        CHECK(output.audit.state_generation == accepted_steps);
+        CHECK(output.audit.command_buffers == 1);
+        CHECK(output.audit.intermediate_buffer_allocations == 0);
+        CHECK(output.audit.intermediate_buffer_bytes == sizeof(uint32_t));
+        CHECK(output.audit.explicit_download_bytes == sizeof(uint32_t));
+    };
+    for (size_t count : {1u, 2u, 3u, 8u, 9u}) check_sequence(make_steps(count));
+    for (size_t count : {3u, 4u}) {
+        auto failed_steps = make_steps(count);
+        // This index is valid as an input scalar but fails on the GPU, after
+        // earlier steps have written both candidate states.
+        failed_steps.back().inputs[0].value.bits.front() = 1;
+        const auto failed = executable.execute_sequence(failed_steps);
+        CHECK(std::holds_alternative<CompatibilityReport>(failed));
+        if (const auto* error = std::get_if<CompatibilityReport>(&failed))
+            CHECK(error->code == CompatibilityError::RUNTIME_INPUT_INVALID);
+        check_sequence(make_steps(count));
+    }
+    const auto final_inputs = make_steps(1).front().inputs;
+    const auto actual = executable.execute(final_inputs);
+    const auto expected = repeated.execute(final_inputs);
+    CHECK(std::holds_alternative<MetalProgramResult>(actual));
+    CHECK(std::holds_alternative<MetalProgramResult>(expected));
+    if (const auto* output = std::get_if<MetalProgramResult>(&actual)) {
+        if (const auto* control = std::get_if<MetalProgramResult>(&expected))
+            CHECK(output->exports == control->exports);
+        CHECK(output->audit.state_generation == accepted_steps + 1);
+        CHECK(output->audit.intermediate_buffer_allocations == 0);
+        CHECK(output->audit.intermediate_buffer_bytes == sizeof(uint32_t));
+    }
+}
+
+void test_bound_decoder_sequence_reuses_workspace() {
+    auto package = bound_dependent_stages_package(true);
+    CHECK(package.has_value());
+    if (!package) return;
+    auto compiled = compile_metal_program(*package);
+    CHECK(std::holds_alternative<MetalProgramExecutable>(compiled));
+    if (!std::holds_alternative<MetalProgramExecutable>(compiled)) return;
+    auto executable = std::get<MetalProgramExecutable>(std::move(compiled));
+    ReferenceState state;
+    const auto reference = execute_reference(*package, state, {});
+    CHECK(std::holds_alternative<ReferenceResult>(reference));
+    for (size_t count : {1u, 2u, 3u, 31u, 32u, 33u}) {
+        const std::vector<MetalProgramInputStep> steps(count);
+        const auto executed = executable.execute_sequence(steps);
+        CHECK(std::holds_alternative<MetalProgramResult>(executed));
+        if (const auto* output = std::get_if<MetalProgramResult>(&executed)) {
+            CHECK(output->exports == std::vector<MetalProgramValue>{
+                f32_value({4}, {-0.5f, 0.5f, 1.5f, 2.5f})});
+            if (const auto* expected = std::get_if<ReferenceResult>(&reference))
+                CHECK(reference_value(output->exports.front()) == expected->exports.front());
+            CHECK(output->audit.command_buffers == 1);
+            CHECK(output->audit.intermediate_buffer_allocations == 0);
+            CHECK(output->audit.intermediate_buffer_bytes == 2 * 4 * sizeof(uint32_t));
+            CHECK(output->audit.explicit_upload_bytes == 0);
+            CHECK(output->audit.explicit_download_bytes == 4 * sizeof(uint32_t));
+            CHECK(output->audit.zero_copy_plane_bytes == 16);
+            CHECK(output->audit.mapped_artifact_buffer_count == 1);
+            CHECK(output->audit.persistent_plane_bytes == 16);
+            CHECK(output->audit.implicit_weight_copies == 0);
+        }
+    }
+}
+
 } // namespace
 
+void test_typed_stage_transport() {
+    for (ElementType type : {ElementType::I1, ElementType::I32, ElementType::U32,
+                             ElementType::U64, ElementType::F16, ElementType::F32}) {
+        Program program = dependent_tensor_stages_program();
+        for (auto& function : program.functions) {
+            for (auto& result : function.result_types) result.element_type = type;
+            for (auto& region : function.regions) {
+                for (auto& argument : region.arguments) argument.type.element_type = type;
+                if (region.id != function.entry_region_id) {
+                    region.instructions.clear();
+                    region.yields = {region.arguments.front().id};
+                }
+                for (auto& instruction : region.instructions)
+                    for (auto& output : instruction.outputs) output.type.element_type = type;
+            }
+        }
+        for (auto& result : program.exports) result.type.element_type = type;
+        const std::vector<uint64_t> bits = type == ElementType::I1 ?
+            std::vector<uint64_t>{0, 1, 1, 0} : type == ElementType::F16 ?
+            std::vector<uint64_t>{0x8000, 1, 0x7e01, 0xffff} : type == ElementType::U64 ?
+            std::vector<uint64_t>{0, 1, UINT64_MAX, 0x8000000100000000ull} :
+            std::vector<uint64_t>{0, 1, UINT32_MAX, 0x80000000};
+        const std::array<MetalProgramInput, 1> inputs = {
+            MetalProgramInput{10, {type, {4}, bits}}};
+        check_matches_reference(std::move(program), inputs);
+    }
+}
+
+void test_integer_state_and_overflow() {
+    for (ElementType type : {ElementType::U32, ElementType::I32, ElementType::U64}) {
+        Program source = transactional_state_stages_program();
+        const auto change = [type](ValueType& value) {
+            if (value.element_type == ElementType::F32) value.element_type = type;
+        };
+        for (auto& state : source.state_references) change(state.type);
+        for (auto& function : source.functions) {
+            for (auto& result : function.result_types) change(result);
+            for (auto& region : function.regions) {
+                for (auto& argument : region.arguments) change(argument.type);
+                for (auto& instruction : region.instructions) {
+                    for (auto& output : instruction.outputs) change(output.type);
+                    if (auto* constant = std::get_if<ConstantAttributes>(&instruction.attributes))
+                        if (constant->bits == std::bit_cast<uint32_t>(1.0f)) constant->bits = 1;
+                }
+            }
+        }
+        for (auto& result : source.exports) change(result.type);
+        auto verified = verify_and_canonicalize_program(std::move(source));
+        CHECK(std::holds_alternative<VerifiedProgram>(verified));
+        if (!std::holds_alternative<VerifiedProgram>(verified)) continue;
+        auto compiled = compile_metal_program(std::get<VerifiedProgram>(verified));
+        CHECK(std::holds_alternative<MetalProgramExecutable>(compiled));
+        if (!std::holds_alternative<MetalProgramExecutable>(compiled)) continue;
+        auto& executable = std::get<MetalProgramExecutable>(compiled);
+        std::vector<MetalProgramInputStep> steps(3);
+        for (auto& step : steps) step.inputs = {
+            MetalProgramInput{9, {ElementType::U32, {}, {0}}},
+            MetalProgramInput{10, {type, {1, 1}, {0}}}};
+        auto result = executable.execute_sequence(steps);
+        CHECK(std::holds_alternative<MetalProgramResult>(result));
+        if (auto* value = std::get_if<MetalProgramResult>(&result)) {
+            CHECK(value->exports.front() == (MetalProgramValue{type, {1}, {3}}));
+            CHECK(value->audit.state_generation == 3);
+        }
+        auto bad = steps.front().inputs;
+        bad.back().value.bits = {type == ElementType::U64 ? UINT64_MAX :
+                                type == ElementType::I32 ? uint64_t(INT32_MAX) : UINT32_MAX};
+        const auto failed = executable.execute(bad);
+        const auto* error = std::get_if<CompatibilityReport>(&failed);
+        CHECK(error && error->code == CompatibilityError::RUNTIME_NUMERICAL_FAILURE);
+        result = executable.execute(steps.front().inputs);
+        CHECK(std::holds_alternative<MetalProgramResult>(result));
+        if (auto* value = std::get_if<MetalProgramResult>(&result)) {
+            CHECK(value->exports.front() == (MetalProgramValue{type, {1}, {4}}));
+            CHECK(value->audit.state_generation == 4);
+        }
+    }
+}
+
+Program typed_algebra_test_program(Primitive primitive,
+                                   const std::vector<MetalProgramValue>& values,
+                                   ElementType output_type) {
+    const uint64_t count = values.front().bits.size();
+    const ValueType output{output_type, {dimension(count)}};
+    const ValueType scalar_output{output_type, {}};
+    Region body;
+    body.id = 2;
+    Region root;
+    root.id = 1;
+    std::vector<uint32_t> scalar_inputs, tensor_inputs;
+    StructuredTensorAttributes attributes;
+    attributes.source_count = static_cast<uint32_t>(values.size());
+    attributes.iteration_dimensions = {dimension(count)};
+    attributes.iterator_kinds = {TensorIteratorKind::Parallel};
+    for (size_t index = 0; index < values.size(); ++index) {
+        const uint32_t id = static_cast<uint32_t>(index);
+        body.arguments.push_back({100 + id, {values[index].type, {}}});
+        root.arguments.push_back({10 + id, {values[index].type, {dimension(count)}}});
+        scalar_inputs.push_back(100 + id);
+        tensor_inputs.push_back(10 + id);
+        attributes.indexing_maps.push_back(map({0}));
+    }
+    body.arguments.push_back({199, scalar_output});
+    body.instructions = {Instruction{200, {primitive, 1, 0}, scalar_inputs,
+        {{201, scalar_output}}, {}, {}, NoAttributes{}}};
+    body.yields = {201};
+    tensor_inputs.push_back(21);
+    attributes.indexing_maps.push_back(map({0}));
+    root.instructions = {
+        Instruction{20, {Primitive::Constant, 1, 0}, {}, {{21, output}},
+                    {}, {}, ConstantAttributes{0}},
+        Instruction{22, {Primitive::StructuredTensor, 1, 0}, tensor_inputs,
+                    {{23, output}}, {2}, {}, std::move(attributes)}};
+    root.yields = {23};
+    Program program;
+    program.minor = 1;
+    program.functions = {Function{9, 1, {std::move(body), std::move(root)}, {output}}};
+    program.exports = {{9, 0, output}};
+    return program;
+}
+
+void check_typed_algebra_native(Primitive primitive,
+                                std::vector<MetalProgramValue> values,
+                                ElementType output_type,
+                                bool expected_success = true,
+                                bool approximate = false) {
+    const auto verified = verify_and_canonicalize_program(
+        typed_algebra_test_program(primitive, values, output_type));
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    auto compiled = compile_metal_program(std::get<VerifiedProgram>(verified));
+    const auto* error = std::get_if<CompatibilityReport>(&compiled);
+    CHECK_MSG(std::holds_alternative<MetalProgramExecutable>(compiled),
+              "typed primitive=%u code=%u detail=%s", static_cast<unsigned>(primitive),
+              error ? static_cast<unsigned>(error->code) : 0,
+              error ? error->detail.c_str() : "none");
+    if (!std::holds_alternative<MetalProgramExecutable>(compiled)) return;
+    std::vector<MetalProgramInput> inputs;
+    std::vector<ReferenceInput> reference_inputs;
+    for (size_t index = 0; index < values.size(); ++index) {
+        const uint32_t id = static_cast<uint32_t>(10 + index);
+        inputs.push_back({id, values[index]});
+        reference_inputs.push_back({id, reference_value(values[index])});
+    }
+    const auto actual = std::get<MetalProgramExecutable>(compiled).execute(inputs);
+    ReferenceState state;
+    const auto reference = execute_reference_program(
+        std::get<VerifiedProgram>(verified), state, reference_inputs);
+    CHECK(std::holds_alternative<MetalProgramResult>(actual) == expected_success);
+    CHECK(std::holds_alternative<ReferenceResult>(reference) == expected_success);
+    if (!expected_success) return;
+    const auto* observed = std::get_if<MetalProgramResult>(&actual);
+    const auto* expected = std::get_if<ReferenceResult>(&reference);
+    if (!observed || !expected) return;
+    CHECK(observed->exports.size() == 1);
+    CHECK(expected->exports.size() == 1);
+    if (observed->exports.empty() || expected->exports.empty()) return;
+    if (!approximate) {
+        CHECK(reference_value(observed->exports.front()) == expected->exports.front());
+    } else {
+        const auto& actual_bits = observed->exports.front().bits;
+        const auto& wanted_bits = expected->exports.front().bits;
+        CHECK(actual_bits.size() == wanted_bits.size());
+        for (size_t i = 0; i < actual_bits.size() && i < wanted_bits.size(); ++i) {
+            const float a = std::bit_cast<float>(static_cast<uint32_t>(actual_bits[i]));
+            const float b = std::bit_cast<float>(static_cast<uint32_t>(wanted_bits[i]));
+            CHECK(std::isfinite(a));
+            CHECK(std::abs(a - b) <= 3.0e-6f * std::max(1.0f, std::abs(b)));
+        }
+    }
+}
+
+void test_typed_scalar_primitives_native() {
+    check_typed_algebra_native(Primitive::Convert,
+        {{ElementType::U32, {4}, {0, 16777217, 16777219, UINT32_MAX}}}, ElementType::F32);
+    check_typed_algebra_native(Primitive::Less,
+        {{ElementType::I32, {4}, {UINT32_MAX, 0x80000000, INT32_MAX, 0}},
+         {ElementType::I32, {4}, {0, INT32_MAX, 0x80000000, UINT32_MAX}}}, ElementType::I1);
+    check_typed_algebra_native(Primitive::Less,
+        {{ElementType::U64, {4}, {0, UINT64_MAX, uint64_t{1} << 63, UINT32_MAX}},
+         {ElementType::U64, {4}, {UINT64_MAX, 0, (uint64_t{1} << 63) - 1, UINT64_MAX}}}, ElementType::I1);
+    check_typed_algebra_native(Primitive::Equal,
+        {{ElementType::F32, {4}, {0, 0x80000000, 0x3f800000, 0xbf800000}},
+         {ElementType::F32, {4}, {0x80000000, 0, 0x3f800000, 0x3f800000}}}, ElementType::I1);
+    for (const auto& values : std::vector<std::pair<ElementType, std::vector<uint64_t>>>{
+            {ElementType::I1, {0, 1, 1, 0}},
+            {ElementType::I32, {UINT32_MAX, 0x80000000, INT32_MAX, 0}},
+            {ElementType::U32, {UINT32_MAX, 1, 0, 0x80000000}},
+            {ElementType::U64, {UINT64_MAX, uint64_t{1} << 63, 0, 1}},
+            {ElementType::F16, {0x8000, 0x7e01, 0x3c00, 0x0001}},
+            {ElementType::F32, {0x80000000, 0x7fc00001, 0x3f800000, 0x00000001}}}) {
+        std::vector<uint64_t> reverse(values.second.rbegin(), values.second.rend());
+        check_typed_algebra_native(Primitive::Select,
+            {{ElementType::I1, {4}, {1, 0, 1, 0}},
+             {values.first, {4}, values.second}, {values.first, {4}, std::move(reverse)}},
+            values.first);
+    }
+    check_typed_algebra_native(Primitive::Sqrt,
+        {f32_value({4}, {0.0f, 0.25f, 2.0f, 4.0f})}, ElementType::F32, true, true);
+    check_typed_algebra_native(Primitive::Tanh,
+        {f32_value({4}, {-100.0f, -1.25f, 0.0f, 100.0f})}, ElementType::F32, true, true);
+    check_typed_algebra_native(Primitive::Sqrt,
+        {f32_value({4}, {1.0f, -1.0f, 2.0f, 4.0f})}, ElementType::F32, false);
+    check_typed_algebra_native(Primitive::Tanh,
+        {f32_value({4}, {0.0f, INFINITY, 1.0f, 2.0f})}, ElementType::F32, false);
+}
+
+void test_tensor_source_element_native() {
+    Program program = dynamic_gather_program();
+    Region& root = program.functions.front().regions.back();
+    root.arguments[1].type = {ElementType::U32, {dimension(1), dimension(3)}};
+    auto& maps = std::get<StructuredTensorAttributes>(root.instructions.back().attributes).indexing_maps;
+    const TensorIndexExpr zero{TensorIndexExpression::Constant, 0, {}};
+    maps[1].results = {zero, iterator(0)};
+    const TensorIndexExpr load{TensorIndexExpression::SourceElement, 1, {zero, iterator(0)}};
+    maps[0].results[0] = load;
+    std::array<MetalProgramInput, 2> inputs = {
+        MetalProgramInput{10, f32_value({4, 3}, {1,2,3,4,5,6,7,8,9,10,11,12})},
+        MetalProgramInput{11, {ElementType::U32, {1,3}, {2,0,1}}}};
+    check_matches_reference(program, inputs);
+    maps[0].results[0].operands[1] = load;
+    check_matches_reference(program, inputs);
+    // An invalid index-source lookup remains an error when an earlier outer
+    // coordinate is zero padded. It must never be hidden by short circuiting.
+    maps[0].bounds = TensorBoundsMode::Zero;
+    maps[0].results = {{TensorIndexExpression::Constant, -1, {}},
+        {TensorIndexExpression::SourceElement, 1, {zero,
+            {TensorIndexExpression::Constant, 3, {}}}}};
+    auto verified = verify_and_canonicalize_program(program);
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    auto compiled = compile_metal_program(std::get<VerifiedProgram>(verified));
+    CHECK(std::holds_alternative<MetalProgramExecutable>(compiled));
+    if (!std::holds_alternative<MetalProgramExecutable>(compiled)) return;
+    const auto result = std::get<MetalProgramExecutable>(compiled).execute(inputs);
+    const auto* error = std::get_if<CompatibilityReport>(&result);
+    CHECK(error && error->code == CompatibilityError::RUNTIME_INPUT_INVALID);
+}
+
+void test_maximum_preserves_ordered_value_bits() {
+    const std::vector<MetalProgramValue> values = {
+        {ElementType::F32, {4}, {0x80000000, 0, 0x7fc12345, 0x3f800000}},
+        {ElementType::F32, {4}, {0, 0x80000000, 0x3f800000, 0x7fc12345}}};
+    auto program = typed_algebra_test_program(Primitive::Maximum, values, ElementType::F32);
+    program.functions.front().regions.front().instructions.front().attributes = ArithmeticAttributes{true, true};
+    const std::array<MetalProgramInput, 2> inputs = {MetalProgramInput{10, values[0]}, MetalProgramInput{11, values[1]}};
+    check_matches_reference(std::move(program), inputs);
+}
+
+void test_export_before_final_state_stage() {
+    Program program = transactional_state_stages_program();
+    Region& root = program.functions.front().regions.back();
+    root.yields = {16};
+    Instruction write = root.instructions[3];
+    root.instructions.erase(root.instructions.begin() + 3);
+    write.inputs = {40};
+    root.instructions.push_back(std::move(write));
+    const auto verified = verify_and_canonicalize_program(program);
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    auto compiled = compile_metal_program(std::get<VerifiedProgram>(verified));
+    const auto* error = std::get_if<CompatibilityReport>(&compiled);
+    CHECK_MSG(std::holds_alternative<MetalProgramExecutable>(compiled),
+              "nonfinal export compile: %s", error ? error->detail.c_str() : "none");
+    if (!std::holds_alternative<MetalProgramExecutable>(compiled)) return;
+    auto executable = std::get<MetalProgramExecutable>(std::move(compiled));
+    const std::vector<MetalProgramInput> inputs = {
+        {9, {ElementType::U32, {}, {0}}}, {10, f32_value({1, 1}, {2.0f})}};
+    uint64_t accepted = 0;
+    for (size_t count : {1u, 2u, 3u}) {
+        const auto result = count == 1 ? executable.execute(inputs) :
+            executable.execute_sequence(std::vector<MetalProgramInputStep>(count, {inputs}));
+        CHECK(std::holds_alternative<MetalProgramResult>(result));
+        accepted += count;
+        if (const auto* output = std::get_if<MetalProgramResult>(&result)) {
+            CHECK(output->exports == std::vector<MetalProgramValue>{
+                f32_value({1}, {3.0f * static_cast<float>(accepted) - 2.0f})});
+            CHECK(output->audit.state_generation == accepted);
+            CHECK(output->audit.intermediate_buffer_bytes == sizeof(float));
+        }
+    }
+    auto invalid = inputs;
+    invalid.front().value.bits.front() = 1;
+    const auto failed = executable.execute(invalid);
+    CHECK(std::holds_alternative<CompatibilityReport>(failed));
+    const auto retry = executable.execute(inputs);
+    CHECK(std::holds_alternative<MetalProgramResult>(retry));
+    if (const auto* output = std::get_if<MetalProgramResult>(&retry))
+        CHECK(output->audit.state_generation == accepted + 1);
+}
+
+void test_multiple_state_write_alias_fallback() {
+    Program program = transactional_state_stages_program();
+    Region& root = program.functions.front().regions.back();
+    root.instructions.insert(root.instructions.begin() + 4,
+        Instruction{171, {Primitive::StateWrite, 1, 0}, {16}, {}, {}, {17},
+                    StateAttributes{71}});
+    program.state_references.push_back({71, tensor({1}), UINT32_MAX, true});
+    const auto verified = verify_and_canonicalize_program(std::move(program));
+    if (const auto* error = std::get_if<CompatibilityReport>(&verified))
+        CHECK_MSG(false, "alias verifier code=%u detail=%s",
+                  static_cast<unsigned>(error->code), error->detail.c_str());
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    auto compiled = compile_metal_program(std::get<VerifiedProgram>(verified));
+    CHECK(std::holds_alternative<MetalProgramExecutable>(compiled));
+    if (!std::holds_alternative<MetalProgramExecutable>(compiled)) return;
+    const std::vector<MetalProgramInput> inputs = {
+        {9, {ElementType::U32, {}, {0}}}, {10, f32_value({1, 1}, {0.0f})}};
+    const auto result = std::get<MetalProgramExecutable>(std::move(compiled)).execute(inputs);
+    CHECK(std::holds_alternative<MetalProgramResult>(result));
+    if (const auto* output = std::get_if<MetalProgramResult>(&result))
+        CHECK(output->audit.intermediate_buffer_bytes == 2 * sizeof(float));
+}
+
 int main() {
+    test_export_before_final_state_stage();
+    test_multiple_state_write_alias_fallback();
     test_generic_f32_algebra_metal();
     test_data_dependent_tensor_index_metal();
     test_dependent_tensor_stages_one_command_buffer();
     test_bound_dependent_stages_one_command_buffer();
     test_transactional_state_publication();
+    test_typed_stage_transport();
+    test_integer_state_and_overflow();
+    test_typed_scalar_primitives_native();
+    test_tensor_source_element_native();
+    test_maximum_preserves_ordered_value_bits();
+    test_sequence_reuses_workspace_with_branching_state();
+    test_bound_decoder_sequence_reuses_workspace();
     test_contraction();
     test_bound_physical_contraction();
+    test_generated_physical_bit_window_exhaustive();
     test_transpose_and_reduction();
     test_generated_physical_decoder();
+    test_preserved_ieee_direct_loads();
     test_generated_physical_bit_orders_and_inline_plane();
     test_generated_physical_numeric_policies();
     test_generated_physical_index_and_float_algebra();

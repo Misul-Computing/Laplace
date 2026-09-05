@@ -18,11 +18,19 @@
 namespace Laplace {
 namespace {
 
-constexpr size_t kMaximumPhysicalNodes = 256;
+// A certificate has at most 64 maps, 128 nodes, rank 8 and 8 planes.
+// Its generic lowering uses <=48 instructions/map and <=64 shared helpers:
+// 64*48 + 128 + 64 = 3264 nodes. The longest lowered load path is <=48
+// nodes, preceded by <=20 coordinate/address nodes and followed by <=31
+// source operations. Its 4096 access records occupy 32768 inline bytes.
+// 4096 instruction records (36 bytes each), that table, and declarations
+// fit in 256 KiB. These rounded language limits also bound verifier work;
+// constant interning remains at most O(nodes^2), all other passes O(nodes).
+constexpr size_t kMaximumPhysicalNodes = 4096;
 constexpr size_t kMaximumPhysicalPlanes = 32;
 constexpr size_t kMaximumPhysicalPolicies = 32;
-constexpr size_t kMaximumPhysicalDepth = 64;
-constexpr size_t kMaximumPhysicalWireBytes = 64 * 1024;
+constexpr size_t kMaximumPhysicalDepth = 128;
+constexpr size_t kMaximumPhysicalWireBytes = 256 * 1024;
 
 CompatibilityReport error_report(CompatibilityError code,
                                   const char* detail) {
@@ -139,7 +147,8 @@ bool valid_numeric_policy(const PhysicalNumericPolicy& policy) noexcept {
         policy.integer_overflow == PhysicalIntegerOverflow::Reject ||
         policy.integer_overflow == PhysicalIntegerOverflow::Saturate;
     const bool nan = policy.nan == PhysicalNanPolicy::CanonicalQuiet ||
-                     policy.nan == PhysicalNanPolicy::Reject;
+                     policy.nan == PhysicalNanPolicy::Reject ||
+                     policy.nan == PhysicalNanPolicy::PreserveIeee;
     const bool infinity =
         policy.infinity == PhysicalInfinityPolicy::Preserve ||
         policy.infinity == PhysicalInfinityPolicy::SaturateFinite ||

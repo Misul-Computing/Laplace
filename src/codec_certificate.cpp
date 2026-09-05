@@ -10,6 +10,7 @@
 #include <cmath>
 #include <limits>
 #include <new>
+#include <numeric>
 #include <optional>
 #include <utility>
 
@@ -385,7 +386,7 @@ std::vector<uint8_t> build_q4() {
                                 AccessEncoding::Unsigned8, 4));
             ml.push_back(access(4 + group + 4, 4, 4,
                                 AccessEncoding::Unsigned8));
-            mh.push_back(access(4 + group + 4, 6, 2,
+            mh.push_back(access(4 + group, 6, 2,
                                 AccessEncoding::Unsigned8, 4));
         }
     }
@@ -440,8 +441,8 @@ std::vector<uint8_t> build_q5_0() {
     ql.reserve(32);
     qh.reserve(32);
     for (uint32_t element = 0; element != 32; ++element) {
-        ql.push_back(access(6 + element / 2,
-                             static_cast<uint8_t>((element & 1u) * 4u), 4,
+        ql.push_back(access(6 + element % 16,
+                             static_cast<uint8_t>((element / 16) * 4u), 4,
                              AccessEncoding::Unsigned8));
         qh.push_back(access(2 + element / 8,
                             static_cast<uint8_t>(element & 7u), 1,
@@ -498,7 +499,7 @@ std::vector<uint8_t> build_q8_0() {
 std::vector<uint8_t> build_q6() {
     Builder builder(256, 210, gguf_physical(210));
     std::vector<AccessRecord> d = repeated(
-        1, access(0, 0, 16, AccessEncoding::Binary16));
+        1, access(208, 0, 16, AccessEncoding::Binary16));
     std::vector<AccessRecord> ql, qh, scales;
     ql.reserve(256); qh.reserve(256); scales.reserve(256);
     for (uint32_t element = 0; element < 256; ++element) {
@@ -506,13 +507,13 @@ std::vector<uint8_t> build_q6() {
         const uint32_t within = element % 128;
         const uint32_t quarter = within / 32;
         const uint32_t lane = within % 32;
-        ql.push_back(access(2 + segment * 64 + (quarter / 2) * 32 + lane,
-                            static_cast<uint8_t>((quarter % 2) * 4), 4,
+        ql.push_back(access(segment * 64 + (quarter % 2) * 32 + lane,
+                            static_cast<uint8_t>((quarter / 2) * 4), 4,
                             AccessEncoding::Unsigned8));
-        qh.push_back(access(2 + 128 + segment * 32 + lane,
+        qh.push_back(access(128 + segment * 32 + lane,
                             static_cast<uint8_t>(quarter * 2), 2,
                             AccessEncoding::Unsigned8, 4));
-        scales.push_back(access(194 + element / 16, 0, 8,
+        scales.push_back(access(192 + element / 16, 0, 8,
                                 AccessEncoding::Signed8));
     }
     const uint8_t dm = builder.add_map(0, std::move(d));
@@ -1118,11 +1119,12 @@ float rounded_mul(float a, float b) {
 CodecCertificateError validate_binding(const Parsed& parsed,
                                        const CodecCertificateBinding& binding,
                                        uint64_t max_elements,
-                                       uint64_t* count) {
+                                       uint64_t* count,
+                                       bool whole_tensor = false) {
     if (binding.planes.size() != parsed.planes.size())
         return CodecCertificateError::InvalidPlaneBinding;
     if (binding.unit_count == 0 ||
-        binding.unit_count > parsed.summary.maximum_units)
+        (!whole_tensor && binding.unit_count > parsed.summary.maximum_units))
         return CodecCertificateError::InvalidUnitCount;
     uint64_t total = 0;
     if (!checked_mul(binding.unit_count, parsed.summary.unit_elements, &total))
@@ -1390,6 +1392,38 @@ CodecCertificateError CodecCertificate::validate(
             return CodecCertificateError::NonCanonical;
         uint64_t ignored = 0;
         return validate_binding(*parsed, binding, 0, &ignored);
+    } catch (const std::bad_alloc&) {
+        return CodecCertificateError::TooLarge;
+    }
+}
+CodecCertificateError CodecCertificate::validate_tensor(
+    const CodecCertificateBinding& binding) const noexcept {
+    try {
+        CodecCertificateError error = CodecCertificateError::None;
+        const auto parsed = parse_internal(canonical_bytes_, &error);
+        if (!parsed) return error;
+        if (codec_certificate_digest(canonical_bytes_) != identity_.digest)
+            return CodecCertificateError::NonCanonical;
+        // Each unit uses the same independent access graph. Positive strides
+        // make the checked final-unit extent an upper bound for every range
+        // of at most maximum_units, without iterating over the tensor payload.
+        uint64_t ignored = 0;
+        error = validate_binding(*parsed, binding, 0, &ignored, true);
+        if (error != CodecCertificateError::None ||
+            binding.unit_count <= parsed->summary.maximum_units)
+            return error;
+        // Every chunk start must satisfy all plane alignments. Their periods
+        // are powers of two, so their maximum is also their common period.
+        // A positive multiple of that period within the cap gives aligned
+        // full chunks; the last chunk may contain fewer units.
+        uint64_t period = 1;
+        for (size_t index = 0; index < parsed->planes.size(); ++index) {
+            const uint64_t alignment = parsed->planes[index].alignment;
+            period = std::max(period, alignment /
+                std::gcd(binding.planes[index].stride, alignment));
+        }
+        return period <= parsed->summary.maximum_units
+            ? CodecCertificateError::None : CodecCertificateError::InvalidUnitCount;
     } catch (const std::bad_alloc&) {
         return CodecCertificateError::TooLarge;
     }

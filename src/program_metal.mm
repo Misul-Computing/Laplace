@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
+#include <cstring>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -28,11 +30,43 @@ CompatibilityReport metal_error(CompatibilityError code, std::string detail) {
     return compatibility_report(code, std::move(detail));
 }
 
+// These are language scalar ABIs, independent of physical weight encodings.
+struct ScalarAbi { const char* name; const char* bits_name; size_t bytes; };
+ScalarAbi scalar_abi(ElementType type) {
+    switch (type) {
+    case ElementType::I1: return {"uchar", "uchar", 1};
+    case ElementType::I32: return {"int", "uint", 4};
+    case ElementType::U32: return {"uint", "uint", 4};
+    case ElementType::U64: return {"ulong", "ulong", 8};
+    case ElementType::F16: return {"half", "ushort", 2};
+    case ElementType::F32: return {"float", "uint", 4};
+    }
+    return {nullptr, nullptr, 0};
+}
+std::string scalar_literal(ElementType type, uint64_t bits) {
+    const auto abi = scalar_abi(type);
+    return "as_type<" + std::string(abi.name) + ">(" + abi.bits_name +
+           "(" + std::to_string(bits) + "ul))";
+}
+std::vector<uint8_t> pack_value(const MetalProgramValue& value) {
+    const size_t width = scalar_abi(value.type).bytes;
+    std::vector<uint8_t> bytes(value.bits.size() * width);
+    for (size_t i = 0; i < value.bits.size(); ++i)
+        std::memcpy(bytes.data() + i * width, &value.bits[i], width);
+    return bytes;
+}
+MetalProgramValue unpack_value(ElementType type, const std::vector<uint64_t>& extents,
+                               size_t count, const void* data) {
+    MetalProgramValue result{type, extents, std::vector<uint64_t>(count, 0)};
+    const size_t width = scalar_abi(type).bytes;
+    for (size_t i = 0; i < count; ++i)
+        std::memcpy(&result.bits[i], static_cast<const uint8_t*>(data) + i * width, width);
+    return result;
+}
+
 bool constant_shape(const ValueType& type, std::vector<uint64_t>* extents,
                     size_t* count) {
-    if (!extents || !count ||
-        (type.element_type != ElementType::F32 &&
-         type.element_type != ElementType::U32))
+    if (!extents || !count || !scalar_abi(type.element_type).bytes)
         return false;
     extents->clear();
     size_t product = 1;
@@ -44,6 +78,7 @@ bool constant_shape(const ValueType& type, std::vector<uint64_t>* extents,
         extents->push_back(dimension.value);
         product *= static_cast<size_t>(dimension.value);
     }
+    if (product > SIZE_MAX / scalar_abi(type.element_type).bytes) return false;
     *count = product;
     return true;
 }
@@ -63,7 +98,7 @@ std::array<uint8_t, 32> source_digest(std::string_view source) {
 
 bool emit_index(const TensorIndexExpr& expression, std::string* result,
                 std::span<const std::string> source_scalars,
-                size_t depth = 0) {
+                std::span<const std::string> source_elements, size_t depth = 0) {
     if (!result || depth > 32) return false;
     switch (expression.expression) {
     case TensorIndexExpression::Constant:
@@ -83,6 +118,18 @@ bool emit_index(const TensorIndexExpr& expression, std::string* result,
             return false;
         *result = source_scalars[static_cast<size_t>(expression.value)];
         return true;
+    case TensorIndexExpression::SourceElement: {
+        if (expression.value < 0 || static_cast<uint64_t>(expression.value) >= source_elements.size() ||
+            source_elements[expression.value].empty()) return false;
+        *result = source_elements[expression.value];
+        for (const auto& operand : expression.operands) {
+            std::string coordinate;
+            if (!emit_index(operand, &coordinate, source_scalars, source_elements, depth + 1)) return false;
+            *result += ", " + coordinate;
+        }
+        *result += ")";
+        return true;
+    }
     case TensorIndexExpression::Add:
     case TensorIndexExpression::Multiply:
     case TensorIndexExpression::FloorDivide:
@@ -94,13 +141,13 @@ bool emit_index(const TensorIndexExpr& expression, std::string* result,
     if (expression.operands.size() != 2) return false;
     std::string left;
     std::string right;
-    if (!emit_index(expression.operands[0], &left, source_scalars, depth + 1) ||
-        !emit_index(expression.operands[1], &right, source_scalars, depth + 1))
+    if (!emit_index(expression.operands[0], &left, source_scalars, source_elements, depth + 1) ||
+        !emit_index(expression.operands[1], &right, source_scalars, source_elements, depth + 1))
         return false;
     if (expression.expression == TensorIndexExpression::Add) {
-        *result = "(" + left + " + " + right + ")";
+        *result = "laplace_index_add(" + left + ", " + right + ", error)";
     } else if (expression.expression == TensorIndexExpression::Multiply) {
-        *result = "(" + left + " * " + right + ")";
+        *result = "laplace_index_mul(" + left + ", " + right + ", error)";
     } else if (expression.expression == TensorIndexExpression::FloorDivide) {
         *result = "laplace_floor_div(" + left + ", " + right + ")";
     } else {
@@ -124,9 +171,11 @@ struct Lowering {
     std::string source;
     std::vector<InputSpec> inputs;
     std::vector<PhysicalPlane> physical_planes;
+    ElementType output_type = ElementType::F32;
     std::vector<uint64_t> output_extents;
     size_t output_count = 0;
     uint32_t output_value_id = UINT32_MAX;
+    uint32_t direct_state_index = UINT32_MAX;
 };
 
 struct MultiLowering {
@@ -142,6 +191,7 @@ struct MultiLowering {
     std::vector<InputSpec> inputs;
     std::vector<State> states;
     std::vector<uint32_t> exports;
+    ElementType output_type = ElementType::F32;
     std::vector<uint64_t> output_extents;
     size_t output_count = 0;
 };
@@ -324,7 +374,10 @@ std::string physical_instruction_source(
             }
             break;
         case PhysicalOpcode::F16ToF32:
-            expression = "float(as_type<half>(ushort(" + operand(0) + ")))";
+            expression = program.policies[instruction.policy].nan ==
+                                 PhysicalNanPolicy::PreserveIeee
+                ? "as_type<float>(laplace_half_to_float_bits(ushort(" + operand(0) + ")))"
+                : "float(as_type<half>(ushort(" + operand(0) + ")))";
             break;
         case PhysicalOpcode::Bf16ToF32:
             expression = "as_type<float>(uint(" + operand(0) + ") << 16u)";
@@ -384,22 +437,44 @@ std::string physical_instruction_source(
 }
 
 constexpr std::string_view kPhysicalMetalPrelude = R"METAL(
-inline uint laplace_load_lsb(device const uchar* bytes, ulong address, uint width) {
-    uint value = 0u;
-    for (uint bit = 0u; bit < width; ++bit) {
-        ulong current = address + ulong(bit);
-        value |= uint((bytes[current >> 3u] >> uint(current & 7u)) & 1u) << bit;
+inline uint laplace_half_to_float_bits(ushort value) {
+    uint sign = uint(value & 0x8000u) << 16u;
+    uint exponent = (uint(value) >> 10u) & 31u;
+    uint fraction = uint(value) & 1023u;
+    if (exponent == 0u) {
+        if (fraction == 0u) return sign;
+        uint shift = 0u;
+        while ((fraction & 1024u) == 0u) {
+            fraction <<= 1u;
+            ++shift;
+        }
+        return sign | ((113u - shift) << 23u) | ((fraction & 1023u) << 13u);
     }
-    return value;
+    if (exponent == 31u) return sign | 0x7f800000u | (fraction << 13u);
+    return sign | ((exponent + 112u) << 23u) | (fraction << 13u);
+}
+inline uint laplace_load_lsb(device const uchar* bytes, ulong address, uint width) {
+    if (width == 0u || width > 32u) return 0u;
+    const uint bit_offset = uint(address & 7ul);
+    const ulong first_byte = address >> 3ul;
+    const uint byte_count = (bit_offset + width + 7u) >> 3u;
+    ulong window = 0ul;
+    for (uint index = 0u; index < byte_count; ++index)
+        window |= ulong(bytes[first_byte + ulong(index)]) << (index * 8u);
+    const uint mask = width == 32u ? 0xffffffffu : (1u << width) - 1u;
+    return uint((window >> bit_offset) & ulong(mask));
 }
 inline uint laplace_load_msb(device const uchar* bytes, ulong address, uint width) {
-    uint value = 0u;
-    for (uint bit = 0u; bit < width; ++bit) {
-        ulong current = address + ulong(bit);
-        value = (value << 1u) |
-            uint((bytes[current >> 3u] >> uint(7u - (current & 7u))) & 1u);
-    }
-    return value;
+    if (width == 0u || width > 32u) return 0u;
+    const uint bit_offset = uint(address & 7ul);
+    const ulong first_byte = address >> 3ul;
+    const uint byte_count = (bit_offset + width + 7u) >> 3u;
+    ulong window = 0ul;
+    for (uint index = 0u; index < byte_count; ++index)
+        window = (window << 8u) | ulong(bytes[first_byte + ulong(index)]);
+    const uint shift = byte_count * 8u - bit_offset - width;
+    const uint mask = width == 32u ? 0xffffffffu : (1u << width) - 1u;
+    return uint((window >> shift) & ulong(mask));
 }
 inline uint laplace_funnel_shift_right(uint low, uint high, ulong shift) {
     if (shift == 0ul) return low;
@@ -415,7 +490,7 @@ inline uint laplace_apply_policy(uint bits, uint nan_policy, uint infinity_polic
     uint fraction = bits & 0x007fffffu;
     if (exponent == 0x7f800000u && fraction != 0u) {
         if (nan_policy == 2u) atomic_store_explicit(error, 1u, memory_order_relaxed);
-        bits = 0x7fc00000u;
+        if (nan_policy != 3u) bits = 0x7fc00000u;
     } else if (exponent == 0x7f800000u) {
         if (infinity_policy == 3u) atomic_store_explicit(error, 1u, memory_order_relaxed);
         else if (infinity_policy == 2u) bits = sign | 0x7f7fffffu;
@@ -534,74 +609,106 @@ std::variant<PhysicalLowering, CompatibilityReport> lower_physical_program(
 
 std::optional<std::string> scalar_body_source(
     const Region& body, uint32_t source_count, std::string* yielded) {
-    if (!yielded || body.arguments.size() != source_count + 1 ||
-        body.yields.size() != 1)
+    if (!yielded || body.arguments.size() != source_count + 1 || body.yields.size() != 1)
         return std::nullopt;
     std::unordered_map<uint32_t, std::string> values;
-    for (uint32_t index = 0; index < source_count; ++index)
-        values.emplace(body.arguments[index].id, "s" + std::to_string(index));
-    values.emplace(body.arguments[source_count].id, "acc");
+    std::unordered_map<uint32_t, ElementType> types;
+    for (uint32_t i = 0; i <= source_count; ++i) {
+        values.emplace(body.arguments[i].id, i == source_count ? "acc" : "s" + std::to_string(i));
+        types.emplace(body.arguments[i].id, body.arguments[i].type.element_type);
+    }
     std::ostringstream source;
     size_t temporary = 0;
     for (const Instruction& instruction : body.instructions) {
-        if (instruction.outputs.size() != 1 ||
-            instruction.outputs.front().type != ValueType{ElementType::F32, {}})
+        if (instruction.outputs.size() != 1 || !instruction.outputs.front().type.dimensions.empty())
             return std::nullopt;
+        const ElementType type = instruction.outputs.front().type.element_type;
+        const auto abi = scalar_abi(type);
+        if (!abi.name) return std::nullopt;
         const std::string name = "t" + std::to_string(temporary++);
-        if (instruction.primitive.code == Primitive::Constant) {
-            const auto* attributes =
-                std::get_if<ConstantAttributes>(&instruction.attributes);
-            if (!attributes || !instruction.inputs.empty() ||
-                attributes->bits > UINT32_MAX)
-                return std::nullopt;
-            source << "        float " << name << " = as_type<float>(uint("
-                   << static_cast<uint32_t>(attributes->bits) << "u));\n";
-        } else if (instruction.primitive.code == Primitive::Add ||
-                   instruction.primitive.code == Primitive::Multiply ||
-                   instruction.primitive.code == Primitive::Subtract ||
-                   instruction.primitive.code == Primitive::Divide ||
-                   instruction.primitive.code == Primitive::Maximum) {
-            if (instruction.inputs.size() != 2) return std::nullopt;
-            const auto left = values.find(instruction.inputs[0]);
-            const auto right = values.find(instruction.inputs[1]);
-            if (left == values.end() || right == values.end())
-                return std::nullopt;
-            const Primitive code = instruction.primitive.code;
-            if (code == Primitive::Maximum) {
-                source << "        float " << name << " = max("
-                       << left->second << ", " << right->second << ");\n";
-            } else {
-                const char* operation = code == Primitive::Add ? " + " :
-                    code == Primitive::Multiply ? " * " :
-                    code == Primitive::Subtract ? " - " : " / ";
-                source << "        float " << name << " = " << left->second
-                       << operation << right->second << ";\n";
-            }
-        } else if (instruction.primitive.code == Primitive::Negate ||
-                   instruction.primitive.code == Primitive::Exp ||
-                   instruction.primitive.code == Primitive::Log ||
-                   instruction.primitive.code == Primitive::Rsqrt ||
-                   instruction.primitive.code == Primitive::Sin ||
-                   instruction.primitive.code == Primitive::Cos) {
-            if (instruction.inputs.size() != 1) return std::nullopt;
-            const auto input = values.find(instruction.inputs.front());
-            if (input == values.end()) return std::nullopt;
-            const Primitive code = instruction.primitive.code;
-            if (code == Primitive::Negate) {
-                source << "        float " << name << " = -" << input->second
-                       << ";\n";
-            } else {
-                const char* function = code == Primitive::Exp ? "exp" :
-                    code == Primitive::Log ? "log" :
-                    code == Primitive::Rsqrt ? "rsqrt" :
-                    code == Primitive::Sin ? "sin" : "cos";
-                source << "        float " << name << " = " << function
-                       << "(" << input->second << ");\n";
-            }
-        } else {
-            return std::nullopt;
+        std::vector<std::string> args;
+        for (uint32_t id : instruction.inputs) {
+            const auto value = values.find(id);
+            if (value == values.end()) return std::nullopt;
+            args.push_back(value->second);
         }
+        const Primitive code = instruction.primitive.code;
+        const auto* arithmetic = std::get_if<ArithmeticAttributes>(&instruction.attributes);
+        const bool allow_nonfinite_operands = arithmetic && arithmetic->allow_nonfinite_operands;
+        const bool allow_nonfinite_result = arithmetic && arithmetic->allow_nonfinite_result;
+        std::string expression;
+        if (code == Primitive::Constant) {
+            const auto* constant = std::get_if<ConstantAttributes>(&instruction.attributes);
+            if (!constant || !args.empty()) return std::nullopt;
+            expression = scalar_literal(type, constant->bits);
+        } else if (code == Primitive::TensorCoordinate) {
+            const auto* coordinate = std::get_if<CoordinateAttributes>(&instruction.attributes);
+            if (!coordinate || !args.empty()) return std::nullopt;
+            expression = std::string(abi.name) + "(i" + std::to_string(coordinate->axis) + ")";
+        } else if (code == Primitive::Require) {
+            if (args.size() != 1) return std::nullopt;
+            source << "        if (" << args[0] << " != 1u) { atomic_store_explicit(error, 1u, memory_order_relaxed); return; }\n";
+            expression = args[0];
+        } else if (code == Primitive::Select) {
+            if (args.size() != 3) return std::nullopt;
+            expression = "(" + args[0] + " != 0 ? " + args[1] + " : " + args[2] + ")";
+        } else if (code == Primitive::Convert) {
+            if (args.size() != 1) return std::nullopt;
+            // Metal integer-to-float conversion uses round-to-nearest-even.
+            expression = "float(" + args[0] + ")";
+        } else {
+            for (uint32_t id : instruction.inputs) {
+                if (!allow_nonfinite_operands && types.at(id) == ElementType::F32)
+                    source << "        if (!isfinite(" << values.at(id)
+                           << ")) { atomic_store_explicit(error, 1u, memory_order_relaxed); return; }\n";
+            }
+            if (code == Primitive::Less || code == Primitive::Equal) {
+                if (args.size() != 2) return std::nullopt;
+                expression = "uchar(" + args[0] + (code == Primitive::Less ? " < " : " == ") + args[1] + ")";
+            } else if (code == Primitive::Add || code == Primitive::Multiply ||
+                       code == Primitive::Subtract || code == Primitive::Divide || code == Primitive::Maximum || code == Primitive::Pow) {
+                if (args.size() != 2) return std::nullopt;
+                const char* operation = code == Primitive::Add ? " + " : code == Primitive::Multiply ? " * " :
+                                        code == Primitive::Subtract ? " - " : " / ";
+                if (type == ElementType::F32) {
+                    expression = code == Primitive::Maximum ? "(" + args[0] + " < " + args[1] + " ? " + args[1] + " : " + args[0] + ")" :
+                        code == Primitive::Pow ? "pow(" + args[0] + ", " + args[1] + ")" :
+                        args[0] + operation + args[1];
+                } else if (type == ElementType::U32 || type == ElementType::I32) {
+                    const char* wide = type == ElementType::I32 ? "long" : "ulong";
+                    source << "        " << wide << " wide" << name << " = " << wide << "(" << args[0]
+                           << ")" << operation << wide << "(" << args[1] << ");\n";
+                    source << "        if (wide" << name
+                           << (type == ElementType::I32 ? " < -2147483648l || wide" + name + " > 2147483647l" : " > 4294967295ul")
+                           << ") { atomic_store_explicit(error, 1u, memory_order_relaxed); return; }\n";
+                    expression = std::string(abi.name) + "(wide" + name + ")";
+                } else if (type == ElementType::U64) {
+                    source << "        if (";
+                    if (code == Primitive::Add) source << args[0] << " > 18446744073709551615ul - " << args[1];
+                    else source << args[0] << " != 0ul && " << args[1] << " > 18446744073709551615ul / " << args[0];
+                    source << ") { atomic_store_explicit(error, 1u, memory_order_relaxed); return; }\n";
+                    expression = args[0] + operation + args[1];
+                } else return std::nullopt;
+            } else {
+                if (args.size() != 1) return std::nullopt;
+                if (code == Primitive::RequireFinite) expression = args[0];
+                else if (code == Primitive::Negate) expression = "-" + args[0];
+                else {
+                    const char* function = code == Primitive::Exp ? "exp" : code == Primitive::Log ? "log" :
+                        code == Primitive::Rsqrt ? "rsqrt" : code == Primitive::Sin ? "sin" :
+                        code == Primitive::Cos ? "cos" : code == Primitive::Sqrt ? "sqrt" :
+                        code == Primitive::Tanh ? "tanh" : nullptr;
+                    if (!function) return std::nullopt;
+                    expression = std::string(function) + "(" + args[0] + ")";
+                }
+            }
+        }
+        source << "        " << abi.name << " " << name << " = " << expression << ";\n";
+        if (!allow_nonfinite_result && type == ElementType::F32 && code != Primitive::Constant && code != Primitive::Select)
+            source << "        if (!isfinite(" << name
+                   << ")) { atomic_store_explicit(error, 1u, memory_order_relaxed); return; }\n";
         values.emplace(instruction.outputs.front().id, name);
+        types.emplace(instruction.outputs.front().id, type);
     }
     const auto result = values.find(body.yields.front());
     if (result == values.end()) return std::nullopt;
@@ -700,8 +807,8 @@ std::variant<Lowering, CompatibilityReport> lower_program(
 
     Lowering lowering;
     lowering.output_value_id = structured->outputs.front().id;
-    if (structured->outputs.front().type.element_type != ElementType::F32 ||
-        !constant_shape(structured->outputs.front().type,
+    lowering.output_type = structured->outputs.front().type.element_type;
+    if (!constant_shape(structured->outputs.front().type,
                         &lowering.output_extents, &lowering.output_count) ||
         lowering.output_count == 0 || lowering.output_count > UINT32_MAX)
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
@@ -754,9 +861,22 @@ std::variant<Lowering, CompatibilityReport> lower_program(
     struct SourceBinding {
         bool physical = false;
         size_t index = 0;
+        const Instruction* constant = nullptr;
     };
+    std::vector<std::vector<uint64_t>> constant_shapes;
     std::vector<SourceBinding> source_bindings;
     for (uint32_t source = 0; source < attributes->source_count; ++source) {
+        const auto definition = definitions.find(structured->inputs[source]);
+        if (definition != definitions.end() && definition->second->primitive.code == Primitive::Constant) {
+            std::vector<uint64_t> extents;
+            size_t count = 0;
+            if (!constant_shape(definition->second->outputs.front().type, &extents, &count))
+                return metal_error(CompatibilityError::IR_SHAPE_MISMATCH, "Metal constant source shape is invalid");
+            source_bindings.push_back({false, constant_shapes.size(), definition->second});
+            constant_shapes.push_back(std::move(extents));
+            continue;
+        }
+
         const auto argument = argument_indices.find(structured->inputs[source]);
         if (argument != argument_indices.end()) {
             source_bindings.push_back({false, argument->second});
@@ -769,20 +889,70 @@ std::variant<Lowering, CompatibilityReport> lower_program(
         source_bindings.push_back({true, bound->second});
     }
 
-    std::vector<std::string> source_scalar_expressions(
-        attributes->source_count);
+    std::vector<std::string> source_scalar_expressions(attributes->source_count);
+    std::vector<std::string> source_element_expressions(attributes->source_count);
+    std::ostringstream indexed_loaders;
     for (uint32_t source = 0; source < attributes->source_count; ++source) {
         const SourceBinding& binding = source_bindings[source];
-        if (!binding.physical &&
-            lowering.inputs[binding.index].type == ElementType::U32 &&
-            lowering.inputs[binding.index].extents.empty()) {
-            source_scalar_expressions[source] =
-                "long(input" + std::to_string(binding.index) + "[0])";
+        const ElementType type = binding.constant ? binding.constant->outputs.front().type.element_type :
+            binding.physical ? bound_sources[binding.index].logical->element_type : lowering.inputs[binding.index].type;
+        if (type != ElementType::U32) continue;
+        const auto& extents = binding.constant ? constant_shapes[binding.index] :
+            binding.physical ? bound_sources[binding.index].logical->extents : lowering.inputs[binding.index].extents;
+        const std::string name = "laplace_index_source" + std::to_string(source);
+        std::string call = name + "(";
+        indexed_loaders << "inline long " << name << "(";
+        PhysicalSourceContext context;
+        context.value_prefix = "iv";
+        context.coordinate_prefix = "ic";
+        if (binding.physical) {
+            const auto& bound = bound_sources[binding.index];
+            for (size_t plane = 0; plane < bound.program->planes.size(); ++plane) {
+                indexed_loaders << "device const uchar* p" << plane << ", ";
+                call += "physical" + std::to_string(bound.plane_base + plane) + ", ";
+                context.plane_names.push_back("p" + std::to_string(plane));
+                context.plane_offset_indices.push_back(bound.plane_base + plane);
+            }
+            indexed_loaders << "constant ulong* plane_offsets, ";
+            call += "physical_offsets, ";
+        } else if (!binding.constant) {
+            indexed_loaders << "device const uint* values, ";
+            call += "input" + std::to_string(binding.index) + ", ";
+        }
+        indexed_loaders << "device atomic_uint* error";
+        call += "error";
+        source_element_expressions[source] = call;
+        if (extents.empty()) source_scalar_expressions[source] = call + ")";
+        for (size_t axis = 0; axis < extents.size(); ++axis)
+            indexed_loaders << ", long c" << axis;
+        indexed_loaders << ") {\n";
+        for (size_t axis = 0; axis < extents.size(); ++axis) {
+            indexed_loaders << "    if (c" << axis << " < 0l || ulong(c" << axis << ") >= "
+                << extents[axis] << "ul) { atomic_store_explicit(error, 2u, memory_order_relaxed); return 0l; }\n";
+        }
+        if (binding.physical) {
+            const auto& bound = bound_sources[binding.index];
+            for (size_t axis = 0; axis < extents.size(); ++axis)
+                indexed_loaders << "    ulong ic" << axis << " = ulong(c" << axis << ");\n";
+            for (size_t i = 0; i < bound.program->instructions.size(); ++i) {
+                const auto& instruction = bound.program->instructions[i];
+                if (instruction.opcode == PhysicalOpcode::Extent)
+                    indexed_loaders << "    ulong iv" << i << " = " << extents[instruction.immediate] << "ul;\n";
+                else indexed_loaders << physical_instruction_source(*bound.program, i, context);
+            }
+            indexed_loaders << "    return long(iv" << bound.program->result << ");\n}\n";
+        } else if (binding.constant) {
+            indexed_loaders << "    return " << std::get<ConstantAttributes>(binding.constant->attributes).bits << "l;\n}\n";
+        } else {
+            indexed_loaders << "    ulong offset = 0ul;\n";
+            for (size_t axis = 0; axis < extents.size(); ++axis)
+                indexed_loaders << "    offset = offset * " << extents[axis] << "ul + ulong(c" << axis << ");\n";
+            indexed_loaders << "    return long(values[offset]);\n}\n";
         }
     }
 
     bool initial_is_constant = false;
-    uint32_t initial_bits = 0;
+    uint64_t initial_bits = 0;
     size_t initial_buffer = 0;
     const uint32_t initial_id = structured->inputs.back();
     if (const auto argument = argument_indices.find(initial_id);
@@ -797,13 +967,13 @@ std::variant<Lowering, CompatibilityReport> lower_program(
         }
         const auto* constant =
             std::get_if<ConstantAttributes>(&definition->second->attributes);
-        if (!constant || constant->bits > UINT32_MAX ||
+        if (!constant ||
             definition->second->outputs.front().type !=
                 structured->outputs.front().type)
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "Metal destination initializer is invalid");
         initial_is_constant = true;
-        initial_bits = static_cast<uint32_t>(constant->bits);
+        initial_bits = constant->bits;
     }
 
     std::string yielded;
@@ -816,16 +986,36 @@ std::variant<Lowering, CompatibilityReport> lower_program(
     std::ostringstream source;
     source << "#include <metal_stdlib>\nusing namespace metal;\n";
     if (!lowering.physical_planes.empty()) source << kPhysicalMetalPrelude;
-    source << "inline long laplace_floor_div(long a, long b) { long q = a / b; "
-              "long r = a % b; return q - long(r < 0); }\n"
-              "inline long laplace_floor_mod(long a, long b) { return a - "
-              "laplace_floor_div(a, b) * b; }\n"
-              "kernel void laplace_structured_v1(";
+    source << R"METAL(
+inline long laplace_index_add(long a, long b, device atomic_uint* error) {
+    if ((b > 0l && a > 9223372036854775807l - b) ||
+        (b < 0l && a < (-9223372036854775807l - 1l) - b)) {
+        atomic_store_explicit(error, 2u, memory_order_relaxed); return 0l;
+    }
+    return a + b;
+}
+inline long laplace_index_mul(long a, long b, device atomic_uint* error) {
+    const long lo = -9223372036854775807l - 1l;
+    const long hi = 9223372036854775807l;
+    if ((a > 0l && ((b > 0l && a > hi / b) || (b < 0l && b < lo / a))) ||
+        (a < 0l && ((b > 0l && a < lo / b) || (b < 0l && a < hi / b)))) {
+        atomic_store_explicit(error, 2u, memory_order_relaxed); return 0l;
+    }
+    return a * b;
+}
+inline long laplace_floor_div(long a, long b) {
+    long q = a / b; long r = a % b; return q - long(r < 0l);
+}
+inline long laplace_floor_mod(long a, long b) {
+    long r = a % b; return r < 0l ? r + b : r;
+}
+)METAL";
+    source << indexed_loaders.str() << "kernel void laplace_structured_v1(";
     bool has_argument = false;
     for (size_t input = 0; input < lowering.inputs.size(); ++input) {
         if (has_argument) source << ", ";
         source << "device const "
-               << (lowering.inputs[input].type == ElementType::F32 ? "float" : "uint")
+               << scalar_abi(lowering.inputs[input].type).name
                << "* input" << input
                << " [[buffer(" << input << ")]]";
         has_argument = true;
@@ -847,7 +1037,8 @@ std::variant<Lowering, CompatibilityReport> lower_program(
     }
     const size_t error_buffer = output_buffer + 1;
     if (has_argument) source << ", ";
-    source << "device float* output [[buffer(" << output_buffer << ")]]";
+    source << "device " << scalar_abi(lowering.output_type).name
+           << "* output [[buffer(" << output_buffer << ")]]";
     source << ", device atomic_uint* error [[buffer(" << error_buffer
            << ")]]";
     source << ", uint gid [[thread_position_in_grid]]) {\n"
@@ -868,9 +1059,9 @@ std::variant<Lowering, CompatibilityReport> lower_program(
             source << "    long i" << iterator << " = o" << axis << ";\n";
         }
     }
-    source << "    float acc = ";
+    source << "    " << scalar_abi(lowering.output_type).name << " acc = ";
     if (initial_is_constant) {
-        source << "as_type<float>(uint(" << initial_bits << "u));\n";
+        source << scalar_literal(lowering.output_type, initial_bits) << ";\n";
     } else {
         source << "input" << initial_buffer << "[gid];\n";
     }
@@ -887,9 +1078,8 @@ std::variant<Lowering, CompatibilityReport> lower_program(
          ++source_index) {
         const TensorIndexMap& index_map = attributes->indexing_maps[source_index];
         const SourceBinding& binding = source_bindings[source_index];
-        const std::vector<uint64_t>& extents = binding.physical
-            ? bound_sources[binding.index].logical->extents
-            : lowering.inputs[binding.index].extents;
+        const std::vector<uint64_t>& extents = binding.constant ? constant_shapes[binding.index] :
+            binding.physical ? bound_sources[binding.index].logical->extents : lowering.inputs[binding.index].extents;
         if (index_map.results.size() != extents.size())
             return metal_error(CompatibilityError::IR_SHAPE_MISMATCH,
                                "Metal source index rank is invalid");
@@ -898,20 +1088,20 @@ std::variant<Lowering, CompatibilityReport> lower_program(
         for (const TensorIndexExpr& expression : index_map.results) {
             std::string coordinate;
             if (!emit_index(expression, &coordinate,
-                            source_scalar_expressions))
+                            source_scalar_expressions, source_element_expressions))
                 return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                    "Metal source index expression is unsupported");
             coordinates.push_back(std::move(coordinate));
         }
         const std::string padding(indent * 4, ' ');
         const ElementType source_type = body->arguments[source_index].type.element_type;
-        if (source_type != ElementType::F32 && source_type != ElementType::U32)
+        if (!scalar_abi(source_type).bytes)
             return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                "Metal scalar source type is unsupported");
         source << padding
-               << (source_type == ElementType::F32 ? "float" : "uint")
+               << scalar_abi(source_type).name
                << " s" << source_index << " = "
-               << (source_type == ElementType::F32 ? "0.0f" : "0u") << ";\n";
+               << scalar_literal(source_type, 0) << ";\n";
         std::string condition = "true";
         for (size_t axis = 0; axis < coordinates.size(); ++axis) {
             source << padding << "long s" << source_index << "c" << axis
@@ -923,7 +1113,10 @@ std::variant<Lowering, CompatibilityReport> lower_program(
                          std::to_string(extents[axis]) + "ul";
         }
         source << padding << "if (" << condition << ") {\n";
-        if (!binding.physical) {
+        if (binding.constant) {
+            source << padding << "    s" << source_index << " = " << scalar_literal(source_type,
+                std::get<ConstantAttributes>(binding.constant->attributes).bits) << ";\n";
+        } else if (!binding.physical) {
             source << padding << "    ulong offset = 0ul;\n";
             for (size_t axis = 0; axis < coordinates.size(); ++axis)
                 source << padding << "    offset = offset * " << extents[axis]
@@ -1264,13 +1457,32 @@ std::variant<MultiLowering, CompatibilityReport> lower_multi_program(
         result.stages.push_back(std::move(stage));
     }
     const uint32_t exported = root->yields.front();
-    if (!available.contains(exported) ||
-        result.stages.back().output_value_id != exported)
+    const auto output = std::find_if(result.stages.begin(), result.stages.end(),
+        [&](const Lowering& stage) { return stage.output_value_id == exported; });
+    if (!available.contains(exported) || output == result.stages.end())
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                            "Metal staged export is unsupported");
     result.exports = {exported};
-    result.output_extents = result.stages.back().output_extents;
-    result.output_count = result.stages.back().output_count;
+    result.output_type = output->output_type;
+    result.output_extents = output->output_extents;
+    result.output_count = output->output_count;
+    // A stage may own its destination when exactly one StateWrite consumes
+    // its value. Later stages already wait on the existing stage barrier.
+    for (Lowering& stage : result.stages) {
+        size_t matching_states = 0;
+        for (size_t index = 0; index < result.states.size(); ++index) {
+            const MultiLowering::State& state = result.states[index];
+            if (state.write_value_id != stage.output_value_id ||
+                state.type != stage.output_type ||
+                state.extents != stage.output_extents ||
+                state.element_count != stage.output_count)
+                continue;
+            ++matching_states;
+            stage.direct_state_index = static_cast<uint32_t>(index);
+        }
+        if (matching_states != 1)
+            stage.direct_state_index = UINT32_MAX;
+    }
     return result;
 }
 
@@ -1279,7 +1491,11 @@ bool value_matches(const MetalProgramValue& value, const InputSpec& spec) {
         value.bits.size() != spec.element_count)
         return false;
     return std::all_of(value.bits.begin(), value.bits.end(),
-                       [](uint64_t bits) { return bits <= UINT32_MAX; });
+                       [&](uint64_t bits) {
+                           const size_t width = scalar_abi(value.type).bytes;
+                           return value.type == ElementType::I1 ? bits <= 1 :
+                               width == 8 || bits < (uint64_t{1} << (width * 8));
+                       });
 }
 
 } // namespace
@@ -1296,11 +1512,14 @@ struct MetalProgramExecutable::Impl {
     struct Stage {
         id<MTLComputePipelineState> pipeline = nil;
         std::vector<InputSpec> inputs;
-        std::vector<uint64_t> output_extents;
+        ElementType output_type = ElementType::F32;
+    std::vector<uint64_t> output_extents;
         size_t output_count = 0;
         uint32_t output_value_id = UINT32_MAX;
+        uint32_t direct_state_index = UINT32_MAX;
         std::vector<size_t> physical_plane_indices;
         id<MTLBuffer> plane_offsets = nil;
+        id<MTLBuffer> output = nil;
     };
     struct State {
         uint32_t state_id = UINT32_MAX;
@@ -1309,6 +1528,7 @@ struct MetalProgramExecutable::Impl {
         size_t element_count = 0;
         std::vector<uint32_t> read_value_ids;
         uint32_t write_value_id = UINT32_MAX;
+        bool direct_output = false;
         id<MTLBuffer> current = nil;
         id<MTLBuffer> candidate = nil;
         id<MTLBuffer> scratch = nil;
@@ -1325,18 +1545,59 @@ struct MetalProgramExecutable::Impl {
     std::vector<uint32_t> exports;
     uint64_t state_generation = 0;
     std::mutex execution_mutex;
+    id<MTLBuffer> output = nil;
+    id<MTLBuffer> numerical_error = nil;
+    uint64_t intermediate_buffer_bytes = 0;
     std::vector<Plane> planes;
+    std::unordered_map<uint32_t, id<MTLBuffer>> mapped_artifacts;
     std::shared_ptr<const VerifiedPhysicalProgramPackage> package_owner;
     uint64_t persistent_upload_bytes = 0;
     uint64_t zero_copy_plane_bytes = 0;
     uint64_t persistent_plane_bytes = 0;
+    ElementType output_type = ElementType::F32;
     std::vector<uint64_t> output_extents;
     size_t output_count = 0;
 
+    id<MTLBuffer> mapped_buffer(const PackageView& artifact, size_t length) {
+        const auto found = mapped_artifacts.find(artifact.artifact_id().value);
+        if (found != mapped_artifacts.end()) return [found->second retain];
+        id<MTLBuffer> buffer = [device
+            newBufferWithBytesNoCopy:const_cast<uint8_t*>(artifact.bytes().data())
+                             length:length
+                            options:MTLResourceStorageModeShared
+                        deallocator:nil];
+        if (buffer) mapped_artifacts.emplace(artifact.artifact_id().value, buffer);
+        return [buffer retain];
+    }
+
+    bool allocate_workspace() {
+        numerical_error = [device newBufferWithLength:sizeof(uint32_t)
+                                              options:MTLResourceStorageModeShared];
+        if (!numerical_error) return false;
+        if (stages.empty()) {
+            output = [device newBufferWithLength:output_count * scalar_abi(output_type).bytes
+                                         options:MTLResourceStorageModeShared];
+            if (!output) return false;
+            intermediate_buffer_bytes = output.length;
+        } else {
+            for (Stage& stage : stages) {
+                if (stage.direct_state_index != UINT32_MAX) continue;
+                stage.output = [device newBufferWithLength:stage.output_count * scalar_abi(stage.output_type).bytes
+                                                   options:MTLResourceStorageModeShared];
+                if (!stage.output) return false;
+                intermediate_buffer_bytes += stage.output.length;
+            }
+        }
+        return true;
+    }
+
     ~Impl() {
+        [output release];
+        [numerical_error release];
         for (const Stage& stage : stages) {
             [stage.pipeline release];
             [stage.plane_offsets release];
+            [stage.output release];
         }
         for (const State& state : states) {
             [state.current release];
@@ -1344,6 +1605,7 @@ struct MetalProgramExecutable::Impl {
             [state.scratch release];
         }
         for (const Plane& plane : planes) [plane.buffer release];
+        for (const auto& [id, buffer] : mapped_artifacts) [buffer release];
         [plane_offsets release];
         [pipeline release];
         [queue release];
@@ -1397,10 +1659,8 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
         buffers.reserve(ordered.size());
         uint64_t upload_bytes = impl_->persistent_upload_bytes;
         for (const MetalProgramInput* input : ordered) {
-            std::vector<uint32_t> bits(input->value.bits.size(), 0);
-            for (size_t index = 0; index < input->value.bits.size(); ++index)
-                bits[index] = static_cast<uint32_t>(input->value.bits[index]);
-            const NSUInteger bytes = bits.size() * sizeof(uint32_t);
+            const auto bits = pack_value(input->value);
+            const NSUInteger bytes = bits.size();
             id<MTLBuffer> buffer = [impl_->device
                 newBufferWithBytes:bits.data()
                            length:bytes
@@ -1417,18 +1677,14 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
             const auto release_inputs = [&] {
                 for (id<MTLBuffer> value : buffers) [value release];
             };
-            uint32_t no_error = 0;
-            id<MTLBuffer> error_buffer = [impl_->device
-                newBufferWithBytes:&no_error
-                           length:sizeof(no_error)
-                          options:MTLResourceStorageModeShared];
+            id<MTLBuffer> error_buffer = impl_->numerical_error;
+            *static_cast<uint32_t*>(error_buffer.contents) = 0;
             id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
             id<MTLComputeCommandEncoder> encoder =
                 [command computeCommandEncoder];
-            if (!error_buffer || !command || !encoder) {
+            if (!command || !encoder) {
                 if (encoder) [encoder endEncoding];
                 release_inputs();
-                [error_buffer release];
                 return metal_error(
                     CompatibilityError::SESSION_CONSTRUCTION_FAILED,
                     "Metal staged command allocation failed");
@@ -1441,24 +1697,21 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
                 for (uint32_t value_id : state.read_value_ids)
                     value_buffers.emplace(value_id, state.current);
             }
-            std::vector<id<MTLBuffer>> stage_outputs;
-            stage_outputs.reserve(impl_->stages.size());
             uint32_t minimum_width = UINT32_MAX;
             uint32_t minimum_maximum = UINT32_MAX;
             bool encode_failed = false;
             for (size_t stage_index = 0;
                  stage_index < impl_->stages.size(); ++stage_index) {
                 const Impl::Stage& stage = impl_->stages[stage_index];
-                const NSUInteger output_bytes =
-                    stage.output_count * sizeof(uint32_t);
-                id<MTLBuffer> stage_output = [impl_->device
-                    newBufferWithLength:output_bytes
-                               options:MTLResourceStorageModeShared];
-                if (!stage_output) {
-                    encode_failed = true;
-                    break;
+                id<MTLBuffer> stage_output = stage.output;
+                if (stage.direct_state_index != UINT32_MAX) {
+                    if (stage.direct_state_index >= impl_->states.size()) {
+                        encode_failed = true;
+                        break;
+                    }
+                    stage_output =
+                        impl_->states[stage.direct_state_index].candidate;
                 }
-                stage_outputs.push_back(stage_output);
                 [encoder setComputePipelineState:stage.pipeline];
                 for (NSUInteger index = 0; index < stage.inputs.size(); ++index) {
                     const auto value =
@@ -1510,8 +1763,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
             [encoder endEncoding];
             if (encode_failed) {
                 release_inputs();
-                for (id<MTLBuffer> value : stage_outputs) [value release];
-                [error_buffer release];
                 return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                    "Metal staged binding is unavailable");
             }
@@ -1523,21 +1774,19 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
                 id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
                 if (!blit) {
                     release_inputs();
-                    for (id<MTLBuffer> value : stage_outputs) [value release];
-                    [error_buffer release];
                     return metal_error(
                         CompatibilityError::SESSION_CONSTRUCTION_FAILED,
                         "Metal staged state copy encoder is unavailable");
                 }
-                for (const Impl::State& state : impl_->states) {
+                for (size_t index = 0; index < impl_->states.size(); ++index) {
+                    const Impl::State& state = impl_->states[index];
                     if (state.write_value_id == UINT32_MAX) continue;
+                    if (state.direct_output)
+                        continue;
                     const auto value = value_buffers.find(state.write_value_id);
                     if (value == value_buffers.end()) {
                         [blit endEncoding];
                         release_inputs();
-                        for (id<MTLBuffer> output : stage_outputs)
-                            [output release];
-                        [error_buffer release];
                         return metal_error(
                             CompatibilityError::IR_REFERENCE_INVALID,
                             "Metal staged state value is unavailable");
@@ -1547,12 +1796,14 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
                                 toBuffer:state.candidate
                        destinationOffset:0
                                     size:state.element_count *
-                                         sizeof(uint32_t)];
+                                         scalar_abi(state.type).bytes];
                 }
                 [blit endEncoding];
             }
+            const auto cpu_wait_start = std::chrono::steady_clock::now();
             [command commit];
             [command waitUntilCompleted];
+            const auto cpu_wait_end = std::chrono::steady_clock::now();
             if (command.status != MTLCommandBufferStatusCompleted ||
                 command.error) {
                 std::string detail = "Metal staged command failed";
@@ -1560,8 +1811,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
                     detail += ": " + std::string(
                         [command.error.localizedDescription UTF8String]);
                 release_inputs();
-                for (id<MTLBuffer> value : stage_outputs) [value release];
-                [error_buffer release];
                 return metal_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE,
                                    std::move(detail));
             }
@@ -1569,8 +1818,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
                 *static_cast<const uint32_t*>(error_buffer.contents);
             if (error_value != 0) {
                 release_inputs();
-                for (id<MTLBuffer> value : stage_outputs) [value release];
-                [error_buffer release];
                 return metal_error(
                     error_value == 2
                         ? CompatibilityError::RUNTIME_INPUT_INVALID
@@ -1588,28 +1835,18 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
             }
             if (impl_->exports.size() != 1) {
                 release_inputs();
-                for (id<MTLBuffer> value : stage_outputs) [value release];
-                [error_buffer release];
                 return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                    "Metal staged export is unavailable");
             }
             const auto exported = value_buffers.find(impl_->exports.front());
             if (exported == value_buffers.end()) {
                 release_inputs();
-                for (id<MTLBuffer> value : stage_outputs) [value release];
-                [error_buffer release];
                 return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
                                    "Metal staged export binding is unavailable");
             }
             MetalProgramResult result;
-            MetalProgramValue value;
-            value.type = ElementType::F32;
-            value.extents = impl_->output_extents;
-            value.bits.resize(impl_->output_count);
-            const auto* output_data =
-                static_cast<const uint32_t*>(exported->second.contents);
-            for (size_t index = 0; index < impl_->output_count; ++index)
-                value.bits[index] = output_data[index];
+            MetalProgramValue value = unpack_value(impl_->output_type, impl_->output_extents,
+                                                       impl_->output_count, exported->second.contents);
             result.exports.push_back(std::move(value));
             result.audit.program_digest = impl_->digest;
             result.audit.lowering_digest = impl_->lowering;
@@ -1618,44 +1855,31 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
             result.audit.persistent_plane_bytes =
                 impl_->persistent_plane_bytes;
             result.audit.explicit_download_bytes =
-                impl_->output_count * sizeof(uint32_t);
+                impl_->output_count * scalar_abi(impl_->output_type).bytes;
             result.audit.command_buffers = 1;
             result.audit.implicit_weight_copies = 0;
+            result.audit.mapped_artifact_buffer_count = impl_->mapped_artifacts.size();
             result.audit.thread_execution_width = minimum_width;
             result.audit.max_total_threads_per_threadgroup = minimum_maximum;
             result.audit.state_generation = impl_->state_generation;
+            result.audit.intermediate_buffer_bytes = impl_->intermediate_buffer_bytes;
+            result.audit.cpu_wait_ms = std::chrono::duration<double, std::milli>(
+                cpu_wait_end - cpu_wait_start).count();
+            if (command.GPUEndTime >= command.GPUStartTime)
+                result.audit.gpu_time_ms =
+                    (command.GPUEndTime - command.GPUStartTime) * 1000.0;
             release_inputs();
-            for (id<MTLBuffer> output : stage_outputs) [output release];
-            [error_buffer release];
             return result;
         }
-        const NSUInteger output_bytes = impl_->output_count * sizeof(uint32_t);
-        id<MTLBuffer> output = [impl_->device
-            newBufferWithLength:output_bytes
-                       options:MTLResourceStorageModeShared];
-        if (!output) {
-            for (id<MTLBuffer> value : buffers) [value release];
-            return metal_error(CompatibilityError::PLAN_MEMORY_EXCEEDED,
-                               "Metal program output buffer allocation failed");
-        }
-        uint32_t no_error = 0;
-        id<MTLBuffer> numerical_error = [impl_->device
-            newBufferWithBytes:&no_error
-                       length:sizeof(no_error)
-                      options:MTLResourceStorageModeShared];
-        if (!numerical_error) {
-            for (id<MTLBuffer> value : buffers) [value release];
-            [output release];
-            return metal_error(CompatibilityError::PLAN_MEMORY_EXCEEDED,
-                               "Metal program error buffer allocation failed");
-        }
+        const NSUInteger output_bytes = impl_->output_count * scalar_abi(impl_->output_type).bytes;
+        id<MTLBuffer> output = impl_->output;
+        id<MTLBuffer> numerical_error = impl_->numerical_error;
+        *static_cast<uint32_t*>(numerical_error.contents) = 0;
 
         id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
         if (!command || !encoder) {
             for (id<MTLBuffer> value : buffers) [value release];
-            [output release];
-            [numerical_error release];
             return metal_error(CompatibilityError::SESSION_CONSTRUCTION_FAILED,
                                "Metal program command allocation failed");
         }
@@ -1676,24 +1900,22 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
         if (width == 0 || maximum < width || threads < width) {
             [encoder endEncoding];
             for (id<MTLBuffer> value : buffers) [value release];
-            [output release];
-            [numerical_error release];
             return metal_error(CompatibilityError::CAPABILITY_MISSING,
                                "Metal program pipeline limits are invalid");
         }
         [encoder dispatchThreads:MTLSizeMake(impl_->output_count, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
         [encoder endEncoding];
+        const auto cpu_wait_start = std::chrono::steady_clock::now();
         [command commit];
         [command waitUntilCompleted];
+        const auto cpu_wait_end = std::chrono::steady_clock::now();
         if (command.status != MTLCommandBufferStatusCompleted || command.error) {
             std::string detail = "Metal program command failed";
             if (command.error.localizedDescription)
                 detail += ": " + std::string(
                     [command.error.localizedDescription UTF8String]);
             for (id<MTLBuffer> value : buffers) [value release];
-            [output release];
-            [numerical_error release];
             return metal_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE,
                                std::move(detail));
         }
@@ -1701,8 +1923,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
             *static_cast<const uint32_t*>(numerical_error.contents);
         if (error_value != 0) {
             for (id<MTLBuffer> value : buffers) [value release];
-            [output release];
-            [numerical_error release];
             if (error_value == 2)
                 return metal_error(CompatibilityError::RUNTIME_INPUT_INVALID,
                                    "Metal tensor index is out of bounds");
@@ -1711,13 +1931,8 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
         }
 
         MetalProgramResult result;
-        MetalProgramValue value;
-        value.type = ElementType::F32;
-        value.extents = impl_->output_extents;
-        value.bits.resize(impl_->output_count);
-        const auto* output_data = static_cast<const uint32_t*>(output.contents);
-        for (size_t index = 0; index < impl_->output_count; ++index)
-            value.bits[index] = output_data[index];
+        MetalProgramValue value = unpack_value(impl_->output_type, impl_->output_extents,
+                                                       impl_->output_count, output.contents);
         result.exports.push_back(std::move(value));
         result.audit.program_digest = impl_->digest;
         result.audit.lowering_digest = impl_->lowering;
@@ -1725,14 +1940,19 @@ MetalProgramExecutionResult MetalProgramExecutable::execute(
         result.audit.zero_copy_plane_bytes = impl_->zero_copy_plane_bytes;
         result.audit.persistent_plane_bytes = impl_->persistent_plane_bytes;
         result.audit.explicit_download_bytes = output_bytes;
+        result.audit.intermediate_buffer_bytes = impl_->intermediate_buffer_bytes;
         result.audit.command_buffers = 1;
         result.audit.implicit_weight_copies = 0;
+        result.audit.mapped_artifact_buffer_count = impl_->mapped_artifacts.size();
         result.audit.thread_execution_width = static_cast<uint32_t>(width);
         result.audit.max_total_threads_per_threadgroup =
             static_cast<uint32_t>(maximum);
+        result.audit.cpu_wait_ms = std::chrono::duration<double, std::milli>(
+            cpu_wait_end - cpu_wait_start).count();
+        if (command.GPUEndTime >= command.GPUStartTime)
+            result.audit.gpu_time_ms =
+                (command.GPUEndTime - command.GPUStartTime) * 1000.0;
         for (id<MTLBuffer> buffer : buffers) [buffer release];
-        [output release];
-        [numerical_error release];
         return result;
     }
 }
@@ -1793,11 +2013,8 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
             std::vector<id<MTLBuffer>> buffers;
             buffers.reserve(ordered.size());
             for (const MetalProgramInput* input : ordered) {
-                std::vector<uint32_t> bits(input->value.bits.size(), 0);
-                for (size_t index = 0; index < input->value.bits.size(); ++index)
-                    bits[index] =
-                        static_cast<uint32_t>(input->value.bits[index]);
-                const NSUInteger bytes = bits.size() * sizeof(uint32_t);
+                const auto bits = pack_value(input->value);
+                const NSUInteger bytes = bits.size();
                 id<MTLBuffer> buffer = [impl_->device
                     newBufferWithBytes:bits.data()
                                length:bytes
@@ -1815,15 +2032,11 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
             input_buffers.push_back(std::move(buffers));
         }
 
-        uint32_t no_error = 0;
-        id<MTLBuffer> error_buffer = [impl_->device
-            newBufferWithBytes:&no_error
-                       length:sizeof(no_error)
-                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> error_buffer = impl_->numerical_error;
+        *static_cast<uint32_t*>(error_buffer.contents) = 0;
         id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
-        if (!error_buffer || !command) {
+        if (!command) {
             release_buffers();
-            [error_buffer release];
             return metal_error(
                 CompatibilityError::SESSION_CONSTRUCTION_FAILED,
                 "Metal program sequence command allocation failed");
@@ -1833,7 +2046,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
         state_sources.reserve(impl_->states.size());
         for (const Impl::State& state : impl_->states)
             state_sources.push_back(state.current);
-        std::vector<id<MTLBuffer>> stage_outputs;
         id<MTLBuffer> final_output = nil;
         uint32_t minimum_width = UINT32_MAX;
         uint32_t minimum_maximum = UINT32_MAX;
@@ -1847,8 +2059,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
                 [command computeCommandEncoder];
             if (!encoder) {
                 release_buffers();
-                for (id<MTLBuffer> output : stage_outputs) [output release];
-                [error_buffer release];
                 return metal_error(
                     CompatibilityError::SESSION_CONSTRUCTION_FAILED,
                     "Metal program sequence encoder is unavailable");
@@ -1864,14 +2074,17 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
             for (size_t stage_index = 0;
                  stage_index < impl_->stages.size(); ++stage_index) {
                 const Impl::Stage& stage = impl_->stages[stage_index];
-                id<MTLBuffer> stage_output = [impl_->device
-                    newBufferWithLength:stage.output_count * sizeof(uint32_t)
-                               options:MTLResourceStorageModeShared];
-                if (!stage_output) {
-                    encode_failed = true;
-                    break;
+                id<MTLBuffer> stage_output = stage.output;
+                if (stage.direct_state_index != UINT32_MAX) {
+                    if (stage.direct_state_index >= impl_->states.size()) {
+                        encode_failed = true;
+                        break;
+                    }
+                    const Impl::State& state =
+                        impl_->states[stage.direct_state_index];
+                    stage_output = step_index % 2 == 0
+                        ? state.candidate : state.scratch;
                 }
-                stage_outputs.push_back(stage_output);
                 [encoder setComputePipelineState:stage.pipeline];
                 for (NSUInteger index = 0; index < stage.inputs.size(); ++index) {
                     const auto value =
@@ -1919,16 +2132,12 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
             [encoder endEncoding];
             if (encode_failed) {
                 release_buffers();
-                for (id<MTLBuffer> output : stage_outputs) [output release];
-                [error_buffer release];
                 return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                                    "Metal program sequence binding is unavailable");
             }
             if (impl_->exports.size() != 1 ||
                 !value_buffers.contains(impl_->exports.front())) {
                 release_buffers();
-                for (id<MTLBuffer> output : stage_outputs) [output release];
-                [error_buffer release];
                 return metal_error(CompatibilityError::IR_REFERENCE_INVALID,
                                    "Metal program sequence export is unavailable");
             }
@@ -1939,8 +2148,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
                 id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
                 if (!blit) {
                     release_buffers();
-                    for (id<MTLBuffer> output : stage_outputs) [output release];
-                    [error_buffer release];
                     return metal_error(
                         CompatibilityError::SESSION_CONSTRUCTION_FAILED,
                         "Metal program sequence state encoder is unavailable");
@@ -1952,34 +2159,35 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
                     if (value == value_buffers.end()) {
                         [blit endEncoding];
                         release_buffers();
-                        for (id<MTLBuffer> output : stage_outputs)
-                            [output release];
-                        [error_buffer release];
                         return metal_error(
                             CompatibilityError::IR_REFERENCE_INVALID,
                             "Metal program sequence state value is unavailable");
                     }
                     id<MTLBuffer> target =
                         step_index % 2 == 0 ? state.candidate : state.scratch;
+                    if (state.direct_output) {
+                        state_sources[index] = target;
+                        continue;
+                    }
                     [blit copyFromBuffer:value->second sourceOffset:0
                                 toBuffer:target destinationOffset:0
-                                    size:state.element_count * sizeof(uint32_t)];
+                                    size:state.element_count * scalar_abi(state.type).bytes];
                     state_sources[index] = target;
                 }
                 [blit endEncoding];
             }
         }
 
+        const auto cpu_wait_start = std::chrono::steady_clock::now();
         [command commit];
         [command waitUntilCompleted];
+        const auto cpu_wait_end = std::chrono::steady_clock::now();
         if (command.status != MTLCommandBufferStatusCompleted || command.error) {
             std::string detail = "Metal program sequence command failed";
             if (command.error.localizedDescription)
                 detail += ": " + std::string(
                     [command.error.localizedDescription UTF8String]);
             release_buffers();
-            for (id<MTLBuffer> output : stage_outputs) [output release];
-            [error_buffer release];
             return metal_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE,
                                std::move(detail));
         }
@@ -1987,8 +2195,6 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
             *static_cast<const uint32_t*>(error_buffer.contents);
         if (error_value != 0) {
             release_buffers();
-            for (id<MTLBuffer> output : stage_outputs) [output release];
-            [error_buffer release];
             return metal_error(
                 error_value == 2
                     ? CompatibilityError::RUNTIME_INPUT_INVALID
@@ -2008,14 +2214,8 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
             impl_->state_generation += steps.size();
         }
         MetalProgramResult result;
-        MetalProgramValue value;
-        value.type = ElementType::F32;
-        value.extents = impl_->output_extents;
-        value.bits.resize(impl_->output_count);
-        const auto* output_data =
-            static_cast<const uint32_t*>(final_output.contents);
-        for (size_t index = 0; index < impl_->output_count; ++index)
-            value.bits[index] = output_data[index];
+        MetalProgramValue value = unpack_value(impl_->output_type, impl_->output_extents,
+                                                       impl_->output_count, final_output.contents);
         result.exports.push_back(std::move(value));
         result.audit.program_digest = impl_->digest;
         result.audit.lowering_digest = impl_->lowering;
@@ -2023,15 +2223,20 @@ MetalProgramExecutionResult MetalProgramExecutable::execute_sequence(
         result.audit.zero_copy_plane_bytes = impl_->zero_copy_plane_bytes;
         result.audit.persistent_plane_bytes = impl_->persistent_plane_bytes;
         result.audit.explicit_download_bytes =
-            impl_->output_count * sizeof(uint32_t);
+            impl_->output_count * scalar_abi(impl_->output_type).bytes;
         result.audit.command_buffers = 1;
         result.audit.implicit_weight_copies = 0;
+        result.audit.mapped_artifact_buffer_count = impl_->mapped_artifacts.size();
         result.audit.thread_execution_width = minimum_width;
         result.audit.max_total_threads_per_threadgroup = minimum_maximum;
         result.audit.state_generation = impl_->state_generation;
+        result.audit.intermediate_buffer_bytes = impl_->intermediate_buffer_bytes;
+        result.audit.cpu_wait_ms = std::chrono::duration<double, std::milli>(
+            cpu_wait_end - cpu_wait_start).count();
+        if (command.GPUEndTime >= command.GPUStartTime)
+            result.audit.gpu_time_ms =
+                (command.GPUEndTime - command.GPUStartTime) * 1000.0;
         release_buffers();
-        for (id<MTLBuffer> output : stage_outputs) [output release];
-        [error_buffer release];
         return result;
     }
 }
@@ -2104,6 +2309,7 @@ static MetalProgramCompileResult compile(
         impl->inputs = std::move(lowering.inputs);
         impl->output_extents = std::move(lowering.output_extents);
         impl->output_count = lowering.output_count;
+        impl->output_type = lowering.output_type;
         impl->package_owner = std::move(package_owner);
 
         if (!lowering.physical_planes.empty()) {
@@ -2197,12 +2403,7 @@ static MetalProgramCompileResult compile(
                             "Metal bound artifact mapping length overflows");
                     const size_t mapped_length = artifact->bytes().size() +
                         (remainder == 0 ? 0 : page - remainder);
-                    plane.buffer = [device
-                        newBufferWithBytesNoCopy:
-                            const_cast<uint8_t*>(artifact->bytes().data())
-                                         length:mapped_length
-                                        options:MTLResourceStorageModeShared
-                                    deallocator:nil];
+                    plane.buffer = impl->mapped_buffer(*artifact, mapped_length);
                     plane.byte_offset = bound->offset;
                     plane.zero_copy = true;
                     impl->zero_copy_plane_bytes += bound->length;
@@ -2224,6 +2425,9 @@ static MetalProgramCompileResult compile(
                     CompatibilityError::PLAN_MEMORY_EXCEEDED,
                     "Metal bound physical offset allocation failed");
         }
+        if (!impl->allocate_workspace())
+            return metal_error(CompatibilityError::PLAN_MEMORY_EXCEEDED,
+                               "Metal program workspace allocation failed");
         return MetalProgramExecutable(std::move(impl));
     }
 }
@@ -2251,6 +2455,7 @@ static MetalProgramCompileResult compile(MultiLowering lowering,
         impl->exports = std::move(lowering.exports);
         impl->output_extents = std::move(lowering.output_extents);
         impl->output_count = lowering.output_count;
+        impl->output_type = lowering.output_type;
         impl->stages.reserve(lowering.stages.size());
         const bool has_physical_planes = std::any_of(
             lowering.stages.begin(), lowering.stages.end(),
@@ -2351,12 +2556,7 @@ static MetalProgramCompileResult compile(MultiLowering lowering,
                         "Metal staged artifact mapping length overflows");
                 const size_t mapped_length = artifact->bytes().size() +
                     (remainder == 0 ? 0 : page - remainder);
-                plane_binding.buffer = [device
-                    newBufferWithBytesNoCopy:
-                        const_cast<uint8_t*>(artifact->bytes().data())
-                                     length:mapped_length
-                                    options:MTLResourceStorageModeShared
-                                deallocator:nil];
+                plane_binding.buffer = impl->mapped_buffer(*artifact, mapped_length);
                 plane_binding.byte_offset = bound->offset;
                 plane_binding.zero_copy = true;
                 impl->zero_copy_plane_bytes += bound->length;
@@ -2423,7 +2623,9 @@ static MetalProgramCompileResult compile(MultiLowering lowering,
             compiled.inputs = std::move(stage.inputs);
             compiled.output_extents = std::move(stage.output_extents);
             compiled.output_count = stage.output_count;
+            compiled.output_type = stage.output_type;
             compiled.output_value_id = stage.output_value_id;
+            compiled.direct_state_index = stage.direct_state_index;
             std::vector<uint64_t> offsets(stage.physical_planes.size(), 0);
             size_t offset_index = 0;
             compiled.physical_plane_indices.reserve(
@@ -2460,8 +2662,13 @@ static MetalProgramCompileResult compile(MultiLowering lowering,
             compiled.element_count = state.element_count;
             compiled.read_value_ids = std::move(state.read_value_ids);
             compiled.write_value_id = state.write_value_id;
+            compiled.direct_output = std::any_of(
+                impl->stages.begin(), impl->stages.end(),
+                [&](const MetalProgramExecutable::Impl::Stage& stage) {
+                    return stage.direct_state_index == impl->states.size();
+                });
             const NSUInteger bytes =
-                compiled.element_count * sizeof(uint32_t);
+                compiled.element_count * scalar_abi(compiled.type).bytes;
             compiled.current = [device
                 newBufferWithLength:bytes
                            options:MTLResourceStorageModeShared];
@@ -2479,15 +2686,15 @@ static MetalProgramCompileResult compile(MultiLowering lowering,
                 return metal_error(CompatibilityError::PLAN_MEMORY_EXCEEDED,
                                    "Metal staged state allocation failed");
             }
-            std::fill_n(static_cast<uint32_t*>(compiled.current.contents),
-                        compiled.element_count, 0u);
-            std::fill_n(static_cast<uint32_t*>(compiled.candidate.contents),
-                        compiled.element_count, 0u);
-            std::fill_n(static_cast<uint32_t*>(compiled.scratch.contents),
-                        compiled.element_count, 0u);
+            std::memset(compiled.current.contents, 0, bytes);
+            std::memset(compiled.candidate.contents, 0, bytes);
+            std::memset(compiled.scratch.contents, 0, bytes);
             impl->states.push_back(std::move(compiled));
         }
         impl->lowering = source_digest(aggregate_source);
+        if (!impl->allocate_workspace())
+            return metal_error(CompatibilityError::PLAN_MEMORY_EXCEEDED,
+                               "Metal program workspace allocation failed");
         return MetalProgramExecutable(std::move(impl));
     }
 }

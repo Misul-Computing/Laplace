@@ -177,6 +177,30 @@ SessionCreateResult create_runtime_session(
         std::get<MetalProgramExecutable>(std::move(compiled)));
     RuntimeSession result(std::move(owner), request, std::move(metal),
                           token_input, score_result);
+    const Program& definition = program_definition(package.semantic_program());
+    for (const auto& endpoint : package.token_bindings()) {
+        const auto function = std::find_if(definition.functions.begin(),
+            definition.functions.end(), [&](const Function& candidate) {
+                return candidate.id == endpoint.semantic_function_id;
+            });
+        if (function == definition.functions.end())
+            return session_error(CompatibilityError::IR_REFERENCE_INVALID);
+        const ValueType* type = nullptr;
+        if (endpoint.kind == TokenEndpointKind::InputToken) {
+            for (const auto& region : function->regions)
+                if (region.id == function->entry_region_id)
+                    for (const auto& argument : region.arguments)
+                        if (argument.id == endpoint.semantic_value)
+                            type = &argument.type;
+        } else if (endpoint.semantic_value < function->result_types.size()) {
+            type = &function->result_types[endpoint.semantic_value];
+        }
+        if (!type) return session_error(CompatibilityError::IR_REFERENCE_INVALID);
+        auto& extents = endpoint.kind == TokenEndpointKind::InputToken
+            ? result.program_token_extents_ : result.program_score_extents_;
+        for (const auto& dimension : type->dimensions)
+            extents.push_back(dimension.value);
+    }
     result.product_store_id_ =
         g_next_product_store_id.fetch_add(1, std::memory_order_relaxed);
     return result;
@@ -210,6 +234,8 @@ RuntimeSession::RuntimeSession(RuntimeSession&& other) noexcept
       program_metal_(std::move(other.program_metal_)),
       program_token_input_value_(other.program_token_input_value_),
       program_score_result_index_(other.program_score_result_index_),
+      program_token_extents_(std::move(other.program_token_extents_)),
+      program_score_extents_(std::move(other.program_score_extents_)),
       poisoned_(other.poisoned_), product_store_id_(other.product_store_id_),
       product_generation_(other.product_generation_), product_history_(std::move(other.product_history_))
 #if defined(LAPLACE_METAL_TESTING)
@@ -232,6 +258,8 @@ RuntimeSession& RuntimeSession::operator=(RuntimeSession&& other) noexcept {
     program_metal_ = std::move(other.program_metal_);
     program_token_input_value_ = other.program_token_input_value_;
     program_score_result_index_ = other.program_score_result_index_;
+    program_token_extents_ = std::move(other.program_token_extents_);
+    program_score_extents_ = std::move(other.program_score_extents_);
     product_route_ = other.product_route_;
     poisoned_ = other.poisoned_;
     product_store_id_ = other.product_store_id_;
@@ -254,6 +282,8 @@ void RuntimeSession::clear_after_move() noexcept {
     program_metal_.reset();
     program_token_input_value_ = UINT32_MAX;
     program_score_result_index_ = UINT32_MAX;
+    program_token_extents_.clear();
+    program_score_extents_.clear();
     product_route_ = false;
     poisoned_ = true;
     product_store_id_ = 0;
@@ -287,7 +317,7 @@ RuntimeRunResult RuntimeSession::execute(std::span<const uint32_t> token_ids,
             if (token_ids.size() == 1) {
                 const MetalProgramInput input{
                     program_token_input_value_,
-                    MetalProgramValue{ElementType::U32, {},
+                    MetalProgramValue{ElementType::U32, program_token_extents_,
                                       {token_ids.front()}}};
                 return program_metal_->execute(
                     std::span<const MetalProgramInput>(&input, 1));
@@ -297,7 +327,7 @@ RuntimeRunResult RuntimeSession::execute(std::span<const uint32_t> token_ids,
             for (uint32_t token : token_ids)
                 steps.push_back({{MetalProgramInput{
                     program_token_input_value_,
-                    MetalProgramValue{ElementType::U32, {}, {token}}}}});
+                    MetalProgramValue{ElementType::U32, program_token_extents_, {token}}}}});
             return program_metal_->execute_sequence(steps);
         }();
         if (const auto* report = std::get_if<CompatibilityReport>(&executed))
@@ -308,8 +338,7 @@ RuntimeRunResult RuntimeSession::execute(std::span<const uint32_t> token_ids,
             return session_error(CompatibilityError::IR_REFERENCE_INVALID);
         const MetalProgramValue& scores =
             program_result.exports[program_score_result_index_];
-        if (scores.type != ElementType::F32 || scores.extents.size() != 1 ||
-            scores.extents.front() != vocabulary ||
+        if (scores.type != ElementType::F32 || scores.extents != program_score_extents_ ||
             scores.bits.size() != vocabulary)
             return session_error(CompatibilityError::IR_SHAPE_MISMATCH);
         RuntimeOutput output;
@@ -328,6 +357,8 @@ RuntimeRunResult RuntimeSession::execute(std::span<const uint32_t> token_ids,
         output.token_history = product_history_;
         output.host_result_bytes = output.logits.size() * sizeof(float);
         output.command_buffers = program_result.audit.command_buffers;
+        output.gpu_time_ms = program_result.audit.gpu_time_ms;
+        output.cpu_wait_ms = program_result.audit.cpu_wait_ms;
         output.peak_session_bytes =
             program_result.audit.persistent_plane_bytes;
         output.completed = true;

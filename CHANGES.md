@@ -1,5 +1,21 @@
 # Changes
 
+## Shared execution and terminal chat (2026-09-05)
+
+Compatible model packages now compile tensor storage and semantic operations
+into the shared Metal executor. Artifact mappings and intermediate buffers
+are reused, with transactional state retained across conversation turns.
+
+Running `laplace model.gguf` opens chat. Package templates frame messages,
+responses stream as UTF-8, and `/help` shows commands and context usage.
+`/exit` or Ctrl-D leaves the session. Prompt files, sampling controls, metadata
+inspection, and separate prefill/decode timing are available from the CLI.
+CMake can install the executable with `cmake --install build`.
+
+See [current support](docs/support.md) for remaining universality, operation
+coverage, and reference-parity gaps. Entries below describe earlier runtime
+designs and do not imply those features are active in the current CLI.
+
 ## Dynamic power management (2026-06-30)
 
 A runtime power management system that automatically adjusts thread count,

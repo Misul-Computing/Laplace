@@ -58,7 +58,7 @@ set(LAPLACE_SOURCES
     src/generation_loop.cpp
     src/product_package.cpp
     src/gguf_product_compiler.cpp
-    src/normalized_gguf_product_compiler.cpp
+    src/normalized_gguf_product_compiler.cpp src/chat_framing.cpp
     src/mlx_package.cpp
     src/normalized_source_evidence.cpp
     src/gguf_normalized_source_adapter.cpp
@@ -88,6 +88,9 @@ set(LAPLACE_SOURCES
     src/closed_v1_source_schema.cpp
     src/source_schema.cpp
     src/source_compiler_graph_proof.cpp
+    src/source_program_compiler.cpp
+    src/semantic_program_compiler.cpp
+    src/codec_certificate_physical_program.cpp
     src/program_ir.cpp
     src/program_metal.mm
     src/physical_program.cpp
@@ -106,6 +109,7 @@ set(LAPLACE_SOURCES
 )
 
 add_executable(laplace ${LAPLACE_SOURCES})
+install(TARGETS laplace RUNTIME DESTINATION bin)
 target_include_directories(laplace PRIVATE src)
 if(LAPLACE_OMP_TARGET)
     target_link_libraries(laplace PRIVATE ${LAPLACE_OMP_TARGET})
@@ -196,6 +200,14 @@ add_executable(test_physical_program tests/test_physical_program.cpp
 target_include_directories(test_physical_program PRIVATE src tests)
 add_test(NAME test_physical_program COMMAND test_physical_program)
 
+add_executable(test_codec_certificate_physical_program
+    tests/test_codec_certificate_physical_program.cpp
+    src/codec_certificate_physical_program.cpp src/codec_certificate.cpp
+    src/physical_codec.cpp src/semantic_model.cpp src/physical_program.cpp
+    src/physical_program_interpreter.cpp src/compatibility_report.cpp)
+target_include_directories(test_codec_certificate_physical_program PRIVATE src tests)
+add_test(NAME test_codec_certificate_physical_program COMMAND test_codec_certificate_physical_program)
+
 add_executable(test_physical_program_package tests/test_physical_program_package.cpp
     src/physical_program_package.cpp src/physical_program.cpp
     src/physical_program_interpreter.cpp src/program_ir.cpp
@@ -232,6 +244,13 @@ add_executable(test_program_reference tests/test_program_reference.cpp
 target_include_directories(test_program_reference PRIVATE src tests)
 add_test(NAME test_program_reference COMMAND test_program_reference)
 
+get_target_property(semantic_reference_sources test_program_reference SOURCES)
+list(REMOVE_ITEM semantic_reference_sources tests/test_program_reference.cpp)
+add_executable(test_semantic_program_compiler tests/test_semantic_program_compiler.cpp
+    src/semantic_program_compiler.cpp ${semantic_reference_sources})
+target_include_directories(test_semantic_program_compiler PRIVATE src tests)
+add_test(NAME test_semantic_program_compiler COMMAND test_semantic_program_compiler)
+
 if(APPLE)
     add_executable(test_program_metal tests/test_program_metal.cpp
         src/program_metal.mm src/program_reference.cpp
@@ -245,6 +264,22 @@ if(APPLE)
     target_link_libraries(test_program_metal PRIVATE "-framework Metal"
         "-framework Foundation")
     add_test(NAME test_program_metal COMMAND test_program_metal)
+    get_target_property(codec_metal_sources test_program_metal SOURCES)
+    list(REMOVE_ITEM codec_metal_sources tests/test_program_metal.cpp)
+    add_executable(test_codec_certificate_physical_metal
+        tests/test_codec_certificate_physical_program.cpp
+        src/codec_certificate_physical_program.cpp ${codec_metal_sources})
+    target_include_directories(test_codec_certificate_physical_metal PRIVATE src tests)
+    target_compile_definitions(test_codec_certificate_physical_metal PRIVATE LAPLACE_CODEC_TEST_METAL=1)
+    target_link_libraries(test_codec_certificate_physical_metal PRIVATE
+        "-framework Metal" "-framework Foundation")
+    add_executable(test_semantic_program_metal tests/test_semantic_program_compiler.cpp
+        src/semantic_program_compiler.cpp ${codec_metal_sources})
+    target_include_directories(test_semantic_program_metal PRIVATE src tests)
+    target_compile_definitions(test_semantic_program_metal PRIVATE LAPLACE_SEMANTIC_PROGRAM_METAL=1)
+    target_link_libraries(test_semantic_program_metal PRIVATE "-framework Metal" "-framework Foundation")
+    add_test(NAME test_semantic_program_metal COMMAND test_semantic_program_metal)
+    add_test(NAME test_codec_certificate_physical_metal COMMAND test_codec_certificate_physical_metal)
 endif()
 add_test(NAME test_physical_program_unseen
     COMMAND ${Python3_EXECUTABLE}
@@ -422,7 +457,7 @@ target_include_directories(test_runtime_package PRIVATE src tests)
 add_test(NAME test_runtime_package COMMAND test_runtime_package)
 
 add_executable(test_product_package tests/test_product_package.cpp
-    src/product_package.cpp src/gguf_product_compiler.cpp src/normalized_gguf_product_compiler.cpp
+    src/product_package.cpp src/gguf_product_compiler.cpp src/normalized_gguf_product_compiler.cpp src/chat_framing.cpp
     src/normalized_source_evidence.cpp src/gguf_normalized_source_adapter.cpp
     src/codec_certificate.cpp
     src/mlx_normalized_source_adapter.cpp src/mlx_package.cpp src/safetensors.cpp src/safetensors_adapter.cpp
@@ -437,7 +472,7 @@ target_compile_definitions(test_product_package PRIVATE LAPLACE_ARTIFACT_SET_TES
 add_test(NAME test_product_package COMMAND test_product_package)
 
 add_executable(test_gguf_product_compiler tests/test_gguf_product_compiler.cpp
-    src/gguf_product_compiler.cpp src/normalized_gguf_product_compiler.cpp
+    src/gguf_product_compiler.cpp src/normalized_gguf_product_compiler.cpp src/chat_framing.cpp
     src/normalized_source_evidence.cpp src/gguf_normalized_source_adapter.cpp
     src/codec_certificate.cpp src/gguf_index.cpp src/gguf.cpp
     src/artifact_index.cpp src/artifact_set.cpp src/compat_rule.cpp
@@ -448,6 +483,18 @@ add_executable(test_gguf_product_compiler tests/test_gguf_product_compiler.cpp
     src/closed_v1_source_schema.cpp src/source_schema.cpp)
 target_include_directories(test_gguf_product_compiler PRIVATE src tests)
 add_test(NAME test_gguf_product_compiler COMMAND test_gguf_product_compiler)
+
+get_target_property(source_package_sources test_product_package SOURCES)
+get_target_property(program_package_sources test_program_package SOURCES)
+list(APPEND source_package_sources ${program_package_sources})
+list(FILTER source_package_sources EXCLUDE REGEX "^tests/")
+list(REMOVE_DUPLICATES source_package_sources)
+add_executable(test_source_program_compiler tests/test_source_program_compiler.cpp
+    src/source_program_compiler.cpp src/semantic_program_compiler.cpp
+    src/codec_certificate_physical_program.cpp ${source_package_sources})
+target_include_directories(test_source_program_compiler PRIVATE src tests)
+add_test(NAME test_source_program_compiler COMMAND test_source_program_compiler)
+
 
 add_executable(test_product_authority tests/test_product_authority.cpp
     src/product_authority.cpp src/semantic_manifest.cpp src/source_compiler_graph_proof.cpp src/semantic_model.cpp
@@ -1168,3 +1215,10 @@ foreach(product_target IN LISTS LAPLACE_PRODUCT_TARGETS)
 endforeach()
 file(GENERATE OUTPUT "${LAPLACE_PRODUCT_SOURCE_CLOSURE_SNAPSHOT}"
     CONTENT "${product_source_closure_content}")
+
+add_executable(test_chat_framing tests/test_chat_framing.cpp src/chat_framing.cpp)
+target_include_directories(test_chat_framing PRIVATE src)
+add_test(NAME test_chat_framing COMMAND test_chat_framing)
+
+target_compile_definitions(test_source_program_compiler PRIVATE LAPLACE_BINARY_PATH="$<TARGET_FILE:laplace>")
+add_dependencies(test_source_program_compiler laplace)

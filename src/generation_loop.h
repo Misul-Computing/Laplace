@@ -3,8 +3,15 @@
 
 #include <cstdint>
 #include <string>
+#include <span>
+#include <cstddef>
 
 namespace Laplace {
+
+// Number of closing-prefix tokens already generated before a skipped stop token.
+size_t emitted_close_prefix(std::span<const uint32_t> reply,
+                            std::span<const uint32_t> close,
+                            uint32_t stop_token);
 
 struct GenerationMetrics {
     uint64_t prefill_tokens = 0;

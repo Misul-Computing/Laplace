@@ -608,6 +608,11 @@ bool v3_is_regular(const VocabEntry& entry) {
     return type == TokenPieceType::Normal || type == TokenPieceType::UserDefined;
 }
 
+bool v3_is_special(const VocabEntry& entry) {
+    const auto type = static_cast<TokenPieceType>(entry.type);
+    return type == TokenPieceType::Control || type == TokenPieceType::UserDefined;
+}
+
 bool v3_is_byte_piece(std::string_view piece) {
     if (piece.size() != 6 || piece[0] != '<' || piece[1] != '0' || piece[2] != 'x' || piece[5] != '>') {
         return false;
@@ -701,6 +706,67 @@ TokenProgramStatus validate_v3_prompt(const TokenProgramDefinition& definition) 
     }
     if (definition.prompt.back().opcode != PromptOpcode::End || user_count != 1 || generation_count != 1) {
         return failure(TokenProgramError::InvalidPrompt, "V3 prompt needs one input and one generation instruction");
+    }
+    if (!definition.turn.empty()) {
+        if (definition.turn.size() > token_program_limits::kMaxPromptInstructions) {
+            return failure(TokenProgramError::InvalidPrompt,
+                           "V3 turn program is outside its bounds");
+        }
+        size_t turn_literal_bytes = 0;
+        size_t turn_user_count = 0;
+        size_t turn_generation_count = 0;
+        for (size_t index = 0; index != definition.turn.size(); ++index) {
+            const PromptInstruction& instruction = definition.turn[index];
+            switch (instruction.opcode) {
+            case PromptOpcode::EmitLiteralUtf8:
+                if (instruction.literal.empty() || !valid_utf8(instruction.literal)) {
+                    return failure(TokenProgramError::InvalidUtf8,
+                                   "V3 turn literal is invalid UTF-8", SIZE_MAX,
+                                   static_cast<uint32_t>(index));
+                }
+                break;
+            case PromptOpcode::EmitUserText:
+                if (!instruction.literal.empty()) {
+                    return failure(TokenProgramError::InvalidPrompt,
+                                   "V3 turn user-text instruction has a literal", SIZE_MAX,
+                                   static_cast<uint32_t>(index));
+                }
+                ++turn_user_count;
+                break;
+            case PromptOpcode::EmitGenerationPrompt:
+                if (instruction.literal.empty() || !valid_utf8(instruction.literal)) {
+                    return failure(TokenProgramError::InvalidPrompt,
+                                   "V3 turn generation instruction is invalid", SIZE_MAX,
+                                   static_cast<uint32_t>(index));
+                }
+                ++turn_generation_count;
+                break;
+            case PromptOpcode::End:
+                if (index + 1 != definition.turn.size() || !instruction.literal.empty()) {
+                    return failure(TokenProgramError::InvalidPrompt,
+                                   "V3 turn end is not canonical", SIZE_MAX,
+                                   static_cast<uint32_t>(index));
+                }
+                break;
+            default:
+                return failure(TokenProgramError::UnsupportedEnum,
+                               "V3 turn opcode is unsupported", SIZE_MAX,
+                               static_cast<uint32_t>(index));
+            }
+            if (instruction.literal.size() > token_program_limits::kMaxPromptLiteralBytes ||
+                turn_literal_bytes >
+                    token_program_limits::kMaxPromptLiteralBytes - instruction.literal.size()) {
+                return failure(TokenProgramError::InvalidPrompt,
+                               "V3 turn literal pool is too large", SIZE_MAX,
+                               static_cast<uint32_t>(index));
+            }
+            turn_literal_bytes += instruction.literal.size();
+        }
+        if (definition.turn.back().opcode != PromptOpcode::End || turn_user_count != 1 ||
+            turn_generation_count != 1) {
+            return failure(TokenProgramError::InvalidPrompt,
+                           "V3 turn program needs one input and one generation instruction");
+        }
     }
     return {};
 }
@@ -906,6 +972,19 @@ Sha256Digest v3_prompt_digest(const TokenProgramDefinition& definition) {
         digest.u32(static_cast<uint32_t>(instruction.literal.size()));
         digest.text(instruction.literal);
     }
+    // Continuation-turn framing joins the same digest when present; packages
+    // without it keep their previous digest bytes exactly.
+    if (!definition.turn.empty()) {
+        digest.u8(1);
+        digest.u32(static_cast<uint32_t>(definition.turn.size()));
+        for (size_t index = 0; index != definition.turn.size(); ++index) {
+            const PromptInstruction& instruction = definition.turn[index];
+            digest.u32(static_cast<uint32_t>(index));
+            digest.u8(static_cast<uint8_t>(instruction.opcode));
+            digest.u32(static_cast<uint32_t>(instruction.literal.size()));
+            digest.text(instruction.literal);
+        }
+    }
     return digest.finish();
 }
 
@@ -995,7 +1074,7 @@ TokenProgram::SerializeResult serialize_token_program_v3(const TokenProgramDefin
         append_u16(output, kTokenProgramV3MinorVersion);
         append_u16(output, kV3HeaderFlags);
         append_u16(output, kV3Reserved);
-        append_u16(output, 10);
+        append_u16(output, definition.turn.empty() ? 10 : 11);
         const std::vector<uint8_t> options = v3_options(definition, vocabulary_digest, prompt_digest);
         const std::vector<uint8_t> normalizer = v3_normalizer(definition);
         const std::vector<uint8_t> pretokenizer = v3_pretokenizer(definition);
@@ -1018,6 +1097,13 @@ TokenProgram::SerializeResult serialize_token_program_v3(const TokenProgramDefin
         append_v3_section(output, TokenProgramV3Section::Decoder, decoder);
         append_v3_section(output, TokenProgramV3Section::Prompt, prompt);
         append_v3_section(output, TokenProgramV3Section::ByteToUnicode, map);
+        // Packages without chat framing stay byte-identical to the previous
+        // format. A turn-bearing package changes the prompt digest and
+        // requires a reader that understands the new section.
+        if (!definition.turn.empty()) {
+            append_v3_section(output, TokenProgramV3Section::TurnPrompt,
+                              make_v2_prompt(definition.turn));
+        }
         if (output.size() > token_program_limits::kMaxPayloadBytes) {
             return failure(TokenProgramError::OutputTooLarge, "V3 tokenizer program is too large");
         }
@@ -1058,7 +1144,7 @@ TokenProgram::CompileResult TokenProgram::compile_v3(std::span<const uint8_t> pa
         };
         std::vector<Section> sections;
         sections.reserve(section_count);
-        std::array<bool, 11> seen{};
+        std::array<bool, 12> seen{};
         uint16_t previous_kind = 0;
         for (uint16_t index = 0; index != section_count; ++index) {
             Section section;
@@ -1307,6 +1393,47 @@ TokenProgram::CompileResult TokenProgram::compile_v3(std::span<const uint8_t> pa
             if (section.remaining() != 0) return failure(TokenProgramError::TrailingBytes,
                                                           "V3 prompt section has trailing bytes", prompt_section->offset);
         }
+        {
+            const Section* turn_section = nullptr;
+            for (const Section& candidate : sections)
+                if (candidate.kind == static_cast<uint16_t>(TokenProgramV3Section::TurnPrompt))
+                    turn_section = &candidate;
+            if (turn_section != nullptr) {
+                Reader section(turn_section->payload);
+                uint32_t count = 0;
+                if (!section.u32(count) || count == 0 ||
+                    count > token_program_limits::kMaxPromptInstructions) {
+                    return failure(TokenProgramError::PayloadMalformed,
+                                   "V3 turn-prompt count is outside its bound",
+                                   turn_section->offset);
+                }
+                definition.turn.reserve(count);
+                for (uint32_t index = 0; index != count; ++index) {
+                    uint8_t opcode = 0, instruction_flags = 0;
+                    uint16_t instruction_reserved = 0;
+                    uint32_t argument = 0, length = 0;
+                    if (!section.u8(opcode) || !section.u8(instruction_flags) ||
+                        !section.u16(instruction_reserved) || !section.u32(argument) ||
+                        !section.u32(length) || instruction_flags != 0 ||
+                        instruction_reserved != 0 || argument != 0 ||
+                        length > token_program_limits::kMaxPromptLiteralBytes ||
+                        length > section.remaining()) {
+                        return failure(TokenProgramError::PayloadMalformed,
+                                       "V3 turn-prompt instruction is malformed",
+                                       turn_section->offset, index);
+                    }
+                    std::span<const uint8_t> literal;
+                    section.take(length, literal);
+                    definition.turn.push_back(
+                        {static_cast<PromptOpcode>(opcode),
+                         std::string(reinterpret_cast<const char*>(literal.data()), literal.size())});
+                }
+                if (section.remaining() != 0)
+                    return failure(TokenProgramError::TrailingBytes,
+                                   "V3 turn-prompt section has trailing bytes",
+                                   turn_section->offset);
+            }
+        }
         const TokenProgramStatus valid = validate_v3_definition(definition);
         if (!valid.ok()) return valid;
         if (v3_vocabulary_digest(definition) != expected_vocabulary_digest ||
@@ -1382,7 +1509,8 @@ TokenProgramStatus normalize_sentencepiece_v3(std::string_view input, const Toke
 
 std::vector<std::string_view> scan_unicode_scalars(std::string_view text, bool group_newline_runs);
 
-TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_view text) {
+TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_view text,
+                                    bool add_postprocessor_start = true) {
     const TokenProgramDefinition& definition = program.definition();
     std::unordered_map<std::string, uint32_t> piece_ids;
     piece_ids.reserve(definition.vocabulary.size());
@@ -1398,14 +1526,6 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
     if (text.size() > token_program_limits::kMaxInputBytes) {
         return failure(TokenProgramError::InputTooLarge, "V3 input text is too large");
     }
-    std::string normalized;
-    if (definition.model_kind == TokenProgramModelKind::SentencePiece) {
-        const TokenProgramStatus status = normalize_sentencepiece_v3(text, definition, normalized);
-        if (!status.ok()) return status;
-    } else {
-        const TokenProgramStatus status = normalize_text(definition.normalizer, text, normalized);
-        if (!status.ok()) return status;
-    }
     std::vector<uint32_t> output;
     output.reserve(std::min<size_t>(text.size() + 2, token_program_limits::kMaxInputBytes));
     const auto append_bos = [&]() {
@@ -1420,7 +1540,8 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
             output.push_back(definition.postprocessor.eos_token_id);
         }
     };
-    append_bos();
+    if (add_postprocessor_start) append_bos();
+    uint64_t work = 0;
     if (definition.model_kind == TokenProgramModelKind::SentencePiece) {
         std::unordered_map<std::string, uint32_t> byte_ids;
         for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
@@ -1428,10 +1549,9 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
                 byte_ids.emplace(definition.vocabulary[index].piece, static_cast<uint32_t>(index));
             }
         }
-        uint64_t work = 0;
-        // User-defined symbols (the raw multi-space and newline pieces)
-        // match the raw text before normalization; everything else is
-        // normalized per segment and segmented greedily.
+        // Declared control and user-defined symbols match raw text before
+        // normalization; everything else is normalized per segment and
+        // segmented greedily.
         struct RawItem {
             bool is_token = false;
             uint32_t token = kTokenProgramNoTokenId;
@@ -1441,8 +1561,8 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
         {
             std::vector<std::pair<size_t, uint32_t>> user_defined;
             for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
-                if (static_cast<TokenPieceType>(definition.vocabulary[index].type) !=
-                    TokenPieceType::UserDefined) {
+                if (!v3_is_special(definition.vocabulary[index]) ||
+                    definition.vocabulary[index].piece.empty()) {
                     continue;
                 }
                 user_defined.emplace_back(definition.vocabulary[index].piece.size(),
@@ -1450,13 +1570,16 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
             }
             std::sort(user_defined.begin(), user_defined.end(),
                       [](const auto& left, const auto& right) {
-                          return left.first > right.first;
+                          if (left.first != right.first) return left.first > right.first;
+                          return left.second < right.second;
                       });
             std::string pending;
             size_t offset = 0;
             while (offset < text.size()) {
                 bool matched = false;
                 for (const auto& [size, id] : user_defined) {
+                    if (++work > kV3MaxExecutionWork)
+                        return failure(TokenProgramError::InputTooLarge, "token matching exceeds its work bound");
                     if (size > text.size() - offset) continue;
                     if (text.compare(offset, size,
                                      definition.vocabulary[id].piece) != 0) {
@@ -1631,41 +1754,102 @@ TokenProgram::EncodeResult encode_v3(const TokenProgram& program, std::string_vi
     };
     const bool split = (definition.pretokenizer.flags & static_cast<uint8_t>(PretokenizerFlags::SplitAsciiWhitespace)) != 0;
     const bool prefix = (definition.pretokenizer.flags & static_cast<uint8_t>(PretokenizerFlags::AddPrefixSpace)) != 0;
-    std::string canonical = normalized;
-    if (prefix && !canonical.empty()) canonical.insert(canonical.begin(), ' ');
-    if (split) {
-        size_t begin = 0;
-        for (size_t index = 0; index <= canonical.size(); ++index) {
-            if (index != canonical.size() && !is_ascii_space(static_cast<uint8_t>(canonical[index]))) continue;
-            if (index != begin) {
-                const TokenProgramStatus status = append_merged(std::string_view(canonical).substr(begin, index - begin));
+    const auto append_regular = [&](std::string_view source, bool add_prefix) -> TokenProgramStatus {
+        std::string canonical;
+        const TokenProgramStatus status = normalize_text(definition.normalizer, source, canonical);
+        if (!status.ok()) return status;
+        if (add_prefix && prefix && !canonical.empty()) canonical.insert(canonical.begin(), ' ');
+        if (split) {
+            size_t begin = 0;
+            for (size_t index = 0; index <= canonical.size(); ++index) {
+                if (index != canonical.size() && !is_ascii_space(static_cast<uint8_t>(canonical[index]))) continue;
+                if (index != begin) {
+                    const TokenProgramStatus status = append_merged(std::string_view(canonical).substr(begin, index - begin));
+                    if (!status.ok()) return status;
+                }
+                if (index != canonical.size()) {
+                    const TokenProgramStatus status = append_merged(std::string_view(canonical).substr(index, 1));
+                    if (!status.ok()) return status;
+                }
+                begin = index + 1;
+            }
+        } else if (definition.pretokenizer.kind == PretokenizerKind::ByteLevel) {
+            // Byte-level BPE groups by the family-neutral scalar scanner
+            // before merging, so merges never cross a word boundary.
+            for (std::string_view segment : scan_unicode_scalars(
+                     canonical,
+                     (definition.pretokenizer.flags &
+                      static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns)) != 0)) {
+                const TokenProgramStatus status = append_merged(segment);
                 if (!status.ok()) return status;
             }
-            if (index != canonical.size()) {
-                const TokenProgramStatus status = append_merged(std::string_view(canonical).substr(index, 1));
-                if (!status.ok()) return status;
-            }
-            begin = index + 1;
-        }
-    } else if (definition.pretokenizer.kind == PretokenizerKind::ByteLevel) {
-        // Byte-level BPE groups by the family-neutral scalar scanner
-        // before merging, so merges never cross a word boundary.
-        for (std::string_view segment : scan_unicode_scalars(
-                 canonical,
-                 (definition.pretokenizer.flags &
-                  static_cast<uint8_t>(PretokenizerFlags::GroupNewlineRuns)) != 0)) {
-            const TokenProgramStatus status = append_merged(segment);
+        } else {
+            const TokenProgramStatus status = append_merged(canonical);
             if (!status.ok()) return status;
         }
-    } else {
-        const TokenProgramStatus status = append_merged(canonical);
+        return {};
+    };
+    struct RawSegment {
+        size_t begin = 0;
+        size_t end = 0;
+        uint32_t token = kTokenProgramNoTokenId;
+    };
+    std::vector<std::pair<size_t, uint32_t>> special_tokens;
+    for (size_t index = 0; index != definition.vocabulary.size(); ++index) {
+        if (!v3_is_special(definition.vocabulary[index]) || definition.vocabulary[index].piece.empty()) continue;
+        special_tokens.emplace_back(definition.vocabulary[index].piece.size(), static_cast<uint32_t>(index));
+    }
+    std::sort(special_tokens.begin(), special_tokens.end(), [](const auto& left, const auto& right) {
+        if (left.first != right.first) return left.first > right.first;
+        return left.second < right.second;
+    });
+    std::vector<RawSegment> segments;
+    size_t pending_begin = 0;
+    size_t offset = 0;
+    while (offset < text.size()) {
+        size_t matched_size = 0;
+        uint32_t matched_id = kTokenProgramNoTokenId;
+        for (const auto& [size, id] : special_tokens) {
+            if (++work > kV3MaxExecutionWork)
+                return failure(TokenProgramError::InputTooLarge, "token matching exceeds its work bound");
+            if (size <= text.size() - offset && text.compare(offset, size, definition.vocabulary[id].piece) == 0) {
+                matched_size = size;
+                matched_id = id;
+                break;
+            }
+        }
+        if (matched_id == kTokenProgramNoTokenId) {
+            ++offset;
+            continue;
+        }
+        if (pending_begin != offset) segments.push_back({pending_begin, offset});
+        segments.push_back({offset, offset + matched_size, matched_id});
+        offset += matched_size;
+        pending_begin = offset;
+    }
+    if (pending_begin != text.size()) segments.push_back({pending_begin, text.size()});
+    if (segments.empty()) {
+        const TokenProgramStatus status = append_regular(text, true);
         if (!status.ok()) return status;
+    } else {
+        bool prefix_pending = true;
+        for (const RawSegment& segment : segments) {
+            if (segment.token != kTokenProgramNoTokenId) {
+                output.push_back(segment.token);
+                continue;
+            }
+            const TokenProgramStatus status = append_regular(
+                text.substr(segment.begin, segment.end - segment.begin), prefix_pending);
+            if (!status.ok()) return status;
+            prefix_pending = false;
+        }
     }
     append_eos();
     return output;
 }
 
-TokenProgram::DecodeResult decode_v3(const TokenProgram& program, std::span<const uint32_t> token_ids) {
+TokenProgram::DecodeResult decode_v3(const TokenProgram& program, std::span<const uint32_t> token_ids,
+                                     bool strip_sentencepiece_prefix) {
     const TokenProgramDefinition& definition = program.definition();
     std::unordered_map<uint32_t, uint8_t> inverse_unicode;
     inverse_unicode.reserve(definition.byte_to_unicode.size());
@@ -1738,7 +1922,8 @@ TokenProgram::DecodeResult decode_v3(const TokenProgram& program, std::span<cons
                                                                           "V3 decoded text exceeds its stream bound", SIZE_MAX,
                                                                           static_cast<uint32_t>(index));
     }
-    if (definition.model_kind == TokenProgramModelKind::SentencePiece && !output.empty() && output.front() == ' ') {
+    if (strip_sentencepiece_prefix && definition.model_kind == TokenProgramModelKind::SentencePiece &&
+        !output.empty() && output.front() == ' ') {
         output.erase(output.begin());
     }
     return output;
@@ -1749,9 +1934,14 @@ TokenProgram::DecodeResult decode_v3(const TokenProgram& program, std::span<cons
 TokenProgram::DecodeResult TokenProgram::decode_chunk(std::span<const uint32_t> token_ids, StreamState& state,
                                                       bool final_chunk) const {
     if (state.finished) return failure(TokenProgramError::InvalidParameter, "V3 decode stream is already finished");
-    const DecodeResult decoded = decode(token_ids);
+    DecodeResult decoded = is_v3() ? decode_v3(*this, token_ids, false) : decode(token_ids);
     if (const auto* status = std::get_if<TokenProgramStatus>(&decoded)) return *status;
-    const std::string& text = std::get<std::string>(decoded);
+    std::string text = std::get<std::string>(std::move(decoded));
+    if (is_v3() && definition_.model_kind == TokenProgramModelKind::SentencePiece &&
+        !state.sentencepiece_prefix_stripped && !text.empty()) {
+        state.sentencepiece_prefix_stripped = true;
+        if (text.front() == ' ') text.erase(text.begin());
+    }
     if (state.pending_utf8.size() > definition_.stream_max_bytes || text.size() > definition_.stream_max_bytes ||
         state.pending_utf8.size() > definition_.stream_max_bytes - text.size() ||
         state.decoded_bytes > definition_.stream_max_bytes - state.pending_utf8.size() - text.size()) {
@@ -1761,10 +1951,9 @@ TokenProgram::DecodeResult TokenProgram::decode_chunk(std::span<const uint32_t> 
     combined.append(text);
     state.pending_utf8.clear();
     std::string emitted = combined;
-    if (!final_chunk) {
+    {
         size_t offset = 0;
         size_t incomplete_offset = SIZE_MAX;
-        bool malformed = false;
         while (offset < combined.size()) {
             uint32_t scalar = 0;
             size_t length = 0;
@@ -1780,11 +1969,16 @@ TokenProgram::DecodeResult TokenProgram::decode_chunk(std::span<const uint32_t> 
             if (expected != 0 && expected > combined.size() - offset) {
                 incomplete_offset = offset;
             } else {
-                malformed = true;
+                return failure(TokenProgramError::InvalidUtf8,
+                               "V3 decode stream contains invalid UTF-8");
             }
             break;
         }
-        if (incomplete_offset != SIZE_MAX && !malformed) {
+        if (incomplete_offset != SIZE_MAX) {
+            if (final_chunk) {
+                return failure(TokenProgramError::InvalidUtf8,
+                               "V3 decode stream ends with incomplete UTF-8");
+            }
             emitted.assign(combined.data(), incomplete_offset);
             state.pending_utf8.assign(combined.data() + incomplete_offset, combined.size() - incomplete_offset);
         }
@@ -1797,8 +1991,8 @@ TokenProgram::DecodeResult TokenProgram::decode_chunk(std::span<const uint32_t> 
 namespace {
 TokenProgram::EncodeResult encode_v2(const TokenProgram&, std::string_view);
 TokenProgram::DecodeResult decode_v2(const TokenProgram&, std::span<const uint32_t>);
-TokenProgram::EncodeResult encode_v3(const TokenProgram&, std::string_view);
-TokenProgram::DecodeResult decode_v3(const TokenProgram&, std::span<const uint32_t>);
+TokenProgram::EncodeResult encode_v3(const TokenProgram&, std::string_view, bool add_postprocessor_start);
+TokenProgram::DecodeResult decode_v3(const TokenProgram&, std::span<const uint32_t>, bool strip_sentencepiece_prefix);
 }
 
 TokenProgram::TokenProgram(TokenProgramDefinition definition) : definition_(std::move(definition)) {
@@ -2378,6 +2572,53 @@ TokenProgram::EncodeResult TokenProgram::encode(std::string_view text) const {
     return output;
 }
 
+TokenProgram::PromptResult TokenProgram::render_turn(std::string_view user_text) const {
+    if (token_ids_only_) return failure(TokenProgramError::UnsupportedVersion,
+                                       "token-ID-only package has no text prompt");
+    if (definition_.turn.empty()) return failure(TokenProgramError::InvalidPrompt,
+                                                 "package has no continuation turn program");
+    if (user_text.size() > token_program_limits::kMaxInputBytes) {
+        return failure(TokenProgramError::InputTooLarge, "turn user text is too large");
+    }
+    if (!valid_utf8(user_text)) return failure(TokenProgramError::InvalidUtf8, "turn user text is not UTF-8");
+    std::string rendered;
+    rendered.reserve(std::min<size_t>(definition_.prompt_max_bytes, user_text.size() + 64));
+    for (size_t index = 0; index != definition_.turn.size(); ++index) {
+        const PromptInstruction& instruction = definition_.turn[index];
+        const std::string_view emitted = instruction.opcode == PromptOpcode::EmitUserText
+                                              ? user_text
+                                              : std::string_view(instruction.literal);
+        if (emitted.size() > definition_.prompt_max_bytes ||
+            rendered.size() > definition_.prompt_max_bytes - emitted.size()) {
+            return failure(TokenProgramError::PromptTooLarge, "rendered turn exceeds its bound",
+                           SIZE_MAX, static_cast<uint32_t>(index));
+        }
+        rendered.append(emitted.begin(), emitted.end());
+    }
+    return rendered;
+}
+
+TokenProgram::EncodeResult TokenProgram::encode_continuation(std::string_view text) const {
+    if (is_v3()) return encode_v3(*this, text, false);
+    auto encoded = encode(text);
+    if (const auto* status = std::get_if<TokenProgramStatus>(&encoded))
+        return *status;
+    std::vector<uint32_t> output =
+        std::get<std::vector<uint32_t>>(std::move(encoded));
+    const PostprocessorSpec& postprocessor = definition_.postprocessor;
+    const uint8_t add_bos = static_cast<uint8_t>(PostprocessorFlags::AddBos);
+    if (postprocessor.kind != PostprocessorKind::AddBosEos ||
+        (postprocessor.flags & add_bos) == 0)
+        return output;
+    if (postprocessor.bos_token_id == kTokenProgramNoTokenId || output.empty() ||
+        output.front() != postprocessor.bos_token_id) {
+        return failure(TokenProgramError::InvalidParameter,
+                       "continuation BOS contract is inconsistent");
+    }
+    output.erase(output.begin());
+    return output;
+}
+
 TokenProgram::PromptResult TokenProgram::render_prompt(std::string_view user_text) const {
     if (token_ids_only_) return failure(TokenProgramError::UnsupportedVersion,
                                        "token-ID-only package has no text prompt");
@@ -2404,7 +2645,7 @@ TokenProgram::PromptResult TokenProgram::render_prompt(std::string_view user_tex
 TokenProgram::DecodeResult TokenProgram::decode(std::span<const uint32_t> token_ids) const {
     if (token_ids_only_) return failure(TokenProgramError::UnsupportedVersion,
                                        "token-ID-only package does not decode text");
-    if (is_v3()) return decode_v3(*this, token_ids);
+    if (is_v3()) return decode_v3(*this, token_ids, true);
     if (is_v2()) return decode_v2(*this, token_ids);
     if (token_ids.size() > token_program_limits::kMaxInputBytes) {
         return failure(TokenProgramError::InputTooLarge, "token sequence is too large");

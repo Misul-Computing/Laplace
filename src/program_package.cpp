@@ -122,15 +122,25 @@ std::optional<std::pair<uint32_t, uint32_t>> output_coordinate(
     return std::pair{*function_slot, result_index};
 }
 
+bool has_constant_elements(const ValueType& type, uint64_t expected) {
+    uint64_t count = 1;
+    for (const auto& dimension : type.dimensions) {
+        if (dimension.expression != DimensionExpression::Constant ||
+            !dimension.operands.empty() || dimension.value == 0 ||
+            count > UINT64_MAX / dimension.value)
+            return false;
+        count *= dimension.value;
+    }
+    return count == expected;
+}
+
 bool token_input_type(const ValueType& type) {
-    return type.element_type == ElementType::U32 && type.dimensions.empty();
+    return type.element_type == ElementType::U32 && has_constant_elements(type, 1);
 }
 
 bool token_output_type(const ValueType& type, size_t vocabulary_size) {
-    return type.element_type == ElementType::F32 && type.dimensions.size() == 1 &&
-           type.dimensions[0].expression == DimensionExpression::Constant &&
-           type.dimensions[0].operands.empty() &&
-           type.dimensions[0].value == vocabulary_size;
+    return type.element_type == ElementType::F32 &&
+           has_constant_elements(type, vocabulary_size);
 }
 
 std::variant<std::vector<TokenEndpointBinding>, CompatibilityReport>

@@ -11,14 +11,14 @@ Each result applies to that recorded configuration.
 3. Record the Mac model, unified-memory size, macOS version, power source, and
    thermal condition when available.
 4. Record the prompt or prompt digest and its token count.
-5. Use fixed sampling. `--greedy --seed 7 --no-spec` is the default comparison
+5. Use fixed sampling. `--greedy --seed 7` is the default comparison
    command for an admitted package.
 
 ## Command
 
 ```bash
 ./build/laplace /absolute/path/to/model.gguf \
-  -p "fixed prompt" -n 128 --greedy --seed 7 --no-spec \
+  -p "fixed prompt" -n 128 --greedy --seed 7 \
   --max-seq 2048 --bench
 ```
 

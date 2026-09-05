@@ -73,6 +73,41 @@ ArtifactIndex make_index(ArtifactId id, std::span<const uint8_t> bytes) {
     return std::get<ArtifactIndex>(std::move(index_result));
 }
 
+ArtifactTensorRecord alias_tensor(uint32_t id, ArtifactId artifact) {
+    ArtifactTensorRecord tensor;
+    tensor.id = id;
+    tensor.logical_type = ArtifactScalarType::F32;
+    tensor.logical_dimensions = {1};
+    tensor.axis.source_rank = 1;
+    tensor.axis.source_axis_order[0] = 0;
+    tensor.layout.rank = 1;
+    tensor.layout.axis_order[0] = 0;
+    tensor.layout.strides[0] = 1;
+    tensor.planes.push_back({PlaneKind::Values, ArtifactScalarType::F32,
+                             {artifact, 0, 4}, 1, 4, 1, 4});
+    return tensor;
+}
+
+ArtifactIndex make_alias_index(ArtifactId artifact) {
+    const std::array<uint8_t, 8> bytes = {0x5a, 0xa5, 0, 0, 0, 0, 0, 0};
+    auto view_result = ArtifactSet::make_owned_blob(artifact, ArtifactRole::Primary, bytes);
+    CHECK(std::holds_alternative<PackageView>(view_result));
+    if (!std::holds_alternative<PackageView>(view_result)) return {};
+    ArtifactIndexInput input;
+    input.artifacts.push_back(std::get<PackageView>(std::move(view_result)));
+    auto source = alias_tensor(10, artifact);
+    auto target = alias_tensor(20, artifact);
+    target.role_evidence.push_back({TensorRole::OutputWeight, {0}, ArtifactFactAuthority::Structural, {}});
+    input.tensors = {std::move(source), std::move(target)};
+    input.aliases.push_back({ArtifactAliasKind::TiedOutput,
+                             ArtifactAliasDirection::SourceToTarget, 10, 20,
+                             TensorRole::OutputWeight, {0}, ArtifactFactAuthority::Structural, {}});
+    auto index_result = ArtifactIndex::build(std::move(input));
+    CHECK(std::holds_alternative<ArtifactIndex>(index_result));
+    if (!std::holds_alternative<ArtifactIndex>(index_result)) return {};
+    return std::get<ArtifactIndex>(std::move(index_result));
+}
+
 void package_accepts_canonical_record() {
     const std::vector<uint8_t> bytes = {0x5a, 0xa5};
     PhysicalProgram program = load_program();
@@ -318,11 +353,95 @@ void package_rejects_overlapping_resource_ranges() {
     CHECK(std::holds_alternative<VerifiedPhysicalProgramPackage>(accepted));
 }
 
+void package_accepts_only_authorized_alias_ranges() {
+    const std::array<uint8_t, 8> bytes = {0x5a, 0xa5, 0, 0, 0, 0, 0, 0};
+    const PhysicalProgram program = load_program();
+    const auto wire = encode_physical_program(program);
+    const auto digest = physical_program_digest(program);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+    CHECK(std::holds_alternative<PhysicalProgramDigest>(digest));
+    if (!std::holds_alternative<std::vector<uint8_t>>(wire) ||
+        !std::holds_alternative<PhysicalProgramDigest>(digest)) return;
+
+    const ArtifactId artifact{10};
+    const PhysicalProgramRecord record{
+        std::get<PhysicalProgramDigest>(digest),
+        std::get<std::vector<uint8_t>>(wire),
+        {ElementType::U32, {}}};
+    PhysicalResourceBinding first;
+    first.resource_id = 0;
+    first.program_digest = record.digest;
+    first.semantic_function_id = 0;
+    first.semantic_value_id = 0;
+    first.planes = {{0, artifact, 0, 4}};
+    PhysicalResourceBinding second = first;
+    second.resource_id = 1;
+    second.semantic_value_id = 1;
+    const std::array<PhysicalResourceBinding, 2> bindings = {first, second};
+    auto semantic = verify_and_canonicalize_program(two_input_semantic_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(semantic));
+    if (!std::holds_alternative<VerifiedProgram>(semantic)) return;
+    auto accepted = load_physical_program_package(
+        make_alias_index(artifact), std::get<VerifiedProgram>(std::move(semantic)),
+        std::span<const PhysicalProgramRecord>(&record, 1), bindings);
+    CHECK(std::holds_alternative<VerifiedPhysicalProgramPackage>(accepted));
+
+    PhysicalProgram different = load_program();
+    different.instructions[1].bit_width = 16;
+    const auto different_wire = encode_physical_program(different);
+    const auto different_digest = physical_program_digest(different);
+    CHECK(std::holds_alternative<std::vector<uint8_t>>(different_wire));
+    CHECK(std::holds_alternative<PhysicalProgramDigest>(different_digest));
+    if (!std::holds_alternative<std::vector<uint8_t>>(different_wire) ||
+        !std::holds_alternative<PhysicalProgramDigest>(different_digest)) return;
+    PhysicalProgramRecord different_record{
+        std::get<PhysicalProgramDigest>(different_digest),
+        std::get<std::vector<uint8_t>>(different_wire),
+        {ElementType::U32, {}}};
+    std::array<PhysicalProgramRecord, 2> records = {record, different_record};
+    std::sort(records.begin(), records.end(), [](const auto& left, const auto& right) {
+        return left.digest < right.digest;
+    });
+    PhysicalResourceBinding different_resource = second;
+    different_resource.program_digest = different_record.digest;
+    const std::array<PhysicalResourceBinding, 2> different_bindings = {
+        first, different_resource};
+    auto different_semantic = verify_and_canonicalize_program(two_input_semantic_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(different_semantic));
+    if (std::holds_alternative<VerifiedProgram>(different_semantic)) {
+        const auto rejected = load_physical_program_package(
+            make_alias_index(artifact),
+            std::get<VerifiedProgram>(std::move(different_semantic)), records,
+            different_bindings);
+        CHECK(std::holds_alternative<CompatibilityReport>(rejected));
+        if (const auto* report = std::get_if<CompatibilityReport>(&rejected))
+            CHECK(report->code == CompatibilityError::PACKAGE_BOUNDS_INVALID);
+    }
+
+    PhysicalResourceBinding partial = second;
+    partial.planes[0].offset = 1;
+    partial.planes[0].length = 3;
+    const std::array<PhysicalResourceBinding, 2> partial_bindings = {first, partial};
+    auto partial_semantic = verify_and_canonicalize_program(two_input_semantic_program());
+    CHECK(std::holds_alternative<VerifiedProgram>(partial_semantic));
+    if (std::holds_alternative<VerifiedProgram>(partial_semantic)) {
+        const std::array<PhysicalProgramRecord, 1> one_record = {record};
+        const auto rejected = load_physical_program_package(
+            make_alias_index(artifact),
+            std::get<VerifiedProgram>(std::move(partial_semantic)), one_record,
+            partial_bindings);
+        CHECK(std::holds_alternative<CompatibilityReport>(rejected));
+        if (const auto* report = std::get_if<CompatibilityReport>(&rejected))
+            CHECK(report->code == CompatibilityError::PACKAGE_BOUNDS_INVALID);
+    }
+}
+
 } // namespace
 
 int main() {
     package_accepts_canonical_record();
     package_rejects_bad_source_and_digest();
     package_rejects_overlapping_resource_ranges();
+    package_accepts_only_authorized_alias_ranges();
     return test_summary("test_physical_program_package");
 }

@@ -254,8 +254,12 @@ ArtifactSet::make_owned_blob(ArtifactId id, ArtifactRole role,
         auto owner = std::make_shared<ArtifactBlobOwner>();
         owner->bytes.assign(bytes.begin(), bytes.end());
         const Sha256Digest digest = digest_bytes(owner->bytes);
+        // Argument evaluation order is unspecified: capture the span before
+        // the owner move, or the pointer can be read after the move.
+        const uint8_t* data = owner->bytes.data();
+        const size_t size = owner->bytes.size();
         return PackageView(id, role,
-                           std::span<const uint8_t>(owner->bytes.data(), owner->bytes.size()),
+                           std::span<const uint8_t>(data, size),
                            digest, std::move(owner));
     } catch (const std::bad_alloc&) {
         return package_failure(CompatibilityError::PACKAGE_GRAPH_UNSUPPORTED, id,
