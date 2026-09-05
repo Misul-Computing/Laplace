@@ -20,7 +20,6 @@
 #include <unistd.h>
 
 #include "execution_plan.h"
-#include "prefill_tile.h"
 #include "column_grouped_u2_atlas.h"
 #include "fp16.h"
 #include "kernels.h"
@@ -1995,9 +1994,6 @@ struct CanonicalMetalProgram::Impl {
     uint32_t prefill_sample_program = UINT32_MAX;
     uint32_t prefill_batch2_logits_program = UINT32_MAX;
     uint32_t prefill_batch2_sample_program = UINT32_MAX;
-    uint32_t prefill_tile_logits_program = UINT32_MAX;
-    uint32_t prefill_tile_sample_program = UINT32_MAX;
-    uint32_t prefill_state_tile_program = UINT32_MAX;
     uint32_t decode_logits_program = UINT32_MAX;
     uint32_t decode_sample_program = UINT32_MAX;
     uint32_t position = 0;
@@ -2050,7 +2046,6 @@ bool product_structural_contract_matches_lowering(
     }
     prefill_batch = false;
     bool saw_prefill = false;
-    bool saw_prefill_tile = false;
     for (size_t program_index = 0; program_index != structural.size();
          ++program_index) {
         const SemanticDispatchProgram& semantic = semantics[program_index];
@@ -2064,10 +2059,6 @@ bool product_structural_contract_matches_lowering(
                 return semantic.request.include_greedy_sampler
                     ? ProductMetalProgramKind::PrefillBatch2GreedySample
                     : ProductMetalProgramKind::PrefillBatch2Logits;
-            if (semantic.request.batch_rows == kPrefillTileRows)
-                return semantic.request.include_greedy_sampler
-                    ? ProductMetalProgramKind::PrefillBatchTileGreedySample
-                    : ProductMetalProgramKind::PrefillBatchTileLogits;
             return semantic.request.include_greedy_sampler
                 ? ProductMetalProgramKind::PrefillGreedySample
                 : ProductMetalProgramKind::PrefillLogits;
@@ -2089,16 +2080,11 @@ bool product_structural_contract_matches_lowering(
         }
         if (semantic.request.phase == ExecutionPhase::Prefill) {
             saw_prefill = true;
-            if (semantic.request.batch_rows == kPrefillTileRows)
-                saw_prefill_tile = true;
-            if (semantic.request.batch_rows > kPrefillTileRows ||
-                (semantic.request.batch_rows > 2 &&
-                 semantic.request.batch_rows != kPrefillTileRows)) {
+            if (semantic.request.batch_rows > 2) {
                 detail = "product Metal composite executor does not admit this prefill batch width";
                 return false;
             }
-            prefill_batch = prefill_batch || semantic.request.batch_rows == 2 ||
-                            semantic.request.batch_rows == kPrefillTileRows;
+            prefill_batch = prefill_batch || semantic.request.batch_rows == 2;
         }
 
         const auto groups = program.groups();
@@ -2176,14 +2162,6 @@ bool product_structural_contract_matches_lowering(
             contract.find(ProductMetalProgramKind::PrefillStateOnly);
         if (!state_only || !contract.range(state_only->id)) {
             detail = "product Metal contract lacks its prefill state-only range";
-            return false;
-        }
-    }
-    if (saw_prefill_tile) {
-        const ProductMetalProgramBinding* state_only =
-            contract.find(ProductMetalProgramKind::PrefillStateOnlyTile);
-        if (!state_only || !contract.range(state_only->id)) {
-            detail = "product Metal contract lacks its prefill tile state-only range";
             return false;
         }
     }
@@ -3275,15 +3253,6 @@ CanonicalMetalCreateResult create_canonical_metal_program_internal(
         impl->prefill_batch2_sample_program =
             prepared_product_session->program_id(
                 ProductMetalProgramKind::PrefillBatch2GreedySample);
-        impl->prefill_tile_logits_program =
-            prepared_product_session->program_id(
-                ProductMetalProgramKind::PrefillBatchTileLogits);
-        impl->prefill_tile_sample_program =
-            prepared_product_session->program_id(
-                ProductMetalProgramKind::PrefillBatchTileGreedySample);
-        impl->prefill_state_tile_program =
-            prepared_product_session->program_id(
-                ProductMetalProgramKind::PrefillStateOnlyTile);
         impl->decode_logits_program = prepared_product_session->program_id(
             ProductMetalProgramKind::DecodeLogits);
         impl->decode_sample_program = prepared_product_session->program_id(
@@ -3748,22 +3717,19 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
     }
     if (output_mode == OutputMode::None &&
         (token_ids.size() != 1 ||
-         (phase != ExecutionPhase::Prefill && impl_->calibration.empty())) &&
-        !(phase == ExecutionPhase::Prefill &&
-          token_ids.size() == kPrefillTileRows)) {
+         (phase != ExecutionPhase::Prefill && impl_->calibration.empty()))) {
         return metal_error(CompatibilityError::RUNTIME_INPUT_INVALID,
-                           "canonical state-only execution requires one prefill token, a tile-width prefill chunk, or configured calibration");
+                           "canonical state-only execution requires one prefill token or configured calibration");
     }
     if (impl_->has_recurrent && token_ids.size() > 1) {
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
                            "canonical Metal recurrent prefill requires explicit candidate-state chaining");
     }
     if (impl_->prefill_batch && phase == ExecutionPhase::Prefill &&
-        (token_ids.size() > impl_->maximum_batch_rows ||
-         (token_ids.size() == 2 && impl_->position != 0) ||
-         (token_ids.size() > 2 && token_ids.size() != kPrefillTileRows))) {
+        (token_ids.size() > impl_->maximum_batch_rows || token_ids.size() > 2 ||
+         (token_ids.size() == 2 && impl_->position != 0))) {
         return metal_error(CompatibilityError::KERNEL_UNAVAILABLE,
-                           "canonical Metal F16 prefill batch is the two initial tokens or a tile-width chunk");
+                           "canonical Metal F16 prefill batch is exactly two initial tokens");
     }
     uint32_t selected_output_row =
         static_cast<uint32_t>(token_ids.size() - 1);
@@ -3771,17 +3737,11 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
         uint32_t product_program = UINT32_MAX;
         if (phase == ExecutionPhase::Prefill) {
             if (output_mode == OutputMode::None) {
-                product_program = token_ids.size() == kPrefillTileRows
-                    ? impl_->prefill_state_tile_program
-                    : impl_->prefill_state_program;
+                product_program = impl_->prefill_state_program;
             } else if (token_ids.size() == 2) {
                 product_program = produce_sample
                     ? impl_->prefill_batch2_sample_program
                     : impl_->prefill_batch2_logits_program;
-            } else if (token_ids.size() == kPrefillTileRows) {
-                product_program = produce_sample
-                    ? impl_->prefill_tile_sample_program
-                    : impl_->prefill_tile_logits_program;
             } else {
                 product_program = produce_sample
                     ? impl_->prefill_sample_program
@@ -3815,15 +3775,8 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
     if (produce_logits) output.logits.resize(impl_->vocabulary);
     MetalSamplerResult sampled_result;
     uint32_t next_position = impl_->position;
-    const bool prefill_batch_transaction =
-        impl_->prefill_batch && phase == ExecutionPhase::Prefill &&
-        (token_ids.size() == 2 || token_ids.size() == kPrefillTileRows);
-    if (prefill_batch_transaction) {
-        const uint32_t rows = static_cast<uint32_t>(token_ids.size());
-        bool tokens_valid = true;
-        for (uint32_t token : token_ids)
-            tokens_valid = tokens_valid && token < impl_->vocabulary;
-        if (!tokens_valid ||
+    if (impl_->prefill_batch && phase == ExecutionPhase::Prefill && token_ids.size() == 2) {
+        if (token_ids[0] >= impl_->vocabulary || token_ids[1] >= impl_->vocabulary ||
             !metal_tok_session_begin_prefill_batch_with_attention_capacity(
                 *impl_->metal_session, static_cast<int>(impl_->hidden),
                 static_cast<int>(impl_->token_intermediate), 0, 0, 0,
@@ -3832,9 +3785,9 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
                     static_cast<int>(impl_->attention_key_value_capacity),
                     impl_->attention_key_value_width_sum},
                 static_cast<int>(impl_->maximum_context), static_cast<int>(impl_->layers.size()),
-                static_cast<int>(next_position), rows) ||
+                static_cast<int>(next_position), 2) ||
             !metal_tok_session_upload_embeddings_batch(*impl_->metal_session, impl_->embedding,
-                                                       token_ids.data(), rows,
+                                                       token_ids.data(), 2,
                                                        static_cast<int>(impl_->hidden),
                                                        static_cast<int>(impl_->vocabulary),
                                                        impl_->embedding_scale)) {
@@ -3859,7 +3812,7 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
             if (!selected ||
                 !std::holds_alternative<DenseLayer>(program_layer) ||
                 !metal_tok_session_dense_prefill_batch_layer(
-                    *impl_->metal_session, std::get<DenseLayer>(program_layer).metal, rows)) {
+                    *impl_->metal_session, std::get<DenseLayer>(program_layer).metal, 2)) {
                 const char* failure = metal_tok_session_last_failure(*impl_->metal_session);
                 metal_tok_session_abort(*impl_->metal_session);
                 CompatibilityReport report = metal_error(
@@ -3870,11 +3823,8 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
                 return report;
             }
         }
-        // State-only chunks seal without an output row: the stopped-before-
-        // final range has no selected row to match.
-        const bool row_selected = output_mode == OutputMode::None ||
-            metal_tok_session_select_prefill_batch_row(
-                *impl_->metal_session, selected_output_row);
+        const bool row_selected = metal_tok_session_select_prefill_batch_row(
+            *impl_->metal_session, selected_output_row);
         const bool finalized = row_selected &&
             (produce_sample
                  ? metal_tok_session_final_sampled(
@@ -3895,7 +3845,7 @@ CanonicalMetalRunResult CanonicalMetalProgram::run(std::span<const uint32_t> tok
             if (failure) detail += ": " + std::string(failure);
             return metal_error(CompatibilityError::RUNTIME_NUMERICAL_FAILURE, std::move(detail));
         }
-        next_position += rows;
+        next_position += 2;
     } else {
     const ExecutionPlan& active_plan =
         impl_->prefill_batch && phase == ExecutionPhase::Prefill ? impl_->token_plan : impl_->plan;
@@ -4105,11 +4055,6 @@ CanonicalMetalRunResult CanonicalMetalProgram::decode_sampled(uint32_t token_id)
 CanonicalMetalRunResult CanonicalMetalProgram::advance_prefill(uint32_t token_id) {
     return run(std::span<const uint32_t>(&token_id, 1), ExecutionPhase::Prefill,
                OutputMode::None);
-}
-
-CanonicalMetalRunResult CanonicalMetalProgram::advance_prefill_batch(
-    std::span<const uint32_t> token_ids) {
-    return run(token_ids, ExecutionPhase::Prefill, OutputMode::None);
 }
 
 CanonicalMetalRunResult CanonicalMetalProgram::accumulate_calibration(uint32_t token_id) {

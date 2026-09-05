@@ -6,6 +6,18 @@
 
 namespace Laplace {
 
+size_t emitted_close_prefix(std::span<const uint32_t> reply,
+                            std::span<const uint32_t> close,
+                            uint32_t stop_token) {
+    size_t prefix = 0;
+    while (prefix < close.size() && close[prefix] != stop_token) ++prefix;
+    if (prefix == close.size() || prefix > reply.size()) return 0;
+    for (size_t i = 0; i < prefix; ++i)
+        if (reply[reply.size() - prefix + i] != close[i]) return 0;
+    return prefix;
+}
+
+
 void record_prefill(GenerationMetrics* metrics, uint64_t tokens) {
     metrics->prefill_tokens += tokens;
 }

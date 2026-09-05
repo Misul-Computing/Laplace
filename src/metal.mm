@@ -1,6 +1,5 @@
 #include "tensor.h"
 #include "matmul.h"
-#include "prefill_tile.h"
 #include "token_graph_backend.h"
 #include "kernels.h"
 #include "fp16.h"
@@ -72,7 +71,6 @@ static id<MTLLibrary> g_router_lib;
 #endif
 static id<MTLComputePipelineState> g_m4_pipe;
 static id<MTLComputePipelineState> g_prefill_f16_pipe;
-static id<MTLComputePipelineState> g_prefill_f16_tile_pipe;
 static id<MTLComputePipelineState> g_sampler_pipe;
 static std::once_flag g_sampler_init;
 #if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_TESTING)
@@ -119,7 +117,6 @@ static std::unordered_map<int, id<MTLComputePipelineState>> g_moe_down_reduce_pi
 static bool g_m4 = false;
 static std::once_flag g_gemm_init;
 static std::once_flag g_prefill_f16_init;
-static std::once_flag g_prefill_f16_tile_init;
 #if defined(LAPLACE_METAL_TESTING) || defined(LAPLACE_TESTING)
 static id<MTLLibrary> g_trellis_lib;
 static id<MTLComputePipelineState> g_trellis_pipe;
@@ -1853,30 +1850,6 @@ static id<MTLComputePipelineState> get_prefill_f16_pipe() {
         }
     });
     return g_prefill_f16_pipe;
-}
-
-// The tile pipeline lives in the same library source as the rows kernel; the
-// shared once-flag also guarantees the library exists before this lookup.
-static id<MTLComputePipelineState> get_prefill_f16_tile_pipe() {
-    if (g_lease_pipeline_path)
-        return leased_pipeline("prefill_f16_tile", {});
-    if (global_pipeline_access_blocked()) return nil;
-    if (!get_prefill_f16_pipe() || !g_prefill_f16_lib) return nil;
-    std::call_once(g_prefill_f16_tile_init, []{
-        if (!g_dev || !g_prefill_f16_lib) return;
-        NSError* error = nil;
-        id<MTLFunction> function = [g_prefill_f16_lib newFunctionWithName:@"prefill_f16_tile"];
-        if (!function) {
-            fprintf(stderr, "[metal] prefill_f16_tile function missing\n");
-            return;
-        }
-        g_prefill_f16_tile_pipe = [g_dev newComputePipelineStateWithFunction:function error:&error];
-        if (!g_prefill_f16_tile_pipe) {
-            fprintf(stderr, "[metal] prefill_f16_tile pipeline: %s\n",
-                    error ? [[error localizedDescription] UTF8String] : "?");
-        }
-    });
-    return g_prefill_f16_tile_pipe;
 }
 
 // Create a specialized pipeline for a given quant type using function constants.
@@ -6172,7 +6145,7 @@ static bool tok_begin(int H, int inter, int exp_inter, int n_used, int n_experts
     const bool has_attention = Hq != 0 || Hk != 0 || Dh != 0;
     if ((has_attention && (Hq < 1 || Hk < 1 || Dh < 1)) ||
         (!has_attention && (Hq != 0 || Hk != 0 || Dh != 0)) ||
-        (batch_rows < 1 || batch_rows > kPrefillTileRows))
+        (batch_rows != 1 && batch_rows != 2))
         return tok_fail("token begin has invalid attention or batch geometry");
     if (context.lease_backed &&
         (!context.leased_program_selected ||
@@ -6649,8 +6622,7 @@ static bool tok_bind(const Tensor& w, size_t xoff, size_t yoff, int K, int N) {
 }
 
 static bool tok_bind_f16_rows(const Tensor& w, size_t xoff, size_t yoff, int M, int K, int N) {
-    if (M < 1 || M > static_cast<int>(kPrefillTileRows) ||
-        w.type != GGMLType::F16 || w.n_dims != 2 || K <= 0 || N <= 0 ||
+    if (M != 2 || w.type != GGMLType::F16 || w.n_dims != 2 || K <= 0 || N <= 0 ||
         w.dims[0] != static_cast<uint64_t>(K) || w.dims[1] != static_cast<uint64_t>(N) ||
         !tok_enc()) return false;
     if (static_cast<uint64_t>(K) > SIZE_MAX / static_cast<uint64_t>(N) / sizeof(uint16_t))
@@ -6659,13 +6631,7 @@ static bool tok_bind_f16_rows(const Tensor& w, size_t xoff, size_t yoff, int M, 
     const size_t weight_bytes = static_cast<size_t>(K) * static_cast<size_t>(N) * sizeof(uint16_t);
     if (!strict_tensor_data_span(w, weight_bytes)) return false;
     id<MTLBuffer> weights = get_weight_buf(w.data, weight_bytes, weight_offset);
-    // Width two keeps the exact legacy rows kernel; every other admitted
-    // width runs the tiled kernel, whose 128-bit staging requires the
-    // reduction width to be a multiple of the declared tile stride.
-    const bool legacy_rows = M == 2;
-    if (!legacy_rows && K % static_cast<int>(kPrefillTileKMultiple) != 0) return false;
-    id<MTLComputePipelineState> pipeline =
-        legacy_rows ? get_prefill_f16_pipe() : get_prefill_f16_tile_pipe();
+    id<MTLComputePipelineState> pipeline = get_prefill_f16_pipe();
     // The active canonical batch context requires registered weight spans.
     // A nil buffer here is a hard error, never an upload/copy fallback.
     if (!weights || !pipeline) return false;
@@ -6676,17 +6642,9 @@ static bool tok_bind_f16_rows(const Tensor& w, size_t xoff, size_t yoff, int M, 
     [g_tok.enc setBytes:&K length:sizeof(K) atIndex:3];
     [g_tok.enc setBytes:&N length:sizeof(N) atIndex:4];
     [g_tok.enc setBytes:&M length:sizeof(M) atIndex:5];
-    if (legacy_rows) {
-        const uint64_t outputs = static_cast<uint64_t>(M) * static_cast<uint64_t>(N);
-        if (outputs > static_cast<uint64_t>(INT_MAX)) return false;
-        enc_1d(g_tok.enc, pipeline, static_cast<int>(outputs), 64);
-    } else {
-        // One simdgroup per 32x32 output tile; the activations stage needs
-        // 4 KiB of threadgroup memory.
-        [g_tok.enc setThreadgroupMemoryLength:4096 atIndex:0];
-        [g_tok.enc dispatchThreadgroups:MTLSizeMake((N + 31) / 32, (M + 31) / 32, 1)
-           threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    }
+    const uint64_t outputs = static_cast<uint64_t>(M) * static_cast<uint64_t>(N);
+    if (outputs > static_cast<uint64_t>(INT_MAX)) return false;
+    enc_1d(g_tok.enc, pipeline, static_cast<int>(outputs), 64);
     tok_record_projection_bytes(w, K, N);
     ++active_tok_context().metrics.projection_dispatches;
     ++active_tok_context().metrics.batched_projection_dispatches;
@@ -7549,7 +7507,7 @@ static bool tok_prefill_f16_layer_supported(const MetalTokLayer& L) {
     };
     const int frequency_dimension = L.rope_frequency_dimension == 0
         ? L.rope_dim : L.rope_frequency_dimension;
-    return g_tok.live && g_tok.batch_rows >= 2 && L.H == g_tok.H &&
+    return g_tok.live && g_tok.batch_rows == 2 && L.H == g_tok.H &&
            L.Hq > 0 && L.Hk > 0 && L.Dh > 0 && L.Hq <= INT_MAX / L.Dh &&
            L.Hk <= INT_MAX / L.Dh && L.Hq * L.Dh <= g_tok.query_capacity &&
            L.Hk * L.Dh <= g_tok.kv_stride && L.inter == g_tok.inter &&
@@ -7656,14 +7614,13 @@ static bool tok_prefill_f16_attention(const MetalTokLayer& L, uint32_t row, int 
     return true;
 }
 
-static bool metal_tok_dense_prefill_batch_layer(const MetalTokLayer& L, uint32_t rows) {
-    if (rows == 0 || rows > kPrefillTileRows)
-        return tok_fail("prefill batch layer width exceeds the declared tile capacity");
+static bool metal_tok_dense_prefill_batch_layer(const MetalTokLayer& L) {
     if (!tok_prefill_f16_layer_supported(L))
         return tok_fail("prefill batch layer contract rejected");
     const int H = L.H;
     const int qn = L.Hq * L.Dh;
     const int kn = L.Hk * L.Dh;
+    const uint32_t rows = 2;
     for (uint32_t row = 0; row != rows; ++row) {
         TokLeaseDispatchScope dispatch(row, 1);
         if (!tok_rms(*L.attn_norm, tok_batch_row(g_tok.x, H, row),
@@ -8352,7 +8309,7 @@ static bool metal_pipeline_program_set_complete(
     for (size_t index = 0; index != program_ranges.size(); ++index) {
         const MetalTokProgramRange& range = program_ranges[index];
         if (range.invocation_count == 0 ||
-            (range.batch_rows < 1 || range.batch_rows > kPrefillTileRows) ||
+            (range.batch_rows != 1 && range.batch_rows != 2) ||
             (range.selected_output_row != UINT32_MAX &&
              (range.selected_output_row >= range.batch_rows ||
               std::all_of(range.semantic_program_digest.begin(),
@@ -10644,8 +10601,7 @@ bool metal_tok_session_begin_prefill_batch(MetalTokSession& session, int H, int 
     MetalTokScope scope(session.token_);
     if (!prepare_leased_program(session.token_))
         return tok_fail("leased prefill program was not selected before token begin");
-    if (rows == 0 || rows > kPrefillTileRows)
-        return tok_fail("prefill batch width exceeds the declared tile capacity");
+    if (rows != 2) return tok_fail("prefill batch requires exactly two rows");
     return tok_begin(H, inter, exp_inter, n_used, n_experts, Hq, Hk, Dh, max_seq, n_layers, pos,
                      rows, false, rows);
 }
@@ -10656,8 +10612,7 @@ bool metal_tok_session_begin_prefill_batch_with_attention_capacity(
     MetalTokScope scope(session.token_);
     if (!prepare_leased_program(session.token_))
         return tok_fail("leased prefill program was not selected before token begin");
-    if (rows == 0 || rows > kPrefillTileRows)
-        return tok_fail("prefill batch width exceeds the declared tile capacity");
+    if (rows != 2) return tok_fail("prefill batch requires exactly two rows");
     if (capacity.query_width < 1 || capacity.key_value_width < 1)
         return tok_fail("prefill batch received invalid attention capacity");
     return tok_begin(H, inter, exp_inter, n_used, n_experts, 1, 1, 1,
@@ -10696,8 +10651,7 @@ bool metal_tok_session_upload_embeddings_batch(MetalTokSession& session, const T
                                                const uint32_t* tokens, uint32_t rows,
                                                int H, int vocab, float scale) {
     MetalTokScope scope(session.token_);
-    if (!tokens || !g_tok.live || rows == 0 || rows > kPrefillTileRows ||
-        g_tok.batch_rows != rows || H != g_tok.H)
+    if (!tokens || !g_tok.live || rows != 2 || g_tok.batch_rows != rows || H != g_tok.H)
         return tok_fail("prefill batch embedding upload has invalid transaction geometry");
     for (uint32_t row = 0; row != rows; ++row) {
         TokLeaseDispatchScope dispatch(row, 1);
@@ -10723,16 +10677,15 @@ bool metal_tok_session_layer(MetalTokSession& session, const MetalTokLayer& laye
 bool metal_tok_session_dense_prefill_batch_layer(MetalTokSession& session,
                                                   const MetalTokLayer& layer, uint32_t rows) {
     MetalTokScope scope(session.token_);
-    if (rows == 0 || rows > kPrefillTileRows)
-        return tok_fail("prefill batch layer width exceeds the declared tile capacity");
+    if (rows != 2) return tok_fail("prefill batch layer requires exactly two rows");
     if (!g_tok.live || g_tok.batch_rows != rows)
         return tok_fail("prefill batch layer does not match the live token transaction");
-    return metal_tok_dense_prefill_batch_layer(layer, rows);
+    return metal_tok_dense_prefill_batch_layer(layer);
 }
 
 bool metal_tok_session_select_prefill_batch_row(MetalTokSession& session, uint32_t row) {
     MetalTokScope scope(session.token_);
-    if (!g_tok.live || row >= g_tok.batch_rows) return false;
+    if (!g_tok.live || g_tok.batch_rows != 2 || row >= g_tok.batch_rows) return false;
     if (session.token_.lease_backed &&
         session.token_.leased_selected_output_row != row) {
         session.token_.failure_detail =

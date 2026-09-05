@@ -46,7 +46,9 @@ inline constexpr CanonicalFactKey rope_scaling_freq_scale{0x47554615u};
 inline constexpr CanonicalFactKey embedding_scale{0x47554616u};
 inline constexpr CanonicalFactKey feed_forward_activation{0x47554617u};
 
-inline constexpr std::array<Descriptor, 23> descriptors = {{
+inline constexpr CanonicalFactKey attention_scale{0x47554618u};
+
+inline constexpr std::array<Descriptor, 24> descriptors = {{
     {block_count, "block_count", ValueKind::Unsigned},
     {context_length, "context_length", ValueKind::Unsigned},
     {embedding_length, "embedding_length", ValueKind::Unsigned},
@@ -70,6 +72,7 @@ inline constexpr std::array<Descriptor, 23> descriptors = {{
     {rope_scaling_freq_scale, "rope.scaling.freq_scale", ValueKind::Float32},
     {embedding_scale, "embedding_scale", ValueKind::Float32},
     {feed_forward_activation, "feed_forward_activation", ValueKind::Unsigned},
+    {attention_scale, "attention.scale", ValueKind::Float32},
 }};
 
 } // namespace Laplace::gguf_fact_keys

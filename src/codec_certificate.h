@@ -217,6 +217,10 @@ public:
     }
 
     CodecCertificateError validate(const CodecCertificateBinding&) const noexcept;
+    // Certify a whole tensor as independent ranges of at most maximum_units.
+    // This checks aggregate bounds without decoding or changing the limits of
+    // validate() and decode(). A successful result is not a decode allocation budget.
+    CodecCertificateError validate_tensor(const CodecCertificateBinding&) const noexcept;
     bool matches_physical_identity(const PhysicalCodecIdentity&) const noexcept;
     CodecCertificateDecodeResult decode(const CodecCertificateBinding&,
                                         uint64_t max_elements) const;

@@ -105,6 +105,15 @@ void check_algebra(Primitive primitive, float left, std::optional<float> right,
 }
 
 void test_generic_f32_algebra_reference() {
+    const auto power = run_algebra(Primitive::Pow, 10000.0f, -0.375f);
+    CHECK(std::holds_alternative<ReferenceResult>(power));
+    if (const auto* value = std::get_if<ReferenceResult>(&power))
+        CHECK(value->exports.front().bits == std::vector<uint64_t>{
+            std::bit_cast<uint32_t>(std::pow(10000.0f, -0.375f))});
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        run_algebra(Primitive::Pow, -2.0f, 0.5f)));
+    CHECK(std::holds_alternative<CompatibilityReport>(
+        run_algebra(Primitive::Pow, 2.0f, 1000.0f)));
     check_algebra(Primitive::Subtract, 5.0f, 2.0f, 3.0f);
     check_algebra(Primitive::Divide, 5.0f, 2.0f, 2.5f);
     check_algebra(Primitive::Maximum, -3.0f, 2.0f, 2.0f);
@@ -711,9 +720,266 @@ void test_reference_execution_and_transaction() {
     }
 }
 
+void test_coordinates_and_require_reference() {
+    Program program = structured_reduction_program();
+    const ValueType f32{ElementType::F32, {}}, u32{ElementType::U32, {}},
+                    u64{ElementType::U64, {}}, i1{ElementType::I1, {}};
+    Region& body = program.functions.front().regions.front();
+    body.instructions = {
+        Instruction{40, {Primitive::TensorCoordinate, 1, 0}, {}, {{41, u32}}, {}, {}, CoordinateAttributes{0}},
+        Instruction{42, {Primitive::TensorCoordinate, 1, 0}, {}, {{43, u32}}, {}, {}, CoordinateAttributes{1}},
+        Instruction{44, {Primitive::Convert, 1, 0}, {41}, {{45, f32}}, {}, {}, NoAttributes{}},
+        Instruction{46, {Primitive::Convert, 1, 0}, {43}, {{47, f32}}, {}, {}, NoAttributes{}},
+        constant(48, 49, 10.0f),
+        Instruction{50, {Primitive::Multiply, 1, 0}, {45, 49}, {{51, f32}}, {}, {}, NoAttributes{}},
+        Instruction{52, {Primitive::Add, 1, 0}, {51, 47}, {{53, f32}}, {}, {}, NoAttributes{}},
+        Instruction{54, {Primitive::Add, 1, 0}, {53, 22}, {{55, f32}}, {}, {}, NoAttributes{}},
+        Instruction{56, {Primitive::TensorCoordinate, 1, 0}, {}, {{57, u64}}, {}, {}, CoordinateAttributes{1}},
+        Instruction{58, {Primitive::Constant, 1, 0}, {}, {{59, u64}}, {}, {}, ConstantAttributes{3}},
+        Instruction{60, {Primitive::Less, 1, 0}, {57, 59}, {{61, i1}}, {}, {}, NoAttributes{}},
+        Instruction{62, {Primitive::Require, 1, 0}, {61}, {{63, i1}}, {}, {}, NoAttributes{}},
+        Instruction{64, {Primitive::Select, 1, 0}, {63, 55, 55}, {{65, f32}}, {}, {}, NoAttributes{}}};
+    body.yields = {65};
+    const auto run = [&] {
+        const auto verified = verify_and_canonicalize_program(program);
+        if (const auto* error = std::get_if<CompatibilityReport>(&verified))
+            CHECK_MSG(false, "coordinate program: %s", error->detail.c_str());
+        CHECK(std::holds_alternative<VerifiedProgram>(verified));
+        if (const auto* error = std::get_if<CompatibilityReport>(&verified))
+            return std::variant<ReferenceResult, CompatibilityReport>(*error);
+        const std::array<ReferenceInput, 1> inputs = {
+            ReferenceInput{10, {ElementType::F32, {2, 3}, std::vector<uint64_t>(6, 0)}}};
+        ReferenceState state;
+        return execute_reference_program(std::get<VerifiedProgram>(verified), state, inputs);
+    };
+    const auto result = run();
+    CHECK(std::holds_alternative<ReferenceResult>(result));
+    if (const auto* value = std::get_if<ReferenceResult>(&result))
+        CHECK((value->exports.front().bits == std::vector<uint64_t>{
+            std::bit_cast<uint32_t>(3.0f), std::bit_cast<uint32_t>(33.0f)}));
+    body.instructions[9].attributes = ConstantAttributes{2};
+    CHECK(std::holds_alternative<CompatibilityReport>(run()));
+    Program require = algebra_program(Primitive::Require, true);
+    auto& function = require.functions.front();
+    function.result_types = {i1};
+    function.regions.front().arguments.front().type = i1;
+    function.regions.front().instructions.front().outputs.front().type = i1;
+    require.exports.front().type = i1;
+    const auto verified = verify_and_canonicalize_program(require);
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (const auto* proof = std::get_if<VerifiedProgram>(&verified)) {
+        for (uint64_t predicate : {0u, 1u, 2u}) {
+            const std::array<ReferenceInput, 1> inputs = {
+                ReferenceInput{10, {ElementType::I1, {}, {predicate}}}};
+            ReferenceState state;
+            const auto actual = execute_reference_program(*proof, state, inputs);
+            CHECK(std::holds_alternative<ReferenceResult>(actual) == (predicate == 1));
+        }
+    }
+}
+
+void test_arithmetic_policy_reference() {
+    const auto run = [](Program program, float input) {
+        const auto verified = verify_and_canonicalize_program(std::move(program));
+        CHECK(std::holds_alternative<VerifiedProgram>(verified));
+        if (const auto* error = std::get_if<CompatibilityReport>(&verified))
+            return std::variant<ReferenceResult, CompatibilityReport>(*error);
+        const std::array<ReferenceInput, 1> inputs = {
+            ReferenceInput{10, {ElementType::F32, {}, {std::bit_cast<uint32_t>(input)}}}};
+        ReferenceState state;
+        return execute_reference_program(std::get<VerifiedProgram>(verified), state, inputs);
+    };
+    Program exponential = algebra_program(Primitive::Exp, true);
+    for (unsigned flags = 0; flags < 4; ++flags) {
+        exponential.functions.front().regions.front().instructions.front().attributes =
+            ArithmeticAttributes{bool(flags & 1), bool(flags & 2)};
+        const auto overflow = run(exponential, 100.0f);
+        CHECK(std::holds_alternative<ReferenceResult>(overflow) == bool(flags & 2));
+        const auto nonfinite = run(exponential, -INFINITY);
+        CHECK(std::holds_alternative<ReferenceResult>(nonfinite) == bool(flags & 1));
+    }
+    Program silu = algebra_program(Primitive::Exp, true);
+    const ValueType f32{ElementType::F32, {}};
+    Region& root = silu.functions.front().regions.front();
+    root.instructions = {
+        Instruction{20, {Primitive::RequireFinite, 1, 0}, {10}, {{21, f32}}, {}, {}, NoAttributes{}},
+        Instruction{22, {Primitive::Negate, 1, 0}, {21}, {{23, f32}}, {}, {}, NoAttributes{}},
+        Instruction{24, {Primitive::Exp, 1, 0}, {23}, {{25, f32}}, {}, {}, ArithmeticAttributes{false, true}},
+        constant(26, 27, 1.0f),
+        Instruction{28, {Primitive::Add, 1, 0}, {27, 25}, {{29, f32}}, {}, {}, ArithmeticAttributes{true, true}},
+        Instruction{31, {Primitive::Divide, 1, 0}, {21, 29}, {{32, f32}}, {}, {}, ArithmeticAttributes{true, true}},
+        Instruction{33, {Primitive::RequireFinite, 1, 0}, {32}, {{30, f32}}, {}, {}, NoAttributes{}}};
+    const auto result = run(silu, -100.0f);
+    CHECK(std::holds_alternative<ReferenceResult>(result));
+    if (const auto* value = std::get_if<ReferenceResult>(&result))
+        CHECK(value->exports.front().bits == std::vector<uint64_t>{0x80000000});
+    CHECK(std::holds_alternative<CompatibilityReport>(run(silu, INFINITY)));
+    root.instructions[2].attributes = NoAttributes{};
+    CHECK(std::holds_alternative<CompatibilityReport>(run(silu, -100.0f)));
+    const Program guard = algebra_program(Primitive::RequireFinite, true);
+    const auto negative_zero = run(guard, -0.0f);
+    CHECK(std::holds_alternative<ReferenceResult>(negative_zero));
+    if (const auto* value = std::get_if<ReferenceResult>(&negative_zero))
+        CHECK(value->exports.front().bits == std::vector<uint64_t>{0x80000000});
+    CHECK(std::holds_alternative<CompatibilityReport>(run(guard, INFINITY)));
+    CHECK(std::holds_alternative<CompatibilityReport>(run(guard, NAN)));
+}
+
+void test_source_element_reference() {
+    Program program = dynamic_gather_program();
+    Region& root = program.functions.front().regions.back();
+    root.arguments[1].type.dimensions = {
+        {DimensionExpression::Constant, 1, {}}, {DimensionExpression::Constant, 3, {}}};
+    auto& maps = std::get<StructuredTensorAttributes>(root.instructions.back().attributes).indexing_maps;
+    const TensorIndexExpr zero{TensorIndexExpression::Constant, 0, {}};
+    const TensorIndexExpr load{TensorIndexExpression::SourceElement, 1,
+                              {zero, iterator_index(0)}};
+    maps[1].results = {zero, iterator_index(0)};
+    maps[0].results[0] = load;
+    const auto run = [&](std::vector<uint64_t> indices) {
+        const auto verified = verify_and_canonicalize_program(program);
+        CHECK(std::holds_alternative<VerifiedProgram>(verified));
+        if (const auto* error = std::get_if<CompatibilityReport>(&verified))
+            return std::variant<ReferenceResult, CompatibilityReport>(*error);
+        std::vector<uint64_t> data;
+        for (size_t row = 0; row < 4; ++row)
+            for (size_t column = 0; column < 3; ++column)
+                data.push_back(std::bit_cast<uint32_t>(static_cast<float>(row * 10 + column)));
+        const std::array<ReferenceInput, 2> inputs = {
+            ReferenceInput{10, {ElementType::F32, {4, 3}, std::move(data)}},
+            ReferenceInput{11, {ElementType::U32, {1, 3}, std::move(indices)}}};
+        ReferenceState state;
+        return execute_reference_program(std::get<VerifiedProgram>(verified), state, inputs);
+    };
+    const auto check = [&](std::vector<uint64_t> indices, std::vector<float> expected) {
+        const auto actual = run(std::move(indices));
+        CHECK(std::holds_alternative<ReferenceResult>(actual));
+        if (const auto* result = std::get_if<ReferenceResult>(&actual)) {
+            std::vector<uint64_t> bits;
+            for (float value : expected) bits.push_back(std::bit_cast<uint32_t>(value));
+            CHECK(result->exports.front().bits == bits);
+        }
+    };
+    check({2, 0, 1}, {20, 1, 12});
+    maps[0].results[0].operands[1] = load;
+    check({2, 0, 1}, {10, 21, 2});
+    CHECK(std::holds_alternative<CompatibilityReport>(run({3, 0, 1})));
+    maps[0].bounds = TensorBoundsMode::Zero;
+    CHECK(std::holds_alternative<CompatibilityReport>(run({3, 0, 1})));
+    maps[0].results[0] = load;
+    check({4, 0, 1}, {0, 1, 12});
+    CHECK(std::holds_alternative<CompatibilityReport>(run({uint64_t{UINT32_MAX} + 1, 0, 1})));
+    // An earlier zero-padded axis must not hide a bad later source lookup.
+    maps[0].results = {{TensorIndexExpression::Constant, -1, {}}, load};
+    maps[0].results[1].operands[1] = {TensorIndexExpression::Constant, 3, {}};
+    CHECK(std::holds_alternative<CompatibilityReport>(run({2, 0, 1})));
+    maps[0].results = {load, iterator_index(0)};
+    maps[0].results[0].operands[1] = {
+        TensorIndexExpression::Multiply, 0,
+        {load, {TensorIndexExpression::Constant, INT64_MAX, {}}}};
+    CHECK(std::holds_alternative<CompatibilityReport>(run({2, 0, 1})));
+}
+
+void test_typed_structured_body_reference() {
+    Program program = dynamic_gather_program();
+    Region& body = program.functions.front().regions.front();
+    const ValueType f32{ElementType::F32, {}}, i1{ElementType::I1, {}};
+    body.instructions = {
+        Instruction{40, {Primitive::Convert, 1, 0}, {22}, {{41, f32}}, {}, {}, NoAttributes{}},
+        Instruction{42, {Primitive::Less, 1, 0}, {21, 23}, {{43, i1}}, {}, {}, NoAttributes{}},
+        Instruction{44, {Primitive::Select, 1, 0}, {43, 23, 21}, {{45, f32}}, {}, {}, NoAttributes{}},
+        Instruction{46, {Primitive::Sqrt, 1, 0}, {45}, {{47, f32}}, {}, {}, NoAttributes{}},
+        Instruction{48, {Primitive::Tanh, 1, 0}, {47}, {{49, f32}}, {}, {}, NoAttributes{}},
+        Instruction{50, {Primitive::Equal, 1, 0}, {47, 47}, {{51, i1}}, {}, {}, NoAttributes{}},
+        Instruction{52, {Primitive::Select, 1, 0}, {51, 49, 41}, {{53, f32}}, {}, {}, NoAttributes{}}};
+    body.yields = {53};
+    const auto verified = verify_and_canonicalize_program(program);
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
+    if (!std::holds_alternative<VerifiedProgram>(verified)) return;
+    std::vector<uint64_t> table(12, std::bit_cast<uint32_t>(-1.0f));
+    table[0] = std::bit_cast<uint32_t>(1.0f);
+    table[1] = std::bit_cast<uint32_t>(4.0f);
+    const std::array<ReferenceInput, 2> inputs = {
+        ReferenceInput{10, {ElementType::F32, {4, 3}, std::move(table)}},
+        ReferenceInput{11, {ElementType::U32, {}, {0}}}};
+    ReferenceState state;
+    const auto result = execute_reference_program(std::get<VerifiedProgram>(verified), state, inputs);
+    CHECK(std::holds_alternative<ReferenceResult>(result));
+    if (const auto* output = std::get_if<ReferenceResult>(&result))
+        CHECK((output->exports.front().bits == std::vector<uint64_t>{
+            std::bit_cast<uint32_t>(std::tanh(1.0f)),
+            std::bit_cast<uint32_t>(std::tanh(2.0f)), 0}));
+}
+
+void test_typed_scalar_reference() {
+    const auto run = [](Primitive code, std::vector<ReferenceValue> values,
+                        ElementType output_type) -> std::variant<ReferenceResult, CompatibilityReport> {
+        Region root;
+        root.id = 1;
+        std::vector<uint32_t> operands;
+        std::vector<ReferenceInput> inputs;
+        for (size_t i = 0; i < values.size(); ++i) {
+            const uint32_t id = static_cast<uint32_t>(10 + i);
+            root.arguments.push_back({id, {values[i].type, {}}});
+            operands.push_back(id);
+            inputs.push_back({id, std::move(values[i])});
+        }
+        const ValueType output{output_type, {}};
+        root.instructions = {Instruction{20, {code, 1, 0}, std::move(operands),
+            {{30, output}}, {}, {}, NoAttributes{}}};
+        root.yields = {30};
+        Program program;
+        program.functions = {Function{9, 1, {std::move(root)}, {output}}};
+        program.exports = {{9, 0, output}};
+        const auto verified = verify_and_canonicalize_program(program);
+        CHECK(std::holds_alternative<VerifiedProgram>(verified));
+        if (const auto* error = std::get_if<CompatibilityReport>(&verified)) return *error;
+        ReferenceState state;
+        return execute_reference_program(std::get<VerifiedProgram>(verified), state, inputs);
+    };
+    const auto check = [&](Primitive code, std::vector<ReferenceValue> inputs,
+                           ElementType type, uint64_t bits) {
+        const auto result = run(code, std::move(inputs), type);
+        CHECK(std::holds_alternative<ReferenceResult>(result));
+        if (const auto* value = std::get_if<ReferenceResult>(&result))
+            CHECK(value->exports.front().bits == std::vector<uint64_t>{bits});
+    };
+    check(Primitive::Less, {{ElementType::I32, {}, {UINT32_MAX}},
+                           {ElementType::I32, {}, {0}}}, ElementType::I1, 1);
+    check(Primitive::Less, {{ElementType::U64, {}, {UINT64_MAX}},
+                           {ElementType::U64, {}, {0}}}, ElementType::I1, 0);
+    check(Primitive::Equal, {{ElementType::F32, {}, {0x80000000}},
+                            {ElementType::F32, {}, {0}}}, ElementType::I1, 1);
+    for (uint64_t condition : {0u, 1u})
+        check(Primitive::Select, {{ElementType::I1, {}, {condition}},
+              {ElementType::U64, {}, {UINT64_MAX}}, {ElementType::U64, {}, {42}}},
+              ElementType::U64, condition ? UINT64_MAX : 42);
+    for (const auto& pair : std::vector<std::pair<uint32_t, uint32_t>>{
+             {0, 0}, {1, 0x3f800000}, {16777217, 0x4b800000},
+             {16777219, 0x4b800002}, {UINT32_MAX, 0x4f800000}})
+        check(Primitive::Convert, {{ElementType::U32, {}, {pair.first}}},
+              ElementType::F32, pair.second);
+    check(Primitive::Sqrt, {{ElementType::F32, {}, {std::bit_cast<uint32_t>(2.0f)}}},
+          ElementType::F32, std::bit_cast<uint32_t>(std::sqrt(2.0f)));
+    check(Primitive::Tanh, {{ElementType::F32, {}, {std::bit_cast<uint32_t>(-1.25f)}}},
+          ElementType::F32, std::bit_cast<uint32_t>(std::tanh(-1.25f)));
+    CHECK(std::holds_alternative<CompatibilityReport>(run(Primitive::Sqrt,
+        {{ElementType::F32, {}, {std::bit_cast<uint32_t>(-1.0f)}}}, ElementType::F32)));
+    CHECK(std::holds_alternative<CompatibilityReport>(run(Primitive::Less,
+        {{ElementType::F32, {}, {0x7fc00000}}, {ElementType::F32, {}, {0}}}, ElementType::I1)));
+    CHECK(std::holds_alternative<CompatibilityReport>(run(Primitive::Select,
+        {{ElementType::I1, {}, {2}}, {ElementType::U32, {}, {1}},
+         {ElementType::U32, {}, {0}}}, ElementType::U32)));
+}
+
 } // namespace
 
 int main() {
+    test_coordinates_and_require_reference();
+    test_arithmetic_policy_reference();
+    test_source_element_reference();
+    test_typed_structured_body_reference();
+    test_typed_scalar_reference();
     test_generic_f32_algebra_reference();
     test_data_dependent_tensor_index_reference();
     test_bound_physical_resource_feeds_semantic_input();

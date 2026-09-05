@@ -209,6 +209,13 @@ Hello<|end|>
     }
 }
 
+void run_distinct_closers() {
+    const auto framing = compile_chat_framing(R"TPL({% for message in messages %}{% if message['role'] == 'user' %}{{ '<u>' + message['content'] + '</u>' }}{% elif message['role'] == 'assistant' %}{{ '<a>' + message['content'] + '</a>' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<a>' }}{% endif %})TPL");
+    CHECK(framing.matched);
+    CHECK(framing.assistant_close == "</a>");
+    CHECK(framing.user_open + "Hello" + framing.turn_close + framing.generation_open == "<u>Hello</u><a>");
+}
+
 void run_unrecognized_templates() {
     {
         const ChatFraming framing = compile_chat_framing(R"TPL()TPL");
@@ -248,6 +255,7 @@ void run_unrecognized_templates() {
 
 int main() {
     run_real_templates();
+    run_distinct_closers();
     run_unrecognized_templates();
     if (g_failures == 0) {
         std::printf("test_chat_framing: all cases passed\n");

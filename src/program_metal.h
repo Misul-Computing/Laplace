@@ -44,9 +44,15 @@ struct MetalProgramExecutionAudit {
     uint64_t explicit_download_bytes = 0;
     uint32_t command_buffers = 0;
     uint32_t implicit_weight_copies = 0;
+    uint32_t mapped_artifact_buffer_count = 0;
     uint32_t thread_execution_width = 0;
     uint32_t max_total_threads_per_threadgroup = 0;
+    double gpu_time_ms = 0.0;
+    double cpu_wait_ms = 0.0;
     uint64_t state_generation = 0;
+    // Intermediate outputs only; excludes inputs, weights and transactional state.
+    uint64_t intermediate_buffer_allocations = 0;
+    uint64_t intermediate_buffer_bytes = 0;
 };
 
 struct MetalProgramResult {

@@ -72,6 +72,47 @@ bool digest_zero(const PhysicalProgramDigest& digest) {
     return true;
 }
 
+bool resource_covers_tensor(const PhysicalResourceBinding& resource,
+                            const ArtifactTensorRecord& tensor) {
+    std::vector<const ArtifactTensorPlane*> physical_planes;
+    for (const auto& plane : tensor.planes)
+        if (plane.source.length != 0) physical_planes.push_back(&plane);
+    if (resource.planes.size() != physical_planes.size()) return false;
+    std::vector<bool> matched(physical_planes.size(), false);
+    for (const auto& bound : resource.planes) {
+        size_t match = 0;
+        while (match != physical_planes.size()) {
+            const auto& source = physical_planes[match]->source;
+            if (!matched[match] && bound.artifact_id == source.artifact_id &&
+                bound.offset == source.offset && bound.length == source.length)
+                break;
+            ++match;
+        }
+        if (match == physical_planes.size()) return false;
+        matched[match] = true;
+    }
+    return true;
+}
+
+bool alias_covers_resources(const ArtifactIndex& physical,
+                            const PhysicalResourceBinding& left,
+                            const PhysicalResourceBinding& right) {
+    if (left.program_digest != right.program_digest) return false;
+    for (const auto& alias : physical.aliases()) {
+        const ArtifactTensorRecord* source = nullptr;
+        const ArtifactTensorRecord* target = nullptr;
+        for (const auto& tensor : physical.tensors()) {
+            if (tensor.id == alias.source_tensor_id) source = &tensor;
+            if (tensor.id == alias.target_tensor_id) target = &tensor;
+        }
+        if (!source || !target) continue;
+        if ((resource_covers_tensor(left, *source) && resource_covers_tensor(right, *target)) ||
+            (resource_covers_tensor(left, *target) && resource_covers_tensor(right, *source)))
+            return true;
+    }
+    return false;
+}
+
 const PackageView* find_artifact(const ArtifactIndex& index, ArtifactId id) {
     auto artifacts = index.artifacts();
     auto it = std::lower_bound(artifacts.begin(), artifacts.end(), id,
@@ -217,7 +258,7 @@ std::variant<PackageValidation, CompatibilityReport> validate_package(
         uint32_t artifact = UINT32_MAX;
         uint64_t begin = 0;
         uint64_t end = 0;
-        uint32_t resource = UINT32_MAX;
+        const PhysicalResourceBinding* binding = nullptr;
     };
     std::vector<SourceRange> source_ranges;
     for (size_t i = 0; i < result.resources.size(); ++i) {
@@ -266,7 +307,7 @@ std::variant<PackageValidation, CompatibilityReport> validate_package(
             previous_plane = plane.plane;
             source_ranges.push_back(
                 {plane.artifact_id.value, plane.offset,
-                 plane.offset + plane.length, resource.resource_id});
+                 plane.offset + plane.length, &resource});
         }
     }
     std::sort(source_ranges.begin(), source_ranges.end(),
@@ -275,21 +316,18 @@ std::variant<PackageValidation, CompatibilityReport> validate_package(
                       return left.artifact < right.artifact;
                   if (left.begin != right.begin) return left.begin < right.begin;
                   if (left.end != right.end) return left.end < right.end;
-                  return left.resource < right.resource;
+                  return left.binding->resource_id < right.binding->resource_id;
               });
-    uint32_t active_artifact = UINT32_MAX;
-    uint64_t active_end = 0;
-    for (const SourceRange& current : source_ranges) {
-        if (current.artifact != active_artifact) {
-            active_artifact = current.artifact;
-            active_end = current.end;
-            continue;
+    for (size_t left_index = 0; left_index != source_ranges.size(); ++left_index) {
+        const SourceRange& left = source_ranges[left_index];
+        for (size_t right_index = left_index + 1; right_index != source_ranges.size(); ++right_index) {
+            const SourceRange& right = source_ranges[right_index];
+            if (right.artifact != left.artifact || right.begin >= left.end) break;
+            if (!alias_covers_resources(physical, *left.binding, *right.binding))
+                return reject(CompatibilityError::PACKAGE_BOUNDS_INVALID,
+                              "physical resource source ranges overlap without an alias contract",
+                              right.binding->resource_id);
         }
-        if (current.begin < active_end)
-            return reject(CompatibilityError::PACKAGE_BOUNDS_INVALID,
-                          "physical resource source ranges overlap without an alias contract",
-                          current.resource);
-        active_end = current.end;
     }
     return result;
 }

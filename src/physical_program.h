@@ -50,6 +50,9 @@ enum class PhysicalIntegerOverflow : uint8_t {
 enum class PhysicalNanPolicy : uint8_t {
     CanonicalQuiet = 1,
     Reject = 2,
+    // Preserve direct-load NaN bits and leave arithmetic results unchanged.
+    // This does not prescribe cross-device arithmetic NaN payload selection.
+    PreserveIeee = 3,
 };
 
 enum class PhysicalInfinityPolicy : uint8_t {

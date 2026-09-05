@@ -568,6 +568,12 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     const auto q_heads_fact = fact_u32(physical, attention_head_count);
     const auto kv_heads_fact = fact_u32(physical, attention_head_count_kv, true);
     const auto rope_base = fact_f32(physical, rope_freq_base);
+    const auto declared_attention_scale = fact_f32(physical, attention_scale);
+    for (const ArtifactFact& fact : physical.metadata_facts()) {
+        if (fact.key == attention_scale && fact.state != ArtifactFactState::Missing &&
+            !declared_attention_scale)
+            return std::nullopt;
+    }
     const auto bos = fact_u32(physical, bos_token_id);
     const auto eos = fact_u32(physical, eos_token_id);
     if (!layers || !hidden || !epsilon ||
@@ -719,7 +725,6 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
     std::vector<LayerRefs> refs;
     refs.reserve(*layers);
     const uint32_t norm_bits = std::bit_cast<uint32_t>(*epsilon);
-    constexpr uint32_t one_bits = 0x3f800000u;
     for (uint32_t layer = 0; layer != *layers; ++layer) {
         const ArtifactTensorRecord* layer_q = unique_role_tensor(
             physical, TensorRole::QueryWeight, layer);
@@ -827,7 +832,7 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
         const uint32_t kn = r.k_norm != UINT32_MAX
             ? add_value(model, ScalarType::F32, rows(layer_kv_width)) : kv;
         const uint32_t qr = add_value(model, ScalarType::F32, rows(layer_q_width));
-        const uint32_t ar = add_value(model, ScalarType::F32, rows(layer_q_width));
+        const uint32_t ar = add_value(model, ScalarType::F32, rows(layer_kv_width));
         const uint32_t ao = add_value(model, ScalarType::F32, rows(layer_q_width));
         const uint32_t attn_proj = add_value(model, ScalarType::F32, rows(*hidden));
         const uint32_t attn_res = add_value(model, ScalarType::F32, rows(*hidden));
@@ -904,7 +909,10 @@ std::optional<SemanticModel> build_model(const ArtifactIndex& physical,
                      RopePayload{RopePairing::HalfSplit, true, layer_rope_dim,
                                  std::bit_cast<uint32_t>(layer_rope_base),
                                  std::bit_cast<uint32_t>(layer_rope_scale)});
-        CausalAttentionPayload attention{q_heads, layer_kv_heads, layer_head_dim, one_bits, AttentionMask::Causal,
+        const float layer_attention_scale = declared_attention_scale.value_or(
+            1.0f / std::sqrt(static_cast<float>(layer_head_dim)));
+        CausalAttentionPayload attention{q_heads, layer_kv_heads, layer_head_dim,
+                                         std::bit_cast<uint32_t>(layer_attention_scale), AttentionMask::Causal,
                                          CachePolicy::Global,
                                          windowed ? AttentionWindowKind::Sliding : AttentionWindowKind::Global,
                                          windowed && sliding_window ? *sliding_window : 0,
@@ -1170,6 +1178,7 @@ std::optional<TokenProgram> compile_gguf_tokenizer(const GGUFContext& context,
             {PromptOpcode::EmitGenerationPrompt, framing.generation_open});
         definition.prompt.push_back({PromptOpcode::End, {}});
         definition.turn = {
+            {PromptOpcode::EmitLiteralUtf8, framing.assistant_close},
             {PromptOpcode::EmitLiteralUtf8, framing.user_open},
             {PromptOpcode::EmitUserText, {}},
             {PromptOpcode::EmitLiteralUtf8, framing.turn_close},
@@ -1249,9 +1258,16 @@ GgufProductCompilationResult compile_normalized_gguf_product(const PackageView& 
         contract.authoritative_tokenizer_digest = span_digest;
         contract.authoritative_template_digest = token_program->prompt_digest();
         contract.stop_ids = model.stop_ids;
-        contract.prompt = PromptTemplate{
-            1, {PromptOperation{PromptOperationKind::AppendInputText, {}, kNoTokenId},
-                PromptOperation{PromptOperationKind::AppendLiteral, {'\n'}, kNoTokenId}}};
+        PromptTemplate prompt;
+        prompt.version = 1;
+        for (const auto& instruction : token_program->definition().prompt) {
+            if (instruction.opcode == PromptOpcode::End) break;
+            const auto kind = instruction.opcode == PromptOpcode::EmitUserText
+                ? PromptOperationKind::AppendInputText : PromptOperationKind::AppendLiteral;
+            prompt.operations.push_back({kind,
+                {instruction.literal.begin(), instruction.literal.end()}, kNoTokenId});
+        }
+        contract.prompt = std::move(prompt);
     } else {
         contract.tokenizer_algorithm = TokenizerAlgorithm::TokenIdsOnly;
         contract.tokenizer_version = 0;

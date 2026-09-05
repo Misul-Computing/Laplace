@@ -600,6 +600,31 @@ PhysicalProgram binary_float_program(PhysicalOpcode opcode,
     return program;
 }
 
+void test_preserve_ieee_load_policy() {
+    for (uint32_t bits : {0u, 0x80000000u, 1u, 0x807fffffu, 0x3f800000u,
+                          0x7f7fffffu, 0x7f800000u, 0xff800000u,
+                          0x7f800001u, 0xff800001u, 0x7fc12345u, 0xffffffffu}) {
+        auto program = load_f32_program();
+        program.policies[0].nan = PhysicalNanPolicy::PreserveIeee;
+        const auto verified = verify_one(program, u32_bytes({bits}), {ElementType::F32, {}});
+        CHECK(require_value(verified).bits == bits);
+        if (!std::holds_alternative<VerifiedPhysicalProgram>(verified)) continue;
+        const auto wire = encode_physical_program(std::get<VerifiedPhysicalProgram>(verified).program());
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+        if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire))
+            CHECK(std::holds_alternative<PhysicalProgram>(parse_physical_program(*bytes)));
+
+        program.policies[0].subnormal = PhysicalSubnormalPolicy::FlushToSignedZero;
+        program.policies[0].signed_zero = PhysicalSignedZeroPolicy::Positive;
+        program.policies[0].infinity = PhysicalInfinityPolicy::SaturateFinite;
+        uint32_t expected = bits;
+        if ((bits & 0x7fffffffu) < 0x00800000u) expected = 0;
+        if ((bits & 0x7fffffffu) == 0x7f800000u)
+            expected = (bits & 0x80000000u) | 0x7f7fffffu;
+        CHECK(require_value(verify_one(program, u32_bytes({bits}), {ElementType::F32, {}})).bits == expected);
+    }
+}
+
 void test_numeric_arithmetic_edges() {
     const auto zero_add = verify_one(
         binary_float_program(PhysicalOpcode::F32Add, preserve_policy()),
@@ -1127,6 +1152,7 @@ int main(int argc, char** argv) {
     test_axis_permutation_and_unpadded_tail();
     test_inline_plane_and_narrow_conversions();
     test_numeric_policy_bits();
+    test_preserve_ieee_load_policy();
     test_numeric_arithmetic_edges();
     test_rounding_saturation_and_rejection();
     test_conversion_contract();

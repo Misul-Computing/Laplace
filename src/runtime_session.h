@@ -127,6 +127,8 @@ private:
     std::unique_ptr<MetalProgramExecutable> program_metal_;
     uint32_t program_token_input_value_ = UINT32_MAX;
     uint32_t program_score_result_index_ = UINT32_MAX;
+    std::vector<uint64_t> program_token_extents_;
+    std::vector<uint64_t> program_score_extents_;
     bool poisoned_ = false;
     uint64_t product_store_id_ = 0;
     uint64_t product_generation_ = 1;

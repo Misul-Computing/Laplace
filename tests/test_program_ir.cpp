@@ -130,7 +130,7 @@ Program algebra_program(Primitive primitive, bool unary,
 
 void test_generic_f32_algebra_contract() {
     constexpr std::array binary = {
-        Primitive::Subtract, Primitive::Divide, Primitive::Maximum};
+        Primitive::Subtract, Primitive::Divide, Primitive::Maximum, Primitive::Pow};
     constexpr std::array unary = {
         Primitive::Negate, Primitive::Exp, Primitive::Log,
         Primitive::Rsqrt, Primitive::Sin, Primitive::Cos};
@@ -970,6 +970,23 @@ Program state_effect_chain_program(uint32_t instruction_count) {
     return program;
 }
 
+Program independent_state_reads(uint32_t count) {
+    Program program;
+    const auto type = scalar(ElementType::U64);
+    program.state_references = {{9, type, UINT32_MAX, false}};
+    Region region;
+    region.id = 1;
+    for (uint32_t i = 0; i < count; ++i) {
+        region.instructions.push_back(instruction(i, Primitive::StateRead, {},
+            {value(i, type)}, StateAttributes{9}));
+        region.yields.push_back(i);
+    }
+    program.functions = {{1, 1, {std::move(region)},
+                          std::vector<ValueType>(count, type)}};
+    program.exports = {{1, 0, type}};
+    return program;
+}
+
 void test_constant_storage_widths() {
     for (const auto [type, bits] : {
              std::pair{ElementType::I1, uint64_t{1}},
@@ -1015,12 +1032,28 @@ void test_loop_overflow_model() {
 
 void test_dependency_depth_is_bounded() {
     CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(independent_state_reads(4096))));
+    CHECK(rejected_with(independent_state_reads(4097),
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+    auto split_reads = independent_state_reads(2048);
+    auto extra_reads = independent_state_reads(2049);
+    extra_reads.functions.front().id = 2;
+    extra_reads.exports.front().function_id = 2;
+    split_reads.functions.push_back(std::move(extra_reads.functions.front()));
+    split_reads.exports.push_back(extra_reads.exports.front());
+    CHECK(rejected_with(split_reads, CompatibilityError::IR_CONSTRAINT_FAILED));
+
+    CHECK(std::holds_alternative<VerifiedProgram>(
         verify_and_canonicalize_program(dependency_chain_program(4096))));
     CHECK(std::holds_alternative<VerifiedProgram>(
         verify_and_canonicalize_program(nested_loop_program(4096))));
     CHECK(std::holds_alternative<VerifiedProgram>(
         verify_and_canonicalize_program(state_effect_chain_program(4096))));
     CHECK(rejected_with(dependency_chain_program(4097),
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+    CHECK(rejected_with(nested_loop_program(4097),
+                        CompatibilityError::IR_CONSTRAINT_FAILED));
+    CHECK(rejected_with(state_effect_chain_program(4097),
                         CompatibilityError::IR_CONSTRAINT_FAILED));
 
     Program split_limit = dependency_chain_program(2048);
@@ -1038,7 +1071,19 @@ void test_dependency_depth_is_bounded() {
     split_over_second.exports.front().function_id = 2;
     split_over.functions.push_back(std::move(split_over_second.functions.front()));
     split_over.exports.push_back(std::move(split_over_second.exports.front()));
-    CHECK(rejected_with(split_over, CompatibilityError::IR_CONSTRAINT_FAILED));
+    CHECK(std::holds_alternative<VerifiedProgram>(
+        verify_and_canonicalize_program(std::move(split_over))));
+
+    Program wide = dependency_chain_program(1024);
+    for (uint32_t i = 1; i < 16; ++i) {
+        auto branch = dependency_chain_program(1024);
+        branch.functions.front().id = i + 1;
+        branch.exports.front().function_id = i + 1;
+        wide.functions.push_back(std::move(branch.functions.front()));
+        wide.exports.push_back(std::move(branch.exports.front()));
+    }
+    const auto verified = verify_and_canonicalize_program(std::move(wide));
+    CHECK(std::holds_alternative<VerifiedProgram>(verified));
 }
 
 uint64_t evaluate_scalar(const Program& program) {
@@ -1294,9 +1339,195 @@ void test_structural_wire_roundtrip() {
     }
 }
 
+void test_coordinate_and_require_contract() {
+    Program program = dynamic_gather_program();
+    Region& body = program.functions.front().regions.front();
+    body.instructions = {
+        instruction(40, Primitive::TensorCoordinate, {}, {value(41, scalar(ElementType::U32))}, CoordinateAttributes{0}),
+        instruction(42, Primitive::Convert, {41}, {value(43)})};
+    body.yields = {43};
+    const auto checked = verify_and_canonicalize_program(program);
+    CHECK(std::holds_alternative<VerifiedProgram>(checked));
+    if (const auto* verified = std::get_if<VerifiedProgram>(&checked)) {
+        const auto wire = encode_program_wire(*verified);
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+        if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire)) {
+            const auto decoded = decode_program_wire(*bytes);
+            CHECK(std::holds_alternative<VerifiedProgram>(decoded));
+            if (const auto* restored = std::get_if<VerifiedProgram>(&decoded))
+                CHECK(program_digest(*restored) == program_digest(*verified));
+        }
+    }
+    Program large = program;
+    auto& geometry = std::get<StructuredTensorAttributes>(
+        large.functions.front().regions.back().instructions.back().attributes);
+    geometry.iteration_dimensions.push_back(constant_dimension(uint64_t{1} << 32));
+    geometry.iterator_kinds.push_back(TensorIteratorKind::Reduction);
+    large.functions.front().regions.front().instructions.front().attributes = CoordinateAttributes{1};
+    CHECK(std::holds_alternative<VerifiedProgram>(verify_and_canonicalize_program(large)));
+    geometry.iteration_dimensions.back().value += 1;
+    CHECK(rejected_with(large, CompatibilityError::IR_SHAPE_MISMATCH));
+    geometry.iteration_dimensions.clear();
+    geometry.iterator_kinds.clear();
+    CHECK(rejected_with(large, CompatibilityError::IR_CONSTRAINT_FAILED));
+    body.instructions.front().attributes = CoordinateAttributes{1};
+    CHECK(rejected_with(program, CompatibilityError::IR_CONSTRAINT_FAILED));
+    body.instructions.front().attributes = CoordinateAttributes{0};
+    body.instructions.front().inputs = {22};
+    CHECK(rejected_with(program, CompatibilityError::IR_CONSTRAINT_FAILED));
+    body.instructions.front().inputs.clear();
+    body.instructions.front().outputs.front().type = scalar();
+    CHECK(rejected_with(program, CompatibilityError::IR_SHAPE_MISMATCH));
+    Program root = one_function_program(0, 0, {},
+        {instruction(1, Primitive::TensorCoordinate, {}, {value(2, scalar(ElementType::U64))}, CoordinateAttributes{0})},
+        {2}, {scalar(ElementType::U64)});
+    CHECK(rejected_with(root, CompatibilityError::IR_CONSTRAINT_FAILED));
+    Program loop = bounded_state_program();
+    loop.functions.front().regions.front().instructions.insert(
+        loop.functions.front().regions.front().instructions.begin(),
+        instruction(500, Primitive::TensorCoordinate, {}, {value(501, scalar(ElementType::U64))}, CoordinateAttributes{0}));
+    CHECK(rejected_with(loop, CompatibilityError::IR_CONSTRAINT_FAILED));
+    const auto i1 = scalar(ElementType::I1);
+    Program require = one_function_program(0, 0, {value(1, i1)},
+        {instruction(2, Primitive::Require, {1}, {value(3, i1)})}, {3}, {i1});
+    CHECK(std::holds_alternative<VerifiedProgram>(verify_and_canonicalize_program(require)));
+    require.functions.front().regions.front().instructions.front().attributes = ArithmeticAttributes{};
+    CHECK(rejected_with(require, CompatibilityError::IR_CONSTRAINT_FAILED));
+}
+
+void test_arithmetic_policy_contract() {
+    Program program = one_function_program(0, 0, {value(1)},
+        {instruction(2, Primitive::Exp, {1}, {value(3)}, ArithmeticAttributes{false, true})},
+        {3}, {scalar()});
+    ProgramDigest previous{};
+    for (unsigned flags = 0; flags < 4; ++flags) {
+        program.functions.front().regions.front().instructions.front().attributes =
+            ArithmeticAttributes{bool(flags & 1), bool(flags & 2)};
+        const auto checked = verify_and_canonicalize_program(program);
+        CHECK(std::holds_alternative<VerifiedProgram>(checked));
+        if (const auto* verified = std::get_if<VerifiedProgram>(&checked)) {
+            CHECK(program_digest(*verified) != previous);
+            previous = program_digest(*verified);
+            const auto wire = encode_program_wire(*verified);
+            CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+            if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire)) {
+                const auto decoded = decode_program_wire(*bytes);
+                CHECK(std::holds_alternative<VerifiedProgram>(decoded));
+                if (const auto* restored = std::get_if<VerifiedProgram>(&decoded))
+                    CHECK(program_digest(*restored) == program_digest(*verified));
+            }
+        }
+    }
+    auto& op = program.functions.front().regions.front().instructions.front();
+    op.primitive.code = Primitive::RequireFinite;
+    CHECK(rejected_with(program, CompatibilityError::IR_CONSTRAINT_FAILED));
+    op.attributes = NoAttributes{};
+    CHECK(std::holds_alternative<VerifiedProgram>(verify_and_canonicalize_program(program)));
+    op.primitive.code = Primitive::Convert;
+    op.attributes = ArithmeticAttributes{true, true};
+    CHECK(rejected_with(program, CompatibilityError::IR_CONSTRAINT_FAILED));
+    op.primitive.code = Primitive::Add;
+    op.inputs = {1, 1};
+    op.outputs.front().type = scalar(ElementType::U32);
+    program.functions.front().regions.front().arguments.front().type = scalar(ElementType::U32);
+    program.functions.front().result_types = {scalar(ElementType::U32)};
+    program.exports.front().type = scalar(ElementType::U32);
+    CHECK(rejected_with(program, CompatibilityError::IR_SHAPE_MISMATCH));
+}
+
+void test_source_element_index_contract() {
+    Program program = dynamic_gather_program();
+    Region& root = program.functions.front().regions.back();
+    root.arguments[1].type = tensor({1, 3}, ElementType::U32);
+    auto& maps = std::get<StructuredTensorAttributes>(root.instructions.back().attributes).indexing_maps;
+    const TensorIndexExpr zero{TensorIndexExpression::Constant, 0, {}};
+    maps[1].results = {zero, iterator_index(0)};
+    const TensorIndexExpr load{TensorIndexExpression::SourceElement, 1,
+                              {zero, iterator_index(0)}};
+    maps[0].results[0] = load;
+    const auto checked = verify_and_canonicalize_program(program);
+    CHECK(std::holds_alternative<VerifiedProgram>(checked));
+    if (const auto* verified = std::get_if<VerifiedProgram>(&checked)) {
+        const auto wire = encode_program_wire(*verified);
+        CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+        if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire)) {
+            const auto decoded = decode_program_wire(*bytes);
+            CHECK(std::holds_alternative<VerifiedProgram>(decoded));
+            if (const auto* restored = std::get_if<VerifiedProgram>(&decoded))
+                CHECK(program_digest(*restored) == program_digest(*verified));
+        }
+    }
+    maps[0].results[0].operands[1] = load;
+    CHECK(std::holds_alternative<VerifiedProgram>(verify_and_canonicalize_program(program)));
+    maps[0].results[0].operands.clear();
+    CHECK(rejected_with(program, CompatibilityError::IR_SHAPE_MISMATCH));
+    maps[0].results[0] = load;
+    maps[0].results[0].value = 2;
+    CHECK(rejected_with(program, CompatibilityError::IR_REFERENCE_INVALID));
+    maps[0].results[0] = load;
+    root.arguments[1].type.element_type = ElementType::F32;
+    program.functions.front().regions.front().arguments[1].type.element_type = ElementType::F32;
+    CHECK(rejected_with(program, CompatibilityError::IR_SHAPE_MISMATCH));
+    root.arguments[1].type.element_type = ElementType::U32;
+    program.functions.front().regions.front().arguments[1].type.element_type = ElementType::U32;
+    maps[0].results[0].operands[1] = {
+        TensorIndexExpression::Add, 0,
+        {{TensorIndexExpression::Constant, INT64_MAX, {}},
+         {TensorIndexExpression::Constant, 1, {}}}};
+    CHECK(rejected_with(program, CompatibilityError::IR_CONSTRAINT_FAILED));
+    TensorIndexExpr deep = load;
+    for (size_t depth = 0; depth < 34; ++depth)
+        deep = {TensorIndexExpression::SourceElement, 1, {zero, std::move(deep)}};
+    maps[0].results[0] = std::move(deep);
+    CHECK(rejected_with(program, CompatibilityError::IR_CONSTRAINT_FAILED));
+}
+
+void test_typed_scalar_primitives() {
+    const ValueType f32 = scalar(), u32 = scalar(ElementType::U32);
+    const ValueType i1 = scalar(ElementType::I1);
+    const auto make = [&](Primitive code, std::vector<TypedValue> args,
+                          std::vector<uint32_t> inputs, ValueType output) {
+        return one_function_program(0, 0, std::move(args),
+            {instruction(10, code, std::move(inputs), {value(11, output)})},
+            {11}, {output});
+    };
+    const std::vector<Program> valid = {
+        make(Primitive::Less, {value(1, u32), value(2, u32)}, {1, 2}, i1),
+        make(Primitive::Equal, {value(1), value(2)}, {1, 2}, i1),
+        make(Primitive::Select, {value(1, i1), value(2), value(3)}, {1, 2, 3}, f32),
+        make(Primitive::Convert, {value(1, u32)}, {1}, f32),
+        make(Primitive::Sqrt, {value(1)}, {1}, f32),
+        make(Primitive::Tanh, {value(1)}, {1}, f32)};
+    for (const Program& program : valid) {
+        const auto checked = verify_and_canonicalize_program(program);
+        CHECK(std::holds_alternative<VerifiedProgram>(checked));
+        if (const auto* verified = std::get_if<VerifiedProgram>(&checked)) {
+            const auto wire = encode_program_wire(*verified);
+            CHECK(std::holds_alternative<std::vector<uint8_t>>(wire));
+            if (const auto* bytes = std::get_if<std::vector<uint8_t>>(&wire)) {
+                const auto decoded = decode_program_wire(*bytes);
+                CHECK(std::holds_alternative<VerifiedProgram>(decoded));
+                if (const auto* restored = std::get_if<VerifiedProgram>(&decoded))
+                    CHECK(program_digest(*restored) == program_digest(*verified));
+            }
+        }
+    }
+    for (Program program : valid) {
+        program.functions.front().regions.front().instructions.front().inputs.clear();
+        CHECK(std::holds_alternative<CompatibilityReport>(verify_and_canonicalize_program(program)));
+    }
+    CHECK(rejected_with(make(Primitive::Less, {value(1), value(2, u32)}, {1, 2}, i1), CompatibilityError::IR_SHAPE_MISMATCH));
+    CHECK(rejected_with(make(Primitive::Select, {value(1, u32), value(2), value(3)}, {1, 2, 3}, f32), CompatibilityError::IR_SHAPE_MISMATCH));
+    CHECK(rejected_with(make(Primitive::Convert, {value(1)}, {1}, u32), CompatibilityError::IR_SHAPE_MISMATCH));
+}
+
 } // namespace
 
 int main() {
+    test_coordinate_and_require_contract();
+    test_arithmetic_policy_contract();
+    test_source_element_index_contract();
+    test_typed_scalar_primitives();
     test_minimal_programs();
     test_generic_f32_algebra_contract();
     test_data_dependent_tensor_index();

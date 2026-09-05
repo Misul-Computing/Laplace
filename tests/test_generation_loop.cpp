@@ -2,6 +2,7 @@
 #include <string>
 
 #include "generation_loop.h"
+#include <array>
 #include "test_util.h"
 
 using namespace Laplace;
@@ -106,9 +107,21 @@ void test_timing_domains_and_invalid_inputs() {
     }
 }
 
+void test_closing_prefix_already_in_history() {
+    const std::array<uint32_t, 3> reply = {7, 8, 9};
+    const std::array<uint32_t, 3> close = {8, 9, 42};
+    CHECK(emitted_close_prefix(reply, close, 42) == 2);
+    CHECK(emitted_close_prefix(std::span<const uint32_t>(reply).first(1), close, 42) == 0);
+    CHECK(emitted_close_prefix(reply, close, 50) == 0);
+    CHECK(emitted_close_prefix(reply, std::array<uint32_t, 2>{42, 10}, 42) == 0);
+    CHECK(emitted_close_prefix({}, close, 42) == 0);
+    CHECK(emitted_close_prefix(reply, std::array<uint32_t, 3>{3, 9, 42}, 42) == 0);
+}
+
 } // namespace
 
 int main() {
+    test_closing_prefix_already_in_history();
     test_plain_metrics_and_rendering();
     test_speculative_metrics();
     test_zero_decode_is_explicitly_unavailable();

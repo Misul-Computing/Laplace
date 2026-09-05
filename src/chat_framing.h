@@ -29,6 +29,7 @@ struct ChatFraming {
     std::string user_open;
     std::string assistant_open;
     std::string turn_close;
+    std::string assistant_close;
     // Opening marker for the assistant's generated turn.
     std::string generation_open;
 

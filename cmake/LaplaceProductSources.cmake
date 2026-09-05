@@ -13,7 +13,7 @@ set(LAPLACE_PRODUCT_SOURCES
     src/generation_loop.cpp
     src/product_package.cpp
     src/gguf_product_compiler.cpp
-    src/normalized_gguf_product_compiler.cpp
+    src/normalized_gguf_product_compiler.cpp src/chat_framing.cpp
     src/mlx_package.cpp
     src/normalized_source_evidence.cpp
     src/gguf_normalized_source_adapter.cpp
@@ -43,6 +43,9 @@ set(LAPLACE_PRODUCT_SOURCES
     src/closed_v1_source_schema.cpp
     src/source_schema.cpp
     src/source_compiler_graph_proof.cpp
+    src/source_program_compiler.cpp
+    src/semantic_program_compiler.cpp
+    src/codec_certificate_physical_program.cpp
     src/program_ir.cpp
     src/program_metal.mm
     src/physical_program.cpp

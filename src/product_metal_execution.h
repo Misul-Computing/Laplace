@@ -24,9 +24,6 @@ enum class ProductMetalProgramKind : uint8_t {
     DecodeGreedySample = 5,
     PrefillBatch2Logits = 6,
     PrefillBatch2GreedySample = 7,
-    PrefillBatchTileLogits = 8,
-    PrefillBatchTileGreedySample = 9,
-    PrefillStateOnlyTile = 10,
 };
 
 struct ProductMetalProgramBinding {

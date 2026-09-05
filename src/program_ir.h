@@ -71,10 +71,23 @@ enum class Primitive : uint16_t {
     Rsqrt = 14,
     Sin = 15,
     Cos = 16,
+    // Scalar comparisons return I1; F32 operands must be finite.
+    Less = 17,
+    Equal = 18,
+    // I1 condition, followed by true and false values of the same scalar type.
+    Select = 19,
+    // Numeric U32 to F32 conversion, rounded to nearest with ties to even.
+    Convert = 20,
+    Sqrt = 21,
+    Tanh = 22,
+    RequireFinite = 23,
+    TensorCoordinate = 24,
+    Require = 25,
+    Pow = 26,
 };
 
 inline constexpr size_t kPrimitiveCount =
-    static_cast<size_t>(Primitive::Cos) + 1;
+    static_cast<size_t>(Primitive::Pow) + 1;
 
 struct PrimitiveVersion {
     Primitive code = Primitive::Constant;
@@ -85,6 +98,17 @@ struct PrimitiveVersion {
 
 struct NoAttributes {
     friend bool operator==(NoAttributes, NoAttributes) = default;
+};
+
+struct CoordinateAttributes {
+    uint32_t axis = 0;
+    friend bool operator==(const CoordinateAttributes&, const CoordinateAttributes&) = default;
+};
+
+struct ArithmeticAttributes {
+    bool allow_nonfinite_operands = false;
+    bool allow_nonfinite_result = false;
+    friend bool operator==(const ArithmeticAttributes&, const ArithmeticAttributes&) = default;
 };
 
 struct ConstantAttributes {
@@ -119,6 +143,9 @@ enum class TensorIndexExpression : uint8_t {
     FloorDivide = 5,
     Remainder = 6,
     SourceScalar = 7,
+    // Read U32 from source `value` at the coordinates in `operands`.
+    // Invalid source coordinates fail even inside a zero-padded outer map.
+    SourceElement = 8,
 };
 
 struct TensorIndexExpr {
@@ -150,7 +177,7 @@ struct StructuredTensorAttributes {
 
 using PrimitiveAttributes =
     std::variant<NoAttributes, ConstantAttributes, LoopAttributes, StateAttributes,
-                 StructuredTensorAttributes>;
+                 StructuredTensorAttributes, ArithmeticAttributes, CoordinateAttributes>;
 
 struct Instruction {
     uint32_t id = UINT32_MAX;

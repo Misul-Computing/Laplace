@@ -286,6 +286,11 @@ void check_component_parameters_and_postprocessor() {
     if (const auto* output = std::get_if<std::vector<uint32_t>>(&ids)) {
         CHECK(*output == std::vector<uint32_t>({6, 3, 7}));
     }
+    const auto continuation = std::get<TokenProgram>(compiled)
+                                  .encode_continuation("ab");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(continuation));
+    if (const auto* output = std::get_if<std::vector<uint32_t>>(&continuation))
+        CHECK(*output == std::vector<uint32_t>({3, 7}));
 
     definition.postprocessor = {};
     definition.normalizer.kind = NormalizerKind::AsciiLowercase;
@@ -847,6 +852,10 @@ void check_v2_postprocessor_and_decoder_policy() {
     const auto ids = std::get<TokenProgram>(compiled).encode("a");
     CHECK(std::holds_alternative<std::vector<uint32_t>>(ids));
     if (const auto* output = std::get_if<std::vector<uint32_t>>(&ids)) CHECK(*output == std::vector<uint32_t>({16, 2, 17}));
+    const auto continuation = std::get<TokenProgram>(compiled).encode_continuation("a");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(continuation));
+    if (const auto* output = std::get_if<std::vector<uint32_t>>(&continuation))
+        CHECK(*output == std::vector<uint32_t>({2, 17}));
     const auto decoded = std::get<TokenProgram>(compiled).decode(std::array<uint32_t, 3>{16, 2, 17});
     CHECK(std::holds_alternative<std::string>(decoded));
     if (const auto* text = std::get_if<std::string>(&decoded)) CHECK(*text == "a");
@@ -864,6 +873,8 @@ TokenProgramDefinition v3_byte_bpe_definition() {
         {"<0x7a>", 0, 0, static_cast<uint8_t>(TokenPieceType::Byte), 0.0f},
         {"<bos>", static_cast<uint16_t>(VocabFlags::Special), 0, static_cast<uint8_t>(TokenPieceType::Control), 0.0f},
         {"<eos>", static_cast<uint16_t>(VocabFlags::Special), 0, static_cast<uint8_t>(TokenPieceType::Control), 0.0f},
+        {"<|im_start|>", static_cast<uint16_t>(VocabFlags::Special), 0, static_cast<uint8_t>(TokenPieceType::Control), 0.0f},
+        {"<u>", 0, 0, static_cast<uint8_t>(TokenPieceType::UserDefined), 0.0f},
     };
     definition.merges = {{1, 2, 3, 0}};
     definition.unknown_token_id = 0;
@@ -905,6 +916,8 @@ TokenProgramDefinition v3_sentencepiece_definition() {
         {"world", 0, 0, static_cast<uint8_t>(TokenPieceType::Normal), -1.0f},
         {"<0xc3>", 0, 0, static_cast<uint8_t>(TokenPieceType::Byte), 0.0f},
         {"<0xa9>", 0, 0, static_cast<uint8_t>(TokenPieceType::Byte), 0.0f},
+        {"<|im_start|>", static_cast<uint16_t>(VocabFlags::Special), 0, static_cast<uint8_t>(TokenPieceType::Control), 0.0f},
+        {"<u>", 0, 0, static_cast<uint8_t>(TokenPieceType::UserDefined), 0.0f},
     };
     definition.unknown_token_id = 0;
     definition.byte_fallback = true;
@@ -942,6 +955,16 @@ void check_v3_byte_bpe_execution_and_streaming() {
     if (const auto* ids = std::get_if<std::vector<uint32_t>>(&fallback)) {
         CHECK(*ids == std::vector<uint32_t>({5, 4, 6}));
     }
+    const auto special = program.encode("<|im_start|>a<|im_start|>b");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(special));
+    if (const auto* ids = std::get_if<std::vector<uint32_t>>(&special)) {
+        CHECK(*ids == std::vector<uint32_t>({5, 7, 1, 7, 2, 6}));
+    }
+    const auto user_defined = program.encode("<u>a");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(user_defined));
+    if (const auto* ids = std::get_if<std::vector<uint32_t>>(&user_defined)) {
+        CHECK(*ids == std::vector<uint32_t>({5, 8, 1, 6}));
+    }
     const auto decoded = program.decode(std::array<uint32_t, 3>{5, 3, 6});
     CHECK(std::holds_alternative<std::string>(decoded));
     if (const auto* text = std::get_if<std::string>(&decoded)) CHECK(*text == "ab");
@@ -970,6 +993,16 @@ void check_v3_sentencepiece_execution_and_fail_closed() {
     if (const auto* ids = std::get_if<std::vector<uint32_t>>(&encoded)) {
         CHECK(*ids == std::vector<uint32_t>({3, 4}));
     }
+    const auto control = program.encode("<|im_start|> world");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(control));
+    if (const auto* ids = std::get_if<std::vector<uint32_t>>(&control)) {
+        CHECK(*ids == std::vector<uint32_t>({9, 6}));
+    }
+    const auto user_defined = program.encode("<u> world");
+    CHECK(std::holds_alternative<std::vector<uint32_t>>(user_defined));
+    if (const auto* ids = std::get_if<std::vector<uint32_t>>(&user_defined)) {
+        CHECK(*ids == std::vector<uint32_t>({10, 6}));
+    }
     const auto fallback = program.encode("é");
     CHECK(std::holds_alternative<std::vector<uint32_t>>(fallback));
     if (const auto* ids = std::get_if<std::vector<uint32_t>>(&fallback)) {
@@ -978,6 +1011,19 @@ void check_v3_sentencepiece_execution_and_fail_closed() {
     const auto decoded = program.decode(std::array<uint32_t, 2>{3, 4});
     CHECK(std::holds_alternative<std::string>(decoded));
     if (const auto* text = std::get_if<std::string>(&decoded)) CHECK(*text == "hello world");
+
+    TokenProgram::StreamState sentencepiece_state;
+    const auto first_word = program.decode_chunk(std::array<uint32_t, 1>{3}, sentencepiece_state, false);
+    const auto second_word = program.decode_chunk(std::array<uint32_t, 1>{4}, sentencepiece_state, true);
+    CHECK(std::holds_alternative<std::string>(first_word));
+    CHECK(std::holds_alternative<std::string>(second_word));
+    if (const auto* left = std::get_if<std::string>(&first_word)) {
+        if (const auto* right = std::get_if<std::string>(&second_word)) CHECK(*left + *right == "hello world");
+    }
+
+    TokenProgram::StreamState space_state;
+    CHECK(std::get<std::string>(program.decode_chunk(std::array<uint32_t, 1>{5}, space_state)).empty());
+    CHECK(std::get<std::string>(program.decode_chunk(std::array<uint32_t, 1>{4}, space_state, true)) == " world");
 
     TokenProgram::StreamState utf8_state;
     const auto one_shot = program.decode(std::array<uint32_t, 2>{7, 8});
@@ -989,6 +1035,12 @@ void check_v3_sentencepiece_execution_and_fail_closed() {
         if (const auto* right = std::get_if<std::string>(&second_byte)) {
             if (const auto* expected = std::get_if<std::string>(&one_shot)) CHECK(*left + *right == *expected);
         }
+    }
+    TokenProgram::StreamState incomplete_state;
+    const auto incomplete = program.decode_chunk(std::array<uint32_t, 1>{7}, incomplete_state, true);
+    CHECK(std::holds_alternative<TokenProgramStatus>(incomplete));
+    if (const auto* status = std::get_if<TokenProgramStatus>(&incomplete)) {
+        CHECK(status->error == TokenProgramError::InvalidUtf8);
     }
 
     auto malformed = std::get<std::vector<uint8_t>>(serialized);

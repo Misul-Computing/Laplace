@@ -18,7 +18,8 @@ CompatibilityReport reference_error(CompatibilityError code, const char* detail)
 }
 
 bool scalar_type_supported(ElementType type) noexcept {
-    return type == ElementType::U32 || type == ElementType::I32 ||
+    return type == ElementType::I1 || type == ElementType::F16 ||
+           type == ElementType::U32 || type == ElementType::I32 ||
            type == ElementType::U64 || type == ElementType::F32;
 }
 
@@ -98,7 +99,9 @@ bool binary_elementwise(const Evaluation& evaluation, const Instruction& instruc
         if (type.element_type == ElementType::F32) {
             const float a = std::bit_cast<float>(static_cast<uint32_t>(left.bits[index]));
             const float b = std::bit_cast<float>(static_cast<uint32_t>(right.bits[index]));
-            if (!std::isfinite(a) || !std::isfinite(b)) return false;
+            const auto* policy = std::get_if<ArithmeticAttributes>(&instruction.attributes);
+            if ((!policy || !policy->allow_nonfinite_operands) &&
+                (!std::isfinite(a) || !std::isfinite(b))) return false;
             float value = 0.0f;
             switch (primitive) {
             case Primitive::Add: value = a + b; break;
@@ -106,9 +109,11 @@ bool binary_elementwise(const Evaluation& evaluation, const Instruction& instruc
             case Primitive::Subtract: value = a - b; break;
             case Primitive::Divide: value = a / b; break;
             case Primitive::Maximum: value = std::max(a, b); break;
+            case Primitive::Pow: value = std::pow(a, b); break;
             default: return false;
             }
-            if (!std::isfinite(value)) return false;
+            if ((!policy || !policy->allow_nonfinite_result) && !std::isfinite(value))
+                return false;
             result->bits[index] = std::bit_cast<uint32_t>(value);
         } else if (type.element_type == ElementType::U32) {
             const uint64_t a = static_cast<uint32_t>(left.bits[index]);
@@ -158,7 +163,9 @@ bool unary_elementwise(const Evaluation& evaluation,
     for (size_t index = 0; index < input.bits.size(); ++index) {
         const float value = std::bit_cast<float>(
             static_cast<uint32_t>(input.bits[index]));
-        if (!std::isfinite(value)) return false;
+        const auto* policy = std::get_if<ArithmeticAttributes>(&instruction.attributes);
+        if ((!policy || !policy->allow_nonfinite_operands) && !std::isfinite(value))
+            return false;
         float computed = 0.0f;
         switch (primitive) {
         case Primitive::Negate: computed = -value; break;
@@ -167,17 +174,83 @@ bool unary_elementwise(const Evaluation& evaluation,
         case Primitive::Rsqrt: computed = 1.0f / std::sqrt(value); break;
         case Primitive::Sin: computed = std::sin(value); break;
         case Primitive::Cos: computed = std::cos(value); break;
+        case Primitive::Sqrt: computed = std::sqrt(value); break;
+        case Primitive::Tanh: computed = std::tanh(value); break;
+        case Primitive::RequireFinite: computed = value; break;
         default: return false;
         }
-        if (!std::isfinite(computed)) return false;
+        if ((!policy || !policy->allow_nonfinite_result) && !std::isfinite(computed))
+            return false;
         result->bits[index] = std::bit_cast<uint32_t>(computed);
     }
     return true;
 }
 
+uint32_t u32_to_f32_bits(uint32_t value) {
+    if (value == 0) return 0;
+    uint32_t exponent = std::bit_width(value) - 1;
+    uint32_t significand;
+    if (exponent <= 23) {
+        significand = value << (23 - exponent);
+    } else {
+        const uint32_t shift = exponent - 23;
+        significand = value >> shift;
+        const uint32_t remainder = value & ((1u << shift) - 1);
+        const uint32_t halfway = 1u << (shift - 1);
+        if (remainder > halfway || (remainder == halfway && (significand & 1)))
+            ++significand;
+        if (significand == (1u << 24)) {
+            significand >>= 1;
+            ++exponent;
+        }
+    }
+    return ((exponent + 127) << 23) | (significand & 0x7fffffu);
+}
+
+bool typed_scalar(const Evaluation& evaluation, const Instruction& instruction,
+                  const ValueType& type, ReferenceValue* result) {
+    std::vector<ReferenceValue> inputs;
+    for (uint32_t id : instruction.inputs) {
+        ReferenceValue value;
+        if (!operand(evaluation, id, &value) || !value.extents.empty() ||
+            value.bits.size() != 1) return false;
+        const uint64_t maximum = value.type == ElementType::I1 ? 1 :
+            value.type == ElementType::F16 ? UINT16_MAX :
+            value.type == ElementType::U64 ? UINT64_MAX : UINT32_MAX;
+        if (value.bits.front() > maximum) return false;
+        inputs.push_back(std::move(value));
+    }
+    const Primitive code = instruction.primitive.code;
+    const uint64_t a = inputs.front().bits.front();
+    if (code == Primitive::Select) {
+        *result = inputs[a ? 1 : 2];
+        return true;
+    }
+    if (code == Primitive::Convert) {
+        *result = scalar_value(type.element_type, u32_to_f32_bits(static_cast<uint32_t>(a)));
+        return true;
+    }
+    const uint64_t b = inputs[1].bits.front();
+    bool selected;
+    if (inputs.front().type == ElementType::F32) {
+        const float left = std::bit_cast<float>(static_cast<uint32_t>(a));
+        const float right = std::bit_cast<float>(static_cast<uint32_t>(b));
+        if (!std::isfinite(left) || !std::isfinite(right)) return false;
+        selected = code == Primitive::Less ? left < right : left == right;
+    } else if (inputs.front().type == ElementType::I32) {
+        const int32_t left = std::bit_cast<int32_t>(static_cast<uint32_t>(a));
+        const int32_t right = std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+        selected = code == Primitive::Less ? left < right : left == right;
+    } else {
+        selected = code == Primitive::Less ? a < b : a == b;
+    }
+    *result = scalar_value(type.element_type, selected);
+    return true;
+}
+
 bool eval_region(const Function& function, uint32_t region_id,
                  Evaluation* evaluation, std::vector<uint32_t>* yields,
-                 uint32_t depth);
+                 uint32_t depth, std::span<const uint64_t> coordinates = {});
 
 int64_t floor_divide_index(int64_t value, int64_t divisor) {
     const int64_t quotient = value / divisor;
@@ -218,6 +291,28 @@ bool evaluate_tensor_index(const TensorIndexExpr& expression,
                 static_cast<uint32_t>(source.bits.front()));
         }
         return true;
+    case TensorIndexExpression::SourceElement: {
+        if (expression.value < 0 ||
+            static_cast<uint64_t>(expression.value) >= sources.size()) return false;
+        const ReferenceValue& source = sources[static_cast<size_t>(expression.value)];
+        if (source.type != ElementType::U32 ||
+            source.extents.size() != expression.operands.size()) return false;
+        size_t offset = 0;
+        for (size_t axis = 0; axis < source.extents.size(); ++axis) {
+            int64_t coordinate = 0;
+            if (!evaluate_tensor_index(expression.operands[axis], iterators,
+                                       sources, &coordinate, depth + 1) ||
+                coordinate < 0 ||
+                static_cast<uint64_t>(coordinate) >= source.extents[axis] ||
+                offset > (SIZE_MAX - static_cast<uint64_t>(coordinate)) /
+                             source.extents[axis]) return false;
+            offset = offset * source.extents[axis] + static_cast<size_t>(coordinate);
+        }
+        if (offset >= source.bits.size() || source.bits[offset] > UINT32_MAX)
+            return false;
+        *result = static_cast<int64_t>(source.bits[offset]);
+        return true;
+    }
     case TensorIndexExpression::Add:
     case TensorIndexExpression::Multiply:
     case TensorIndexExpression::FloorDivide:
@@ -266,8 +361,9 @@ bool tensor_offset(const ReferenceValue& value, const TensorIndexMap& map,
         if (coordinate < 0 || static_cast<uint64_t>(coordinate) >= value.extents[axis]) {
             if (map.bounds != TensorBoundsMode::Zero) return false;
             *zero = true;
-            return true;
+            continue;
         }
+        if (*zero) continue;
         if (*offset > (std::numeric_limits<size_t>::max() -
                        static_cast<size_t>(coordinate)) /
                           static_cast<size_t>(value.extents[axis]))
@@ -275,7 +371,7 @@ bool tensor_offset(const ReferenceValue& value, const TensorIndexMap& map,
         *offset = *offset * static_cast<size_t>(value.extents[axis]) +
                   static_cast<size_t>(coordinate);
     }
-    return *offset < value.bits.size();
+    return *zero || *offset < value.bits.size();
 }
 
 bool eval_structured_tensor(const Function& function,
@@ -354,7 +450,7 @@ bool eval_structured_tensor(const Function& function,
                              destinations[result].bits[destination_offsets[result]]);
         }
         std::vector<uint32_t> body_yields;
-        if (!eval_region(function, body->id, evaluation, &body_yields, depth + 1) ||
+        if (!eval_region(function, body->id, evaluation, &body_yields, depth + 1, iterators) ||
             body_yields.size() != destinations.size())
             return false;
         for (size_t result = 0; result < destinations.size(); ++result) {
@@ -374,7 +470,7 @@ bool eval_structured_tensor(const Function& function,
 
 bool eval_region(const Function& function, uint32_t region_id,
                  Evaluation* evaluation, std::vector<uint32_t>* yields,
-                 uint32_t depth) {
+                 uint32_t depth, std::span<const uint64_t> coordinates) {
     if (!evaluation || !yields || depth > 64) return false;
     const Region* region = nullptr;
     for (const Region& candidate : function.regions)
@@ -403,7 +499,8 @@ bool eval_region(const Function& function, uint32_t region_id,
         case Primitive::Multiply:
         case Primitive::Subtract:
         case Primitive::Divide:
-        case Primitive::Maximum: {
+        case Primitive::Maximum:
+        case Primitive::Pow: {
             if (!output_type(instruction, &id, &type)) return false;
             std::vector<uint64_t> extents;
             if (!shape_for(type, &extents)) return false;
@@ -419,13 +516,44 @@ bool eval_region(const Function& function, uint32_t region_id,
         case Primitive::Log:
         case Primitive::Rsqrt:
         case Primitive::Sin:
-        case Primitive::Cos: {
+        case Primitive::Cos:
+        case Primitive::Sqrt:
+        case Primitive::Tanh:
+        case Primitive::RequireFinite: {
             if (!output_type(instruction, &id, &type)) return false;
             ReferenceValue value;
             if (!unary_elementwise(*evaluation, instruction, type,
                                    instruction.primitive.code, &value))
                 return false;
             evaluation->values[id] = std::move(value);
+            break;
+        }
+        case Primitive::Less:
+        case Primitive::Equal:
+        case Primitive::Select:
+        case Primitive::Convert: {
+            if (!output_type(instruction, &id, &type)) return false;
+            ReferenceValue value;
+            if (!typed_scalar(*evaluation, instruction, type, &value)) return false;
+            evaluation->values[id] = std::move(value);
+            break;
+        }
+        case Primitive::TensorCoordinate: {
+            if (!output_type(instruction, &id, &type)) return false;
+            const auto* attributes = std::get_if<CoordinateAttributes>(&instruction.attributes);
+            if (!attributes || attributes->axis >= coordinates.size()) return false;
+            const uint64_t coordinate = coordinates[attributes->axis];
+            if (type.element_type == ElementType::U32 && coordinate > UINT32_MAX) return false;
+            evaluation->values[id] = scalar_value(type.element_type, coordinate);
+            break;
+        }
+        case Primitive::Require: {
+            if (!output_type(instruction, &id, &type)) return false;
+            ReferenceValue predicate;
+            if (!operand(*evaluation, instruction.inputs.front(), &predicate) ||
+                predicate.type != ElementType::I1 || !predicate.extents.empty() ||
+                predicate.bits.size() != 1 || predicate.bits.front() != 1) return false;
+            evaluation->values[id] = std::move(predicate);
             break;
         }
         case Primitive::StateRead: {

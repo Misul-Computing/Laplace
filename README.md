@@ -81,7 +81,7 @@ Talk to a model:
 ./build/laplace /absolute/path/to/model.gguf
 ```
 
-That opens an interactive chat. Each message is framed with the model's own
+That opens an interactive chat after the model and Metal programs load. Each message is framed with the model's own
 chat template, the conversation history carries across turns, and Ctrl-D
 exits. If the package's template is not one of the recognized shapes, the
 session says so and continues with plain text framing.
@@ -100,13 +100,17 @@ Run `./build/laplace --help` for the full option list with defaults.
 
 ## Models
 
-Any conforming GGUF is worth trying: loading is universal and data-driven,
-never keyed on architecture names. Dense llama-class and Qwen-class models
-load with their byte-level BPE tokenizers (text prompts work directly),
-including tied embeddings, QKV biases, QK-norms, sandwich norms, and mixed
-Q4_K/Q5_0/Q6_K/Q8_0 quantization. Gemma-class models load with windowed
-attention and their SentencePiece tokenizer.
+The normal model route compiles declared tensor storage and semantic operations
+into one shared Metal program. It currently executes embedding, projection,
+normalization, activation, rotary position, and causal or sliding attention
+operations, including tied weights and mixed stored precisions. Graphs needing
+unsupported operations fail with a compatibility report; recurrent and routed
+expert execution through this compiler is still in progress.
 
+Chat templates are compiled from the package's own template text. The first
+turn includes its opening context; later turns close the preceding response
+and reuse the existing session without repeating the start token. The context
+limit is fixed for a session; when it fills, start a new session.
 Fetch a small test model and talk to it:
 
 ```bash

@@ -6,6 +6,7 @@
 #include <span>
 #include <variant>
 #include <vector>
+#include <sys/mman.h>
 
 #include "codec_certificate.h"
 #include "physical_codec.h"
@@ -110,6 +111,108 @@ void test_raw_vectors() {
     }
 }
 
+void test_large_bindings() {
+    // Anonymous mappings reserve address space without touching the payload.
+    // This is the raw-unit count of the Qwen2.5 0.5B embedding tensor.
+    constexpr uint64_t units = 136134656;
+    for (const auto& bytes : {make_raw_f16_codec_certificate(),
+                              make_raw_f32_codec_certificate(),
+                              make_q8_0_codec_certificate()}) {
+        const auto certificate = parsed(bytes);
+        const uint64_t stride = certificate.summary().unit_bytes;
+        const size_t length = static_cast<size_t>(units * stride);
+        void* mapping = mmap(nullptr, length, PROT_READ,
+                             MAP_PRIVATE | MAP_ANON, -1, 0);
+        CHECK(mapping != MAP_FAILED);
+        if (mapping == MAP_FAILED) continue;
+        const std::span<const uint8_t> storage(
+            static_cast<const uint8_t*>(mapping), length);
+        CodecCertificateBinding binding{units, {plane(storage, 0, length, stride)}};
+        CHECK(certificate.summary().maximum_units == (1u << 24));
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::None);
+        CHECK(certificate.validate(binding) == CodecCertificateError::InvalidUnitCount);
+        // Structural acceptance must not authorize unbounded reference decoding.
+        CHECK(std::get<CodecCertificateError>(certificate.decode(binding, units * 32)) ==
+              CodecCertificateError::InvalidUnitCount);
+        const uint64_t limit = certificate.summary().maximum_units;
+        binding.unit_count = limit;
+        CHECK(certificate.validate(binding) == CodecCertificateError::None);
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::None);
+        binding.unit_count = limit + 1;
+        CHECK(certificate.validate(binding) == CodecCertificateError::InvalidUnitCount);
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::None);
+        binding.unit_count = units;
+        binding.planes[0].length -= 1;
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::AccessOutOfBounds);
+        binding.planes[0].length = length + 1;
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::InvalidLength);
+        binding.planes[0].length = length;
+        binding.planes[0].offset = length + 1;
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::InvalidOffset);
+        binding.planes[0].offset = 0;
+        binding.planes[0].stride = std::numeric_limits<uint64_t>::max();
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::ArithmeticOverflow);
+        binding.planes[0].stride = stride;
+        binding.unit_count = std::numeric_limits<uint64_t>::max();
+        CHECK(certificate.validate_tensor(binding) == CodecCertificateError::ArithmeticOverflow);
+        CHECK(munmap(mapping, length) == 0);
+    }
+    const auto certificate = parsed(make_raw_f32_codec_certificate());
+    const std::array<uint8_t, 4> storage{};
+    const CodecCertificateBinding binding{1, {plane(storage, 0, 4, 4)}};
+    CHECK(decoded(certificate, binding, 0).size() == 1);
+    const std::array<uint8_t, 8> two_units{};
+    CHECK(std::get<CodecCertificateError>(certificate.decode(
+              {2, {plane(two_units, 0, 8, 4)}}, 1)) == CodecCertificateError::DecodeLimit);
+    CHECK(decoded(certificate, binding, 1).size() == 1);
+    CHECK(certificate.validate({0, binding.planes}) == CodecCertificateError::InvalidUnitCount);
+    CHECK(certificate.validate_tensor({0, binding.planes}) == CodecCertificateError::InvalidUnitCount);
+    CHECK(certificate.validate_tensor({1, {}}) == CodecCertificateError::InvalidPlaneBinding);
+}
+
+void test_tensor_chunk_alignment() {
+    auto bytes = make_raw_f16_codec_certificate();
+    // The serialized per-invocation maximum is at byte 26.
+    bytes[26] = 1;
+    bytes[27] = bytes[28] = bytes[29] = 0;
+    auto certificate = parsed(bytes);
+    const std::array<uint8_t, 11> storage{};
+    const CodecCertificateBinding two{2, {plane(storage, 0, 5, 3)}};
+    CHECK(certificate.validate_tensor(two) == CodecCertificateError::InvalidUnitCount);
+    CHECK(certificate.validate({1, {plane(storage, 0, 2, 3)}}) ==
+          CodecCertificateError::None);
+    CHECK(certificate.validate({1, {plane(storage, 3, 2, 3)}}) ==
+          CodecCertificateError::InvalidOffset);
+    CHECK(certificate.validate_tensor({1, two.planes}) == CodecCertificateError::None);
+    // A two-unit cap permits aligned chunks of two, including a short tail.
+    bytes[26] = 2;
+    certificate = parsed(bytes);
+    CHECK(certificate.validate_tensor(two) == CodecCertificateError::None);
+    CHECK(certificate.validate_tensor({4, {plane(storage, 0, 11, 3)}}) ==
+          CodecCertificateError::None);
+    CHECK(certificate.validate_tensor({3, {plane(storage, 0, 8, 3)}}) ==
+          CodecCertificateError::None);
+    CHECK(certificate.validate({2, {plane(storage, 6, 5, 3)}}) ==
+          CodecCertificateError::None);
+    // The last plane can require a larger period than the first two.
+    bytes = make_grouped_affine_u2_codec_certificate();
+    bytes[26] = 2;
+    bytes[27] = bytes[28] = bytes[29] = 0;
+    bytes[68 + 2 * 27 + 15] = 8; // Bias plane alignment.
+    certificate = parsed(bytes);
+    const std::array<uint8_t, 576> values{};
+    const std::array<uint8_t, 26> parameters{};
+    const std::vector<CodecCertificatePlaneBinding> planes = {
+        plane(values, 0, values.size(), 64),
+        plane(parameters, 0, parameters.size(), 2),
+        plane(parameters, 0, parameters.size(), 3)};
+    CHECK(certificate.validate_tensor({3, planes}) == CodecCertificateError::InvalidUnitCount);
+    CHECK(certificate.validate_tensor({2, planes}) == CodecCertificateError::None);
+    bytes[26] = 8;
+    certificate = parsed(bytes);
+    CHECK(certificate.validate_tensor({9, planes}) == CodecCertificateError::None);
+}
+
 void test_structural_view() {
     const auto q4 = parsed(make_q4_k_codec_certificate());
     const auto& nodes = q4.node_summaries();
@@ -151,7 +254,7 @@ std::vector<float> q4_reference(const std::array<uint8_t, 144>& block) {
             scale = (block[8 + group] & 15u) |
                     ((block[4 + group - 4] >> 6u) << 4u);
             minimum = ((block[8 + group] >> 4u) & 15u) |
-                      ((block[8 + group] >> 6u) << 4u);
+                      ((block[4 + group] >> 6u) << 4u);
         }
         const uint32_t q_base = 16 + (group / 2) * 32;
         const uint32_t output_base = (group / 2) * 64 + (group % 2) * 32;
@@ -190,8 +293,19 @@ void test_q4_vector() {
         }
 }
 
+void test_q4_minimum_wire_layout() {
+    const auto certificate = parsed(make_q4_k_codec_certificate());
+    std::array<uint8_t, 144> block{};
+    block[3] = 0x3c;
+    block[8] = 0x80;
+    block[12] = 0x30;
+    const auto values = decoded(
+        certificate, {1, {plane(block, 0, block.size(), block.size())}}, 256);
+    CHECK(values[128] == -35.0f);
+}
+
 std::vector<float> q6_reference(const std::array<uint8_t, 210>& block) {
-    const float d = f16(block.data());
+    const float d = f16(block.data() + 208);
     std::vector<float> output(256);
     for (uint32_t i = 0; i < 256; ++i) {
         const uint32_t segment = i / 128;
@@ -199,17 +313,34 @@ std::vector<float> q6_reference(const std::array<uint8_t, 210>& block) {
         const uint32_t quarter = within / 32;
         const uint32_t lane = within % 32;
         const uint32_t ql_offset =
-            2 + segment * 64 + (quarter / 2) * 32 + lane;
-        const uint32_t qh_offset = 2 + 128 + segment * 32 + lane;
+            segment * 64 + (quarter % 2) * 32 + lane;
+        const uint32_t qh_offset = 128 + segment * 32 + lane;
         const uint32_t ql =
-            (block[ql_offset] >> ((quarter % 2) * 4u)) & 15u;
+            (block[ql_offset] >> ((quarter / 2) * 4u)) & 15u;
         const uint32_t qh =
             ((block[qh_offset] >> (quarter * 2u)) & 3u) << 4u;
-        const int32_t scale = static_cast<int8_t>(block[194 + i / 16]);
+        const int32_t scale = static_cast<int8_t>(block[192 + i / 16]);
         output[i] = d * static_cast<float>(static_cast<int32_t>(ql + qh) - 32) *
                     static_cast<float>(scale);
     }
     return output;
+}
+
+void test_q5_wire_layout() {
+    const auto certificate = parsed(make_q5_0_codec_certificate());
+    std::array<uint8_t, 22> block{};
+    block[1] = 0x3c;
+    block[2] = 0x01;
+    block[4] = 0x02;
+    block[6] = 0x21;
+    block[7] = 0x43;
+    const auto values = decoded(
+        certificate, {1, {plane(block, 0, block.size(), block.size())}}, 32);
+    CHECK(values.size() == 32);
+    CHECK(values[0] == 1.0f);
+    CHECK(values[1] == -13.0f);
+    CHECK(values[16] == -14.0f);
+    CHECK(values[17] == 4.0f);
 }
 
 void test_q6_vector() {
@@ -219,10 +350,10 @@ void test_q6_vector() {
     CHECK(certificate.plane_summaries()[0].storage_scalar ==
           CodecCertificateStorageScalar::Unsigned8);
     std::array<uint8_t, 210> block{};
-    block[0] = 0x42;
-    block[1] = 0x34;
-    for (size_t i = 2; i < block.size(); ++i)
+    for (size_t i = 0; i < 208; ++i)
         block[i] = static_cast<uint8_t>(i * 29u + 7u);
+    block[208] = 0x42;
+    block[209] = 0x34;
     const auto values = decoded(
         certificate, {1, {plane(block, 0, block.size(), block.size())}}, 256);
     const auto expected = q6_reference(block);
@@ -230,6 +361,24 @@ void test_q6_vector() {
     if (values.size() == expected.size())
         for (size_t i = 0; i < values.size(); ++i)
             CHECK(std::fabs(values[i] - expected[i]) < 1e-5f);
+    // Independent wire-layout witness: distinct low nibbles and signed scales.
+    block.fill(0);
+    block[0] = 0x21;
+    block[32] = 0x43;
+    block[128] = 0xe4;
+    block[192] = 1;
+    block[194] = 2;
+    block[196] = 0xff;
+    block[198] = 3;
+    block[208] = 0;
+    block[209] = 0x3c;
+    const auto witness = decoded(
+        certificate, {1, {plane(block, 0, block.size(), block.size())}}, 256);
+    CHECK(witness[0] == -31.0f);
+    CHECK(witness[32] == -26.0f);
+    CHECK(witness[64] == -2.0f);
+    CHECK(witness[96] == 60.0f);
+
 }
 
 void test_q8_vector() {
@@ -493,9 +642,13 @@ void test_fail_closed() {
 
 int main() {
     test_raw_vectors();
+    test_large_bindings();
+    test_tensor_chunk_alignment();
     test_structural_view();
     test_q4_vector();
+    test_q4_minimum_wire_layout();
     test_q6_vector();
+    test_q5_wire_layout();
     test_q8_vector();
     test_grouped_affine_vector();
     test_physical_identity();

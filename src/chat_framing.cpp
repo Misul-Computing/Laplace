@@ -336,7 +336,7 @@ bool parse_turn_branch(Walker& walker, TurnShape& shape) {
 bool process_loop_body(const std::vector<Segment>& body, FramingState& state) {
     Walker walker{body, 0};
     ChatFraming& framing = state.framing;
-    std::string user_open, assistant_open, turn_close;
+    std::string user_open, assistant_open, turn_close, assistant_close;
     bool have_user = false, have_assistant = false;
 
     // Skips a branch body up to the next elif/else/endif at the same depth,
@@ -384,7 +384,7 @@ bool process_loop_body(const std::vector<Segment>& body, FramingState& state) {
         if (!parse_turn_branch(walker, shape) || !shape.role_symbolic) return false;
         user_open = shape.prefix + "user" + shape.role_mid;
         assistant_open = shape.prefix + "assistant" + shape.role_mid;
-        turn_close = shape.suffix;
+        turn_close = assistant_close = shape.suffix;
         have_user = have_assistant = true;
     } else if (walker.at_tag_starting("if ")) {
         const std::string_view guard = walker.peek_tag().substr(3);
@@ -410,7 +410,7 @@ bool process_loop_body(const std::vector<Segment>& body, FramingState& state) {
             if (role.empty()) {
                 user_open = shape.prefix + "user" + shape.role_mid;
                 assistant_open = shape.prefix + "assistant" + shape.role_mid;
-                turn_close = shape.suffix;
+                turn_close = assistant_close = shape.suffix;
                 have_user = have_assistant = true;
             } else if (role == "user") {
                 user_open = shape.prefix + shape.role_mid;
@@ -418,7 +418,7 @@ bool process_loop_body(const std::vector<Segment>& body, FramingState& state) {
                 have_user = true;
             } else if (role == "assistant") {
                 assistant_open = shape.prefix + shape.role_mid;
-                turn_close = shape.suffix;
+                assistant_close = shape.suffix;
                 have_assistant = true;
             }
             return true;
@@ -475,13 +475,15 @@ bool process_loop_body(const std::vector<Segment>& body, FramingState& state) {
     bool saw_bos = false, saw_eos = false;
     if (!walker.collect_literals_until_tag(tail, LiteralAllow::LiteralsOnly, saw_bos, saw_eos))
         return false;
-    if (!tail.empty()) turn_close += tail;
+    turn_close += tail;
+    assistant_close += tail;
     if (!walker.done()) return false;
 
-    if (have_user && have_assistant && !turn_close.empty()) {
+    if (have_user && have_assistant && !turn_close.empty() && !assistant_close.empty()) {
         framing.user_open = std::move(user_open);
         framing.assistant_open = std::move(assistant_open);
         framing.turn_close = std::move(turn_close);
+        framing.assistant_close = std::move(assistant_close);
         state.have_turn = true;
     }
     return state.have_turn;

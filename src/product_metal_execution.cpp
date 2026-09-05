@@ -9,7 +9,6 @@
 
 #include "compat_rule.h"
 #include "metal_library_source_catalog.h"
-#include "prefill_tile.h"
 
 namespace Laplace {
 
@@ -22,9 +21,6 @@ constexpr uint32_t kDecodeLogitsProgram = 4;
 constexpr uint32_t kDecodeSampleProgram = 5;
 constexpr uint32_t kPrefillBatch2LogitsProgram = 6;
 constexpr uint32_t kPrefillBatch2SampleProgram = 7;
-constexpr uint32_t kPrefillBatchTileLogitsProgram = 8;
-constexpr uint32_t kPrefillBatchTileSampleProgram = 9;
-constexpr uint32_t kPrefillStateOnlyTileProgram = 10;
 
 void append_u16(std::vector<uint8_t>& bytes, uint16_t value) {
     bytes.push_back(static_cast<uint8_t>(value));
@@ -97,10 +93,10 @@ bool request_valid(const RuntimePackage& package, const SessionRequest& request,
         report = execution_error(CompatibilityError::RUNTIME_INPUT_INVALID);
         return false;
     }
-    if (request.max_batch > kPrefillTileRows) {
+    if (request.max_batch > 2) {
         report = execution_error(
             CompatibilityError::KERNEL_UNAVAILABLE,
-            "product Metal executor admits prefill batches up to the declared tile width");
+            "product Metal executor currently admits prefill batches of one or two rows");
         return false;
     }
     if (request.memory_limit == 0) {
@@ -124,9 +120,6 @@ uint32_t program_id(ExecutionPhase phase, uint32_t batch_rows,
         if (batch_rows == 2)
             return sampled ? kPrefillBatch2SampleProgram
                            : kPrefillBatch2LogitsProgram;
-        if (batch_rows == kPrefillTileRows)
-            return sampled ? kPrefillBatchTileSampleProgram
-                           : kPrefillBatchTileLogitsProgram;
         return sampled ? kPrefillSampleProgram : kPrefillLogitsProgram;
     }
     return sampled ? kDecodeSampleProgram : kDecodeLogitsProgram;
@@ -140,10 +133,6 @@ ProductMetalProgramKind program_kind(ExecutionPhase phase,
             return sampled
                 ? ProductMetalProgramKind::PrefillBatch2GreedySample
                 : ProductMetalProgramKind::PrefillBatch2Logits;
-        if (batch_rows == kPrefillTileRows)
-            return sampled
-                ? ProductMetalProgramKind::PrefillBatchTileGreedySample
-                : ProductMetalProgramKind::PrefillBatchTileLogits;
         return sampled ? ProductMetalProgramKind::PrefillGreedySample
                        : ProductMetalProgramKind::PrefillLogits;
     }
@@ -175,7 +164,7 @@ bool append_authorized_invocation(
         bound_program.program_digest() != semantic.program_digest ||
         bound_program.request() != semantic.request || row_count == 0 ||
         (row_index != UINT32_MAX && row_index >= semantic.request.batch_rows) ||
-        (row_count > 1 && row_count != semantic.request.batch_rows) ||
+        (row_count == 2 && semantic.request.batch_rows != 2) ||
         !append_invocation(invocation, recipe_count, flattened))
         return false;
     ProductMetalInvocationAuthority authority;
@@ -208,7 +197,7 @@ bool append_authorized_invocation(
     return true;
 }
 
-bool append_dense_attention_group(
+bool append_two_row_group(
     const StructuralMetalBundleGroup& group,
     const SemanticDispatchProgram& semantic,
     const BoundDispatchProgram& bound_program,
@@ -216,18 +205,14 @@ bool append_dense_attention_group(
     std::vector<uint32_t>& flattened,
     std::vector<ProductMetalInvocationAuthority>& authorities) {
     const auto primitives = group.primitives();
-    // Exact admitted batch widths: two (legacy rows kernel) and the declared
-    // tile width (tiled kernel). Anything else fails closed here.
-    const uint32_t rows = semantic.request.batch_rows;
-    if (rows != 2 && rows != kPrefillTileRows) return false;
     if (group.shape() == StructuralMetalExecutionShape::GraphEmbedding) {
-        if (primitives.size() != 1) return false;
-        for (uint32_t row = 0; row < rows; ++row)
-            if (!append_authorized_invocation(
-                    primitives[0], group, semantic, bound_program, program_id,
-                    recipe_count, row, 1, flattened, authorities))
-                return false;
-        return true;
+        return primitives.size() == 1 &&
+               append_authorized_invocation(
+                   primitives[0], group, semantic, bound_program, program_id,
+                   recipe_count, 0, 1, flattened, authorities) &&
+               append_authorized_invocation(
+                   primitives[0], group, semantic, bound_program, program_id,
+                   recipe_count, 1, 1, flattened, authorities);
     }
     if (group.kind() != StructuralMetalBundleGroupKind::Layer) {
         for (const auto& invocation : primitives)
@@ -244,64 +229,55 @@ bool append_dense_attention_group(
     if (group.shape() != StructuralMetalExecutionShape::DenseAttention)
         return false;
 
-    const StructuralMetalPrimitive projection =
-        rows == 2 ? StructuralMetalPrimitive::PrefillF16Rows
-                  : StructuralMetalPrimitive::PrefillF16Tile;
-    const std::array<StructuralMetalPrimitive, 17> expected = {
+    static constexpr std::array<StructuralMetalPrimitive, 17> expected = {
         StructuralMetalPrimitive::RmsNormF32,
-        projection,
-        projection,
-        projection,
+        StructuralMetalPrimitive::PrefillF16Rows,
+        StructuralMetalPrimitive::PrefillF16Rows,
+        StructuralMetalPrimitive::PrefillF16Rows,
         StructuralMetalPrimitive::RopeHalfSplit,
         StructuralMetalPrimitive::RopeHalfSplit,
         StructuralMetalPrimitive::KvWrite,
         StructuralMetalPrimitive::KvWrite,
         StructuralMetalPrimitive::Attention,
-        projection,
+        StructuralMetalPrimitive::PrefillF16Rows,
         StructuralMetalPrimitive::VecAdd,
         StructuralMetalPrimitive::RmsNormF32,
-        projection,
-        projection,
+        StructuralMetalPrimitive::PrefillF16Rows,
+        StructuralMetalPrimitive::PrefillF16Rows,
         StructuralMetalPrimitive::SwiGlu,
-        projection,
+        StructuralMetalPrimitive::PrefillF16Rows,
         StructuralMetalPrimitive::VecAdd,
     };
     if (primitives.size() != expected.size()) return false;
-    for (size_t index = 0; index != expected.size(); ++index)
+    for (size_t index = 0; index < expected.size(); ++index)
         if (primitives[index].primitive != expected[index]) return false;
 
     // The composite dense executor launches row-local primitives once per row
-    // and matrix projections once for the whole batch. This order is the
-    // executor's dispatch order and must stay in lockstep with
-    // metal_tok_dense_prefill_batch_layer.
-    const auto emit_row = [&](uint8_t primitive_index, uint32_t row) {
-        return append_authorized_invocation(
-            primitives[primitive_index], group, semantic, bound_program,
-            program_id, recipe_count, row, 1, flattened, authorities);
+    // and matrix projections once for the full two-row batch.
+    struct PhysicalInvocation {
+        uint8_t primitive_index;
+        uint32_t row_index;
+        uint32_t row_count;
     };
-    const auto emit_batch = [&](uint8_t primitive_index) {
-        return append_authorized_invocation(
-            primitives[primitive_index], group, semantic, bound_program,
-            program_id, recipe_count, UINT32_MAX, rows, flattened, authorities);
-    };
-    for (uint32_t row = 0; row < rows; ++row)
-        if (!emit_row(0, row)) return false;
-    if (!emit_batch(1) || !emit_batch(2) || !emit_batch(3)) return false;
-    for (uint32_t row = 0; row < rows; ++row)
-        if (!emit_row(4, row) || !emit_row(5, row) || !emit_row(6, row) ||
-            !emit_row(7, row))
+    static constexpr std::array<PhysicalInvocation, 27> physical_order = {{
+        {0, 0, 1}, {0, 1, 1}, {1, UINT32_MAX, 2},
+        {2, UINT32_MAX, 2}, {3, UINT32_MAX, 2},
+        {4, 0, 1}, {5, 0, 1}, {6, 0, 1}, {7, 0, 1},
+        {4, 1, 1}, {5, 1, 1}, {6, 1, 1}, {7, 1, 1},
+        {8, 0, 1}, {8, 1, 1}, {9, UINT32_MAX, 2},
+        {10, 0, 1}, {11, 0, 1}, {10, 1, 1}, {11, 1, 1},
+        {12, UINT32_MAX, 2}, {13, UINT32_MAX, 2},
+        {14, 0, 1}, {14, 1, 1}, {15, UINT32_MAX, 2},
+        {16, 0, 1}, {16, 1, 1},
+    }};
+    for (const PhysicalInvocation& physical : physical_order) {
+        if (!append_authorized_invocation(
+                primitives[physical.primitive_index], group, semantic,
+                bound_program, program_id, recipe_count,
+                physical.row_index, physical.row_count,
+                flattened, authorities))
             return false;
-    for (uint32_t row = 0; row < rows; ++row)
-        if (!emit_row(8, row)) return false;
-    if (!emit_batch(9)) return false;
-    for (uint32_t row = 0; row < rows; ++row)
-        if (!emit_row(10, row) || !emit_row(11, row)) return false;
-    if (!emit_batch(12) || !emit_batch(13)) return false;
-    for (uint32_t row = 0; row < rows; ++row)
-        if (!emit_row(14, row)) return false;
-    if (!emit_batch(15)) return false;
-    for (uint32_t row = 0; row < rows; ++row)
-        if (!emit_row(16, row)) return false;
+    }
     return true;
 }
 
@@ -329,8 +305,8 @@ bool append_program_invocations(
             saw_final = true;
             if (stop_before_final) break;
         }
-        if (program.batch_rows() > 1) {
-            if (!append_dense_attention_group(
+        if (program.batch_rows() == 2) {
+            if (!append_two_row_group(
                     group, semantic, bound_program, id, recipe_count,
                     flattened, authorities))
                 return false;
@@ -401,10 +377,7 @@ ProductMetalExecutionContractResult compile_product_metal_execution_contract(
         std::vector<SemanticDispatchProgram> programs;
         std::vector<ProductMetalProgramBinding> program_bindings;
         const size_t prefill_program_count =
-            request.enable_prefill
-                ? 2u + (request.max_batch == 2 ? 2u : 0u) +
-                      (request.max_batch >= kPrefillTileRows ? 2u : 0u)
-                : 0u;
+            request.enable_prefill ? (request.max_batch == 2 ? 4u : 2u) : 0u;
         programs.reserve(prefill_program_count +
                          (request.enable_decode ? 2u : 0u));
         program_bindings.reserve(programs.capacity() +
@@ -438,10 +411,6 @@ ProductMetalExecutionContractResult compile_product_metal_execution_contract(
         if (request.enable_prefill && request.max_batch == 2 &&
             (!append_program(ExecutionPhase::Prefill, 2, false) ||
              !append_program(ExecutionPhase::Prefill, 2, true)))
-            return report;
-        if (request.enable_prefill && request.max_batch >= kPrefillTileRows &&
-            (!append_program(ExecutionPhase::Prefill, kPrefillTileRows, false) ||
-             !append_program(ExecutionPhase::Prefill, kPrefillTileRows, true)))
             return report;
         if (request.enable_decode &&
             (!append_program(ExecutionPhase::Decode, 1, false) ||
@@ -534,33 +503,6 @@ ProductMetalExecutionContractResult compile_product_metal_execution_contract(
             program_bindings.push_back(
                 {ProductMetalProgramKind::PrefillStateOnly,
                  kPrefillStateOnlyProgram, prefill->semantic_program_index});
-            // Tile-width chunks seal state-only between full chunks, so the
-            // tile program needs the same stopped-before-final range.
-            const auto prefill_tile = std::find_if(
-                program_bindings.begin(), program_bindings.end(),
-                [](const ProductMetalProgramBinding& binding) {
-                    return binding.kind ==
-                           ProductMetalProgramKind::PrefillBatchTileLogits;
-                });
-            if (prefill_tile != program_bindings.end()) {
-                if (prefill_tile->semantic_program_index >=
-                        structural.programs().size() ||
-                    !append_program_invocations(
-                        structural.programs()[prefill_tile->semantic_program_index],
-                        programs[prefill_tile->semantic_program_index],
-                        bound.programs()[prefill_tile->semantic_program_index],
-                        kPrefillStateOnlyTileProgram,
-                        static_cast<uint32_t>(structural.recipes().size()),
-                        flattened, authorities, ranges, true)) {
-                    return execution_error(
-                        CompatibilityError::SESSION_CONSTRUCTION_FAILED,
-                        "product prefill tile state-only recipe range is invalid");
-                }
-                program_bindings.push_back(
-                    {ProductMetalProgramKind::PrefillStateOnlyTile,
-                     kPrefillStateOnlyTileProgram,
-                     prefill_tile->semantic_program_index});
-            }
         }
 
         return ProductMetalExecutionContract(
